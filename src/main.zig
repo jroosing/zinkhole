@@ -11,7 +11,9 @@ const Allocator = std.mem.Allocator;
 
 const config = @import("config.zig");
 const Config = config.Config;
+const dns = @import("dns.zig");
 const ip = @import("ip.zig");
+const tcp = @import("tcp.zig");
 const log_output = @import("log.zig");
 const rules = @import("rules.zig");
 const Cache = @import("cache.zig").Cache;
@@ -49,6 +51,8 @@ const usage =
     \\Options:
     \\  -c, --config <path>  configuration file (default: /etc/dnsblock/config.yaml)
     \\  -t, --test           check the configuration, load all lists, then exit
+    \\  --healthcheck [addr] ask a running server (default 127.0.0.1:53) for
+    \\                       "localhost"; exit 0 if it answers (for containers)
     \\  -h, --help           show this help
     \\  -V, --version        show the version
     \\
@@ -88,6 +92,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             };
         } else if (eql(arg, "-t") or eql(arg, "--test")) {
             test_only = true;
+        } else if (eql(arg, "--healthcheck")) {
+            return healthcheck(io, args.next() orelse "127.0.0.1:53");
         } else if (eql(arg, "-h") or eql(arg, "--help")) {
             printTo(io, .stdout(), usage, .{});
             return 0;
@@ -121,6 +127,47 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         return 1;
     };
     return 0;
+}
+
+/// `--healthcheck`: queries the server at `target` for "localhost", which is
+/// answered from the built-in local record, so the check does not depend on
+/// upstream servers. Lets images without a shell (FROM scratch) define a
+/// container healthcheck.
+fn healthcheck(io: Io, target: []const u8) u8 {
+    const server = ip.parseSocketAddress(target, 53) orelse {
+        printTo(io, .stderr(), "unhealthy: '{s}' is not an IP address with optional port\n", .{target});
+        return 1;
+    };
+    // ID 0x6863, recursion desired, one question: localhost A IN.
+    const query = [_]u8{ 0x68, 0x63, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0 } ++
+        "\x09localhost\x00".* ++ [_]u8{ 0, 1, 0, 1 };
+
+    const any_address: Io.net.IpAddress = switch (server) {
+        .ip4 => .{ .ip4 = .unspecified(0) },
+        .ip6 => .{ .ip6 = .unspecified(0) },
+    };
+    const socket = any_address.bind(io, .{ .mode = .dgram, .protocol = .udp }) catch |err| {
+        printTo(io, .stderr(), "unhealthy: {t}\n", .{err});
+        return 1;
+    };
+    defer socket.close(io);
+    socket.send(io, &server, &query) catch |err| {
+        printTo(io, .stderr(), "unhealthy: {t}\n", .{err});
+        return 1;
+    };
+    var buffer: [512]u8 = undefined;
+    const deadline = tcp.deadlineIn(io, 2000);
+    while (true) {
+        const message = socket.receiveTimeout(io, &buffer, deadline) catch |err| {
+            printTo(io, .stderr(), "unhealthy: no answer from {f} ({t})\n", .{ server, err });
+            return 1;
+        };
+        if (!message.from.eql(&server) or !dns.isResponseTo(message.data, &query, query.len)) continue;
+        const rcode = dns.readFlags(message.data).rcode;
+        if (rcode == .noerror) return 0;
+        printTo(io, .stderr(), "unhealthy: {f} answered {t} (is it in server.allow_clients?)\n", .{ server, rcode });
+        return 1;
+    }
 }
 
 /// `--test`: validates the config and loads every list once.

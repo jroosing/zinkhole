@@ -1,0 +1,72 @@
+#!/sbin/openrc-run
+# OpenRC service for dnsblock (Alpine Linux, e.g. inside an LXC container).
+#
+# Install with `./deploy/install.sh`, or by hand:
+#   apk add ca-certificates
+#   install -m 755 dnsblock /usr/local/bin/dnsblock
+#   install -m 755 deploy/openrc/dnsblock /etc/init.d/dnsblock
+#   install -m 644 -D config.yaml /etc/dnsblock/config.yaml
+#   rc-update add dnsblock default
+#   rc-service dnsblock start
+#
+#   rc-service dnsblock reload   # reload the config file (SIGHUP)
+#   rc-service dnsblock stats    # log query statistics (SIGUSR1)
+#
+# Runs as the unprivileged user "dnsblock" (created on first start) with only
+# the capability to bind port 53, and is restarted if it crashes. Logs go to
+# syslog (`tail -f /var/log/messages`). Settings can be overridden in
+# /etc/conf.d/dnsblock: dnsblock_config, dnsblock_user.
+
+name="dnsblock"
+description="Minimal DNS blocker and local DNS server"
+
+: "${dnsblock_config:=/etc/dnsblock/config.yaml}"
+: "${dnsblock_user:=dnsblock}"
+
+command="/usr/local/bin/dnsblock"
+command_args="--config $dnsblock_config"
+command_user="$dnsblock_user:$dnsblock_user"
+supervisor="supervise-daemon"
+respawn_delay=2
+respawn_max=10
+respawn_period=60
+# Ambient capability, so the unprivileged process may bind port 53.
+capabilities="^cap_net_bind_service"
+no_new_privs="yes"
+error_logger="logger -t dnsblock -p daemon.info"
+
+extra_started_commands="reload stats"
+description_reload="Reload the configuration file"
+description_stats="Log query statistics"
+
+depend() {
+	need net
+	use logger
+	after firewall
+	provide dns
+}
+
+start_pre() {
+	if ! id "$dnsblock_user" >/dev/null 2>&1; then
+		ebegin "Creating user $dnsblock_user"
+		addgroup -S "$dnsblock_user" &&
+			adduser -S -D -H -h /var/empty -s /sbin/nologin -G "$dnsblock_user" "$dnsblock_user"
+		eend $? || return 1
+	fi
+	if [ ! -r "$dnsblock_config" ]; then
+		eerror "$dnsblock_config is missing (start from config.example.yaml)"
+		return 1
+	fi
+}
+
+reload() {
+	ebegin "Reloading $name configuration"
+	supervise-daemon "$RC_SVCNAME" --signal HUP
+	eend $?
+}
+
+stats() {
+	ebegin "Logging $name statistics"
+	supervise-daemon "$RC_SVCNAME" --signal USR1
+	eend $?
+}

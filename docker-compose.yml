@@ -1,0 +1,46 @@
+# dnsblock with Docker Compose.
+#
+#   cp config.example.yaml config.yaml      # then edit it
+#   docker compose up -d --build
+#   dig @127.0.0.1 example.com
+#
+#   docker compose kill -s HUP dnsblock     # reload config.yaml
+#   docker compose kill -s USR1 dnsblock    # log statistics (see `docker compose logs`)
+#
+# With these port mappings Docker keeps the address of clients on your LAN,
+# so `server.allow_clients` and the query log see real addresses (queries from
+# the Docker host itself show up from Docker's bridge address).
+
+services:
+  dnsblock:
+    build: .
+    image: dnsblock:latest
+    container_name: dnsblock
+    restart: unless-stopped
+    ports:
+      # Port 53 may already be taken on the host (e.g. by systemd-resolved);
+      # then bind one address, e.g. "192.168.1.5:53:53/udp".
+      - "53:53/udp"
+      - "53:53/tcp"
+    volumes:
+      - ./config.yaml:/etc/dnsblock/config.yaml:ro
+    # The healthcheck comes from the image (dnsblock --healthcheck).
+
+    # Hardening: dnsblock writes nothing, needs no capabilities and runs as
+    # an unprivileged user.
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    sysctls:
+      # Lets the unprivileged user bind port 53 (Docker's default since
+      # 20.10; set explicitly so it does not depend on the runtime).
+      net.ipv4.ip_unprivileged_port_start: 0
+    # Large lists (~1 million domains) need about 35 MB, briefly twice that
+    # while a refresh builds the new lists.
+    mem_limit: 256m
+    pids_limit: 64
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

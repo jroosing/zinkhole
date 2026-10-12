@@ -45,23 +45,91 @@ debug info, which costs disk space only, not memory).
 
 ## Run
 
+Try it in the foreground first (port 53 needs privileges, so pick another
+port in `server.listen` for a quick test):
+
 ```sh
 cp config.example.yaml config.yaml     # then edit it
 ./zig-out/bin/dnsblock --test -c config.yaml   # validate and load all lists
 ./zig-out/bin/dnsblock -c config.yaml
 ```
 
-Port 53 needs privileges. On Linux, use the hardened systemd unit in
-[deploy/dnsblock.service](deploy/dnsblock.service) (unprivileged dynamic user
-with only `CAP_NET_BIND_SERVICE`), or grant the capability to the binary:
-`setcap cap_net_bind_service=+ep /usr/local/bin/dnsblock`. Do not run it as
-root.
+For permanent use, pick the setup that fits. Each runs dnsblock as an
+unprivileged user that may only bind port 53; never run it as root.
 
-| Signal    | Effect                                                     |
-|-----------|------------------------------------------------------------|
+|          | Debian, Ubuntu (systemd)       | Alpine (OpenRC)              | Docker                                 |
+|----------|--------------------------------|------------------------------|----------------------------------------|
+| Install  | `./deploy/install.sh`          | `./deploy/install.sh`        | `docker compose up -d --build`         |
+| Config   | `/etc/dnsblock/config.yaml`    | `/etc/dnsblock/config.yaml`  | `./config.yaml`                        |
+| Reload   | `systemctl reload dnsblock`    | `rc-service dnsblock reload` | `docker compose kill -s HUP dnsblock`  |
+| Logs     | `journalctl -u dnsblock -f`    | `tail -f /var/log/messages`  | `docker compose logs -f`               |
+| Tested on| Debian 13, systemd 257         | Alpine 3.24, OpenRC 0.63     | Docker 29, Compose 5.4                 |
+
+### Debian, Ubuntu or Alpine: as a system service
+
+Build the binary for the target machine, copy the repository (or just the
+binary, `config.example.yaml` and `deploy/`) there, and run the installer as
+root:
+
+```sh
+zig build --release -Dstrip=true -Dtarget=x86_64-linux-musl   # or aarch64-linux-musl
+./deploy/install.sh                  # detects systemd or OpenRC
+./deploy/install.sh --init openrc    # ...or choose: systemd, openrc
+```
+
+The installer copies the binary to `/usr/local/bin`, installs the CA
+certificates package if it is missing, creates `/etc/dnsblock/config.yaml`
+from the example (an existing config is never overwritten), and enables the
+service. Edit the config, then start the service. Running the installer
+again upgrades and restarts; `./deploy/install.sh --uninstall` removes the
+service and binary but keeps the config.
+
+- **systemd** ([deploy/dnsblock.service](deploy/dnsblock.service)): a
+  throwaway dynamic user, read-only file system, syscall filter and other
+  sandboxing (`systemd-analyze security dnsblock` rates it 1.6, "OK").
+- **OpenRC** ([deploy/openrc/dnsblock](deploy/openrc/dnsblock)): a `dnsblock`
+  user created on first start, restarted by supervise-daemon if it crashes,
+  logs to syslog; `rc-service dnsblock stats` logs statistics.
+- **Port 53 already in use?** `systemd-resolved` (default on Ubuntu, optional
+  on Debian) listens on 127.0.0.53:53. Set `DNSStubListener=no` in
+  `/etc/systemd/resolved.conf`, or listen on the LAN address only, e.g.
+  `server.listen: ["192.168.1.5:53"]`.
+- **Proxmox LXC with systemd:** the sandboxing needs the container's
+  *nesting* feature (on by default for new unprivileged containers). Without
+  it the service fails with status 226/NAMESPACE.
+
+No Zig on the build machine? Docker can build the binary (use
+`linux/arm64` for 64-bit ARM):
+
+```sh
+docker buildx build --platform linux/amd64 -t dnsblock --load .
+mkdir -p zig-out/bin && docker create --name dnsblock-tmp dnsblock
+docker cp dnsblock-tmp:/usr/local/bin/dnsblock zig-out/bin/ && docker rm dnsblock-tmp
+```
+
+### Docker
+
+The default image is `FROM scratch`: just the static binary, CA certificates
+and a config (about 2 MB). `--target alpine` builds a variant with a shell.
+
+```sh
+cp config.example.yaml config.yaml     # then edit it
+docker compose up -d --build           # hardened: read-only, no capabilities
+docker compose kill -s HUP dnsblock    # reload config.yaml
+```
+
+The image has a healthcheck (`dnsblock --healthcheck`, which asks the server
+for `localhost`). On Docker Desktop for macOS or Windows, UDP clients appear
+with public addresses and get `REFUSED`; for local testing there, add
+`0.0.0.0/0` to `server.allow_clients`. Docker on Linux keeps real addresses.
+
+### Signals
+
+| Signal    | Effect                                                      |
+|-----------|-------------------------------------------------------------|
 | `SIGHUP`  | Reload the config file (server/upstream/cache need restart) |
-| `SIGUSR1` | Log query statistics                                       |
-| `SIGTERM` | Shut down cleanly                                          |
+| `SIGUSR1` | Log query statistics                                        |
+| `SIGTERM` | Shut down cleanly                                           |
 
 ## Configuration
 

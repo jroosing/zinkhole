@@ -47,8 +47,9 @@ pub const Server = struct {
             // IPv6-only to avoid a conflict; otherwise allow dual-stack.
             const ip6_only = if (address == .ip6) hasIp4OnPort(addresses, address.getPort()) else null;
             const udp = address.bind(server.io, .{ .mode = .dgram, .protocol = .udp, .ip6_only = ip6_only }) catch |err| {
-                if (address == .ip6 and err == error.AddressFamilyUnsupported) {
-                    log.warn("IPv6 is not available, skipping {f}", .{address});
+                // Containers and LXCs often run without IPv6; serve IPv4 then.
+                if (address == .ip6 and (err == error.AddressFamilyUnsupported or err == error.AddressUnavailable)) {
+                    log.warn("IPv6 is not available ({t}), skipping {f}", .{ err, address });
                     continue;
                 }
                 log.err("cannot listen on {f} (udp): {t}", .{ address, err });
