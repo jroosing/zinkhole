@@ -1,0 +1,106 @@
+# dnsblock configuration
+#
+# Every setting except `upstream.servers` is optional; the values shown are the
+# defaults unless marked "example". Unknown keys are errors, so typos are caught.
+# Check a config without starting the server:  dnsblock --test -c config.yaml
+# Apply changes to a running server:            kill -HUP $(pidof dnsblock)
+#   (server, upstream and cache changes need a restart)
+
+server:
+  # Addresses to answer on, UDP and TCP. IPv6 addresses need quotes in YAML.
+  listen:
+    - 0.0.0.0:53
+    - "[::]:53"
+
+  # Only clients from these networks get answers; others get REFUSED. The
+  # default covers loopback, private (10/8, 172.16/12, 192.168/16, fc00::/7),
+  # link-local and CGNAT/Tailscale (100.64/10) addresses. If your clients use
+  # global IPv6 addresses, add your prefix here. Never expose this server to
+  # the internet.
+  allow_clients:
+    - 127.0.0.0/8
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+    - 169.254.0.0/16
+    - 100.64.0.0/10
+    - ::1/128
+    - fc00::/7
+    - fe80::/10
+
+  # UDP worker threads per listen address (TCP gets 2 per address).
+  workers: 4
+
+upstream:
+  # Plain DNS servers that answer everything not handled locally. Tried in
+  # order; the one that answered last is tried first. (Required.)
+  servers:
+    - 9.9.9.9                # example: Quad9
+    - 149.112.112.112        # example
+    - "[2620:fe::fe]:53"     # example: IPv6 with explicit port
+  # How long to wait for one server before trying the next.
+  timeout_ms: 2000
+
+cache:
+  # Maximum number of cached upstream answers; 0 disables the cache.
+  # A typical answer takes 100-500 bytes.
+  size: 4096
+  # Clamp the TTLs of cached answers (seconds).
+  min_ttl: 0
+  max_ttl: 86400
+
+blocking:
+  # How blocked names are answered: `zero` (0.0.0.0 / :: and an empty answer
+  # for other record types) or `nxdomain`.
+  response: zero
+  # TTL of blocked answers (seconds).
+  ttl: 300
+  # Download the lists again this often; 0 means only at start and on reload.
+  refresh_hours: 24
+
+  # Blocklists: http(s) URLs or file paths. Formats are detected per line:
+  # hosts files, plain domains, *.wildcards, Adblock (||domain^) and dnsmasq
+  # (address=/domain/). A listed domain also blocks all of its subdomains.
+  lists:
+    - https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts                      # example
+    - https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/multi.txt       # example
+    # - /etc/dnsblock/my-blocklist.txt
+
+  # Allowlists, same formats. An allowed name is never blocked.
+  allowlists: []
+    # - /etc/dnsblock/my-allowlist.txt
+
+  # Inline rules, in any list syntax.
+  block: []
+    # - ads.example.com
+    # - "*.tracking.example"
+  allow: []
+    # - cdn.example.com
+
+local:
+  # Hostnames for your own devices and apps. A name can have several
+  # addresses, IPv4 and IPv6. `*.name` matches every name below `name` (quote
+  # it). Reverse lookups (PTR) for these addresses are answered too, and
+  # `localhost` is built in.
+  records:
+    router.lan: 192.168.1.1                      # example
+    nas.lan: [192.168.1.10, "fd00::10"]          # example
+    jellyfin.lan: 192.168.1.10                   # example
+    "*.apps.lan": 192.168.1.20                   # example: everything behind a reverse proxy
+
+  # TTL of local answers (seconds).
+  ttl: 300
+
+  # Names that cannot exist on the public internet (.lan, .home.arpa,
+  # .internal, .local, single-label names like "printer", reverse lookups of
+  # private addresses...) and are not in `records`:
+  #   nxdomain - answer NXDOMAIN, so they never leak to upstream servers
+  #   forward  - send them upstream, e.g. when upstream is your router and
+  #              knows its DHCP clients' names
+  private_names: nxdomain
+
+log:
+  # error, warn, info or debug
+  level: info
+  # Log every query: client, name, type, outcome and duration.
+  queries: false

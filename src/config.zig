@@ -1,0 +1,564 @@
+//! Configuration: loads the YAML file into typed, validated settings.
+//!
+//! Unknown keys are errors (a typo must not silently disable a setting), and
+//! every error names the line it was found on.
+
+const std = @import("std");
+const Io = std.Io;
+const net = std.Io.net;
+const Allocator = std.mem.Allocator;
+
+const yaml = @import("yaml.zig");
+const dns = @import("dns.zig");
+const ip = @import("ip.zig");
+const local = @import("local.zig");
+const blocklist = @import("blocklist.zig");
+
+const log = std.log.scoped(.config);
+
+const max_file_size = 1024 * 1024;
+
+pub const Config = struct {
+    /// Owns all strings and slices below.
+    arena: std.heap.ArenaAllocator,
+    server: Server = .{},
+    upstream: Upstream = .{},
+    cache: Cache = .{},
+    blocking: Blocking = .{},
+    local: Local = .{},
+    log: Log = .{},
+
+    pub const Server = struct {
+        listen: []const net.IpAddress = &default_listen,
+        /// Only clients in these networks may query.
+        allow_clients: []const ip.Cidr = &default_allow_clients,
+        /// UDP worker threads per listen address.
+        workers: u16 = 4,
+    };
+
+    pub const Upstream = struct {
+        servers: []const net.IpAddress = &.{},
+        timeout_ms: u32 = 2000,
+    };
+
+    pub const Cache = struct {
+        /// Maximum number of cached responses; 0 disables the cache.
+        size: u32 = 4096,
+        min_ttl: u32 = 0,
+        max_ttl: u32 = 86400,
+    };
+
+    pub const BlockResponse = enum {
+        /// 0.0.0.0 for A, :: for AAAA, an empty answer for other types.
+        zero,
+        nxdomain,
+    };
+
+    pub const Blocking = struct {
+        response: BlockResponse = .zero,
+        ttl: u32 = 300,
+        /// Reload lists this often; 0 loads them only at start and on SIGHUP.
+        refresh_hours: u32 = 24,
+        /// Blocklist URLs or file paths.
+        lists: []const []const u8 = &.{},
+        /// Allowlist URLs or file paths; allow rules beat block rules.
+        allowlists: []const []const u8 = &.{},
+        /// Inline rules, in any list syntax.
+        block: []const []const u8 = &.{},
+        allow: []const []const u8 = &.{},
+    };
+
+    pub const PrivateNames = enum {
+        /// Answer NXDOMAIN when no local record matches.
+        nxdomain,
+        /// Send them upstream (e.g. to a router that knows DHCP hostnames).
+        forward,
+    };
+
+    pub const Local = struct {
+        ttl: u32 = 300,
+        private_names: PrivateNames = .nxdomain,
+        records: []const local.Record = &.{},
+    };
+
+    pub const Log = struct {
+        level: std.log.Level = .info,
+        /// Log every query with client, name, type and outcome.
+        queries: bool = false,
+    };
+
+    pub fn deinit(config: *Config) void {
+        config.arena.deinit();
+        config.* = undefined;
+    }
+};
+
+const default_listen = [_]net.IpAddress{
+    .{ .ip4 = .unspecified(53) },
+    .{ .ip6 = .unspecified(53) },
+};
+
+/// Loopback, private (RFC 1918, RFC 4193), link-local and CGNAT networks.
+const default_allow_clients = [_]ip.Cidr{
+    ip.Cidr.parse("127.0.0.0/8").?,
+    ip.Cidr.parse("10.0.0.0/8").?,
+    ip.Cidr.parse("172.16.0.0/12").?,
+    ip.Cidr.parse("192.168.0.0/16").?,
+    ip.Cidr.parse("169.254.0.0/16").?,
+    ip.Cidr.parse("100.64.0.0/10").?,
+    ip.Cidr.parse("::1/128").?,
+    ip.Cidr.parse("fc00::/7").?,
+    ip.Cidr.parse("fe80::/10").?,
+};
+
+/// Describes why loading failed.
+pub const Diagnostic = struct {
+    /// 0 when the problem is not tied to a line.
+    line: u32 = 0,
+    buf: [256]u8 = undefined,
+    len: usize = 0,
+
+    pub fn message(diag: *const Diagnostic) []const u8 {
+        return diag.buf[0..diag.len];
+    }
+
+    fn fail(diag: *Diagnostic, line: u32, comptime format: []const u8, args: anytype) error{InvalidConfig} {
+        diag.line = line;
+        // A message too long for the buffer is cut off.
+        const text: []const u8 = std.fmt.bufPrint(&diag.buf, format, args) catch &diag.buf;
+        diag.len = text.len;
+        return error.InvalidConfig;
+    }
+};
+
+pub const Error = error{ InvalidConfig, OutOfMemory };
+
+pub fn load(io: Io, gpa: Allocator, path: []const u8, diag: *Diagnostic) Error!Config {
+    const source = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_file_size)) catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        error.StreamTooLong => return diag.fail(0, "file is larger than 1 MiB", .{}),
+        else => return diag.fail(0, "cannot read file: {t}", .{err}),
+    };
+    defer gpa.free(source);
+    return parse(gpa, source, diag);
+}
+
+pub fn parse(gpa: Allocator, source: []const u8, diag: *Diagnostic) Error!Config {
+    var tree_arena: std.heap.ArenaAllocator = .init(gpa);
+    defer tree_arena.deinit();
+    var yaml_diag: yaml.Diagnostic = .{};
+    const root = yaml.parse(tree_arena.allocator(), source, &yaml_diag) catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        error.InvalidYaml => return diag.fail(yaml_diag.line, "{s}", .{yaml_diag.message}),
+    };
+
+    var config: Config = .{ .arena = .init(gpa) };
+    errdefer config.deinit();
+    var decoder: Decoder = .{ .arena = config.arena.allocator(), .diag = diag };
+    try decoder.decodeRoot(root, &config);
+    return config;
+}
+
+/// Turns the YAML tree into a `Config`, copying kept strings into `arena`.
+const Decoder = struct {
+    arena: Allocator,
+    diag: *Diagnostic,
+
+    fn fail(d: *Decoder, line: u32, comptime format: []const u8, args: anytype) error{InvalidConfig} {
+        return d.diag.fail(line, format, args);
+    }
+
+    fn decodeRoot(d: *Decoder, root: yaml.Node, config: *Config) Error!void {
+        for (try d.mapping(root, "top level")) |pair| {
+            if (is(pair, "server")) {
+                try d.decodeServer(pair.value, &config.server);
+            } else if (is(pair, "upstream")) {
+                try d.decodeUpstream(pair.value, &config.upstream);
+            } else if (is(pair, "cache")) {
+                try d.decodeCache(pair.value, &config.cache);
+            } else if (is(pair, "blocking")) {
+                try d.decodeBlocking(pair.value, &config.blocking);
+            } else if (is(pair, "local")) {
+                try d.decodeLocal(pair.value, &config.local);
+            } else if (is(pair, "log")) {
+                try d.decodeLog(pair.value, &config.log);
+            } else {
+                return d.fail(pair.line, "unknown section '{s}'", .{pair.key});
+            }
+        }
+        if (config.upstream.servers.len == 0) {
+            return d.fail(0, "upstream.servers: at least one upstream DNS server is required", .{});
+        }
+    }
+
+    fn decodeServer(d: *Decoder, node: yaml.Node, server: *Config.Server) Error!void {
+        for (try d.mapping(node, "server")) |pair| {
+            if (is(pair, "listen")) {
+                server.listen = try d.socketAddresses(pair);
+            } else if (is(pair, "allow_clients")) {
+                const items = try d.nonEmptyList(pair);
+                const networks = try d.arena.alloc(ip.Cidr, items.len);
+                for (items, networks) |item, *network| {
+                    network.* = ip.Cidr.parse(try d.scalar(item, pair.key)) orelse
+                        return d.fail(item.line, "invalid network '{s}' (expected e.g. 192.168.0.0/16)", .{item.value.scalar});
+                }
+                server.allow_clients = networks;
+            } else if (is(pair, "workers")) {
+                server.workers = try d.integer(u16, pair, 1, 64);
+            } else {
+                return d.unknownKey(pair, "server");
+            }
+        }
+    }
+
+    fn decodeUpstream(d: *Decoder, node: yaml.Node, upstream: *Config.Upstream) Error!void {
+        for (try d.mapping(node, "upstream")) |pair| {
+            if (is(pair, "servers")) {
+                upstream.servers = try d.socketAddresses(pair);
+            } else if (is(pair, "timeout_ms")) {
+                upstream.timeout_ms = try d.integer(u32, pair, 100, 30_000);
+            } else {
+                return d.unknownKey(pair, "upstream");
+            }
+        }
+    }
+
+    fn decodeCache(d: *Decoder, node: yaml.Node, cache: *Config.Cache) Error!void {
+        for (try d.mapping(node, "cache")) |pair| {
+            if (is(pair, "size")) {
+                cache.size = try d.integer(u32, pair, 0, 1_000_000);
+            } else if (is(pair, "min_ttl")) {
+                cache.min_ttl = try d.integer(u32, pair, 0, 604_800);
+            } else if (is(pair, "max_ttl")) {
+                cache.max_ttl = try d.integer(u32, pair, 0, 604_800);
+            } else {
+                return d.unknownKey(pair, "cache");
+            }
+        }
+        if (cache.min_ttl > cache.max_ttl) return d.fail(node.line, "cache: min_ttl is larger than max_ttl", .{});
+    }
+
+    fn decodeBlocking(d: *Decoder, node: yaml.Node, blocking: *Config.Blocking) Error!void {
+        for (try d.mapping(node, "blocking")) |pair| {
+            if (is(pair, "response")) {
+                blocking.response = try d.enumeration(Config.BlockResponse, pair);
+            } else if (is(pair, "ttl")) {
+                blocking.ttl = try d.integer(u32, pair, 0, 86_400);
+            } else if (is(pair, "refresh_hours")) {
+                blocking.refresh_hours = try d.integer(u32, pair, 0, 8760);
+            } else if (is(pair, "lists")) {
+                blocking.lists = try d.listSources(pair);
+            } else if (is(pair, "allowlists")) {
+                blocking.allowlists = try d.listSources(pair);
+            } else if (is(pair, "block")) {
+                blocking.block = try d.inlineRules(pair);
+            } else if (is(pair, "allow")) {
+                blocking.allow = try d.inlineRules(pair);
+            } else {
+                return d.unknownKey(pair, "blocking");
+            }
+        }
+    }
+
+    fn decodeLocal(d: *Decoder, node: yaml.Node, local_config: *Config.Local) Error!void {
+        for (try d.mapping(node, "local")) |pair| {
+            if (is(pair, "ttl")) {
+                local_config.ttl = try d.integer(u32, pair, 0, 86_400);
+            } else if (is(pair, "private_names")) {
+                local_config.private_names = try d.enumeration(Config.PrivateNames, pair);
+            } else if (is(pair, "records")) {
+                local_config.records = try d.records(pair.value);
+            } else {
+                return d.unknownKey(pair, "local");
+            }
+        }
+    }
+
+    fn decodeLog(d: *Decoder, node: yaml.Node, log_config: *Config.Log) Error!void {
+        for (try d.mapping(node, "log")) |pair| {
+            if (is(pair, "level")) {
+                const value = try d.scalar(pair.value, pair.key);
+                const levels = [_]struct { []const u8, std.log.Level }{
+                    .{ "error", .err }, .{ "warn", .warn }, .{ "info", .info }, .{ "debug", .debug },
+                };
+                for (levels) |entry| {
+                    if (std.mem.eql(u8, value, entry[0])) {
+                        log_config.level = entry[1];
+                        break;
+                    }
+                } else return d.fail(pair.value.line, "log.level must be error, warn, info or debug", .{});
+            } else if (is(pair, "queries")) {
+                log_config.queries = try d.boolean(pair);
+            } else {
+                return d.unknownKey(pair, "log");
+            }
+        }
+    }
+
+    /// `name: address` or `name: [address, ...]`; `*.name` for wildcards.
+    fn records(d: *Decoder, node: yaml.Node) Error![]const local.Record {
+        const pairs = try d.mapping(node, "local.records");
+        const result = try d.arena.alloc(local.Record, pairs.len);
+        for (pairs, result, 0..) |pair, *record, i| {
+            const wildcard = std.mem.startsWith(u8, pair.key, "*.");
+            var name_buf: [dns.max_name_len]u8 = undefined;
+            const name = dns.normalizeName(if (wildcard) pair.key[2..] else pair.key, &name_buf) orelse
+                return d.fail(pair.line, "invalid hostname '{s}'", .{pair.key});
+            for (result[0..i]) |previous| {
+                if (previous.wildcard == wildcard and std.mem.eql(u8, previous.name, name)) {
+                    return d.fail(pair.line, "hostname '{s}' is defined twice", .{pair.key});
+                }
+            }
+
+            const values: []const yaml.Node = switch (pair.value.value) {
+                .scalar => (&pair.value)[0..1],
+                .sequence => |items| items,
+                else => &.{},
+            };
+            if (values.len == 0) return d.fail(pair.line, "'{s}' needs at least one IP address", .{pair.key});
+            if (values.len > local.max_addresses) {
+                return d.fail(pair.line, "'{s}' has more than {d} addresses", .{ pair.key, local.max_addresses });
+            }
+            const addresses = try d.arena.alloc(ip.Ip, values.len);
+            for (values, addresses) |value, *address| {
+                const text = try d.scalar(value, pair.key);
+                address.* = ip.Ip.parse(text) orelse
+                    return d.fail(value.line, "'{s}' is not an IP address", .{text});
+            }
+            record.* = .{ .name = try d.arena.dupe(u8, name), .wildcard = wildcard, .addresses = addresses };
+        }
+        return result;
+    }
+
+    fn socketAddresses(d: *Decoder, pair: yaml.Pair) Error![]const net.IpAddress {
+        const items = try d.nonEmptyList(pair);
+        const addresses = try d.arena.alloc(net.IpAddress, items.len);
+        for (items, addresses) |item, *address| {
+            const text = try d.scalar(item, pair.key);
+            address.* = ip.parseSocketAddress(text, 53) orelse
+                return d.fail(item.line, "'{s}' is not an IP address with optional port", .{text});
+        }
+        return addresses;
+    }
+
+    /// Blocklist sources: http(s) URLs or file paths.
+    fn listSources(d: *Decoder, pair: yaml.Pair) Error![]const []const u8 {
+        const sources = try d.stringList(pair);
+        for (sources, (try d.list(pair))) |source, item| {
+            if (blocklist.isUrl(source)) {
+                _ = std.Uri.parse(source) catch return d.fail(item.line, "invalid URL '{s}'", .{source});
+                if (std.mem.startsWith(u8, source, "http://")) {
+                    log.warn("line {d}: {s} is fetched without TLS; prefer https://", .{ item.line, source });
+                }
+            }
+        }
+        return sources;
+    }
+
+    /// Inline rules must each be valid, so typos fail loudly instead of
+    /// being skipped like unsupported lines in a downloaded list.
+    fn inlineRules(d: *Decoder, pair: yaml.Pair) Error![]const []const u8 {
+        const rules = try d.stringList(pair);
+        for (rules, (try d.list(pair))) |rule, item| {
+            var counter: RuleCounter = .{};
+            blocklist.parseLine(rule, &counter) catch unreachable;
+            if (counter.rules == 0) return d.fail(item.line, "'{s}' is not a valid domain or rule", .{rule});
+        }
+        return rules;
+    }
+
+    // Value helpers ---------------------------------------------------------
+
+    fn mapping(d: *Decoder, node: yaml.Node, what: []const u8) Error![]const yaml.Pair {
+        return switch (node.value) {
+            .empty => &.{},
+            .mapping => |pairs| pairs,
+            else => d.fail(node.line, "{s}: expected 'key: value' entries", .{what}),
+        };
+    }
+
+    fn list(d: *Decoder, pair: yaml.Pair) Error![]const yaml.Node {
+        return switch (pair.value.value) {
+            .empty => &.{},
+            .sequence => |items| items,
+            else => d.fail(pair.value.line, "{s}: expected a list", .{pair.key}),
+        };
+    }
+
+    fn nonEmptyList(d: *Decoder, pair: yaml.Pair) Error![]const yaml.Node {
+        const items = try d.list(pair);
+        if (items.len == 0) return d.fail(pair.line, "{s}: the list is empty", .{pair.key});
+        return items;
+    }
+
+    fn stringList(d: *Decoder, pair: yaml.Pair) Error![]const []const u8 {
+        const items = try d.list(pair);
+        const strings = try d.arena.alloc([]const u8, items.len);
+        for (items, strings) |item, *string| {
+            string.* = try d.arena.dupe(u8, try d.scalar(item, pair.key));
+        }
+        return strings;
+    }
+
+    fn scalar(d: *Decoder, node: yaml.Node, key: []const u8) Error![]const u8 {
+        return switch (node.value) {
+            .scalar => |value| value,
+            else => d.fail(node.line, "{s}: expected a single value", .{key}),
+        };
+    }
+
+    fn integer(d: *Decoder, comptime T: type, pair: yaml.Pair, min: T, max: T) Error!T {
+        const text = try d.scalar(pair.value, pair.key);
+        const value = std.fmt.parseInt(T, text, 10) catch
+            return d.fail(pair.value.line, "{s}: '{s}' is not a whole number", .{ pair.key, text });
+        if (value < min or value > max) {
+            return d.fail(pair.value.line, "{s}: must be between {d} and {d}", .{ pair.key, min, max });
+        }
+        return value;
+    }
+
+    fn boolean(d: *Decoder, pair: yaml.Pair) Error!bool {
+        const text = try d.scalar(pair.value, pair.key);
+        if (std.mem.eql(u8, text, "true")) return true;
+        if (std.mem.eql(u8, text, "false")) return false;
+        return d.fail(pair.value.line, "{s}: expected true or false", .{pair.key});
+    }
+
+    fn enumeration(d: *Decoder, comptime E: type, pair: yaml.Pair) Error!E {
+        const text = try d.scalar(pair.value, pair.key);
+        return std.meta.stringToEnum(E, text) orelse {
+            const names = comptime names: {
+                var joined: []const u8 = "";
+                for (std.meta.fieldNames(E), 0..) |name, i| joined = joined ++ (if (i == 0) "" else ", ") ++ name;
+                break :names joined;
+            };
+            return d.fail(pair.value.line, "{s}: expected one of: {s}", .{ pair.key, names });
+        };
+    }
+
+    fn unknownKey(d: *Decoder, pair: yaml.Pair, section: []const u8) error{InvalidConfig} {
+        return d.fail(pair.line, "unknown key '{s}' in section '{s}'", .{ pair.key, section });
+    }
+};
+
+fn is(pair: yaml.Pair, key: []const u8) bool {
+    return std.mem.eql(u8, pair.key, key);
+}
+
+/// Counts what `blocklist.parseLine` finds, to validate inline rules.
+const RuleCounter = struct {
+    rules: usize = 0,
+    stats: blocklist.Stats = .{},
+
+    pub fn add(counter: *RuleCounter, _: blocklist.Rule) error{}!void {
+        counter.rules += 1;
+    }
+
+    pub fn skip(_: *RuleCounter) void {}
+};
+
+// ---------------------------------------------------------------------------
+// Tests
+
+const testing = std.testing;
+
+fn expectConfigError(source: []const u8, line: u32, message_part: []const u8) !void {
+    var diag: Diagnostic = .{};
+    try testing.expectError(error.InvalidConfig, parse(testing.allocator, source, &diag));
+    try testing.expectEqual(line, diag.line);
+    if (std.mem.find(u8, diag.message(), message_part) == null) {
+        std.debug.print("unexpected message: {s}\n", .{diag.message()});
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "full configuration" {
+    var diag: Diagnostic = .{};
+    var config = try parse(testing.allocator,
+        \\server:
+        \\  listen: ["127.0.0.1:5353", "[::1]:5353"]
+        \\  allow_clients: [192.168.0.0/16, "fd00::/8"]
+        \\  workers: 2
+        \\upstream:
+        \\  servers:
+        \\    - 9.9.9.9
+        \\    - "[2620:fe::fe]:53"
+        \\  timeout_ms: 1500
+        \\cache:
+        \\  size: 100
+        \\  min_ttl: 10
+        \\blocking:
+        \\  response: nxdomain
+        \\  refresh_hours: 12
+        \\  lists:
+        \\    - https://example.com/hosts.txt
+        \\    - /etc/dnsblock/local.txt
+        \\  block: ["ads.example.com", "||tracker.example^", "*.wild.example"]
+        \\  allow: [ok.example.com]
+        \\local:
+        \\  ttl: 60
+        \\  private_names: forward
+        \\  records:
+        \\    NAS.lan: 192.168.1.10
+        \\    router.lan: [192.168.1.1, "fd00::1"]
+        \\    "*.apps.lan": 192.168.1.20
+        \\log:
+        \\  level: debug
+        \\  queries: true
+    , &diag);
+    defer config.deinit();
+
+    try testing.expectEqual(2, config.server.listen.len);
+    try testing.expectEqual(5353, config.server.listen[1].getPort());
+    try testing.expectEqual(2, config.server.allow_clients.len);
+    try testing.expectEqual(2, config.server.workers);
+    try testing.expectEqual(2, config.upstream.servers.len);
+    try testing.expectEqual(1500, config.upstream.timeout_ms);
+    try testing.expectEqual(100, config.cache.size);
+    try testing.expectEqual(10, config.cache.min_ttl);
+    try testing.expectEqual(Config.BlockResponse.nxdomain, config.blocking.response);
+    try testing.expectEqual(2, config.blocking.lists.len);
+    try testing.expectEqual(3, config.blocking.block.len);
+    try testing.expectEqual(Config.PrivateNames.forward, config.local.private_names);
+
+    const records = config.local.records;
+    try testing.expectEqual(3, records.len);
+    try testing.expectEqualStrings("nas.lan", records[0].name);
+    try testing.expectEqual(2, records[1].addresses.len);
+    try testing.expect(records[2].wildcard);
+    try testing.expectEqualStrings("apps.lan", records[2].name);
+
+    try testing.expectEqual(std.log.Level.debug, config.log.level);
+    try testing.expect(config.log.queries);
+}
+
+test "defaults" {
+    var diag: Diagnostic = .{};
+    var config = try parse(testing.allocator, "upstream:\n  servers: [1.1.1.1]\n", &diag);
+    defer config.deinit();
+    try testing.expectEqual(2, config.server.listen.len);
+    try testing.expectEqual(4, config.server.workers);
+    try testing.expectEqual(4096, config.cache.size);
+    try testing.expectEqual(Config.BlockResponse.zero, config.blocking.response);
+    try testing.expect(ip.isAllowed(config.server.allow_clients, .{ .ip4 = .{ .bytes = .{ 192, 168, 1, 1 }, .port = 1 } }));
+    try testing.expect(!ip.isAllowed(config.server.allow_clients, .{ .ip4 = .{ .bytes = .{ 8, 8, 8, 8 }, .port = 1 } }));
+}
+
+test "configuration errors name the line" {
+    try expectConfigError("", 0, "upstream");
+    try expectConfigError("upstream:\n  servers: [1.1.1.1]\n  timeout: 5", 3, "unknown key 'timeout'");
+    try expectConfigError("upstrem:\n  servers: [1.1.1.1]", 1, "unknown section");
+    try expectConfigError("upstream:\n  servers: [dns.google]", 2, "not an IP address");
+    try expectConfigError("upstream:\n  servers: []", 2, "empty");
+    try expectConfigError("upstream:\n  servers: [1.1.1.1]\nserver:\n  workers: 0", 4, "between 1 and 64");
+    try expectConfigError("upstream:\n  servers: [1.1.1.1]\nblocking:\n  response: refuse", 4, "zero, nxdomain");
+    try expectConfigError("upstream:\n  servers: [1.1.1.1]\nblocking:\n  block:\n    - not a domain", 5, "not a valid domain");
+    try expectConfigError("upstream:\n  servers: [1.1.1.1]\nlocal:\n  records:\n    nas.lan: 999.1.1.1", 5, "not an IP address");
+    try expectConfigError("upstream:\n  servers: [1.1.1.1]\nlocal:\n  records:\n    nas.lan: 10.0.0.1\n    NAS.LAN: 10.0.0.2", 6, "defined twice");
+    try expectConfigError("upstream:\n  servers: [1.1.1.1]\nlocal:\n  records:\n    bad_host!: 10.0.0.1", 5, "invalid hostname");
+    try expectConfigError("upstream:\n  servers: [1.1.1.1]\nlog:\n  queries: yes", 4, "true or false");
+    try expectConfigError("upstream:\n  servers: [1.1.1.1]\ncache:\n  min_ttl: 10\n  max_ttl: 5", 4, "min_ttl");
+    try expectConfigError("upstream:\n  servers: [1.1.1.1]\nserver:\n  allow_clients: [192.168.0.0/40]", 4, "invalid network");
+    try expectConfigError("upstream: [1.1.1.1]", 1, "expected 'key: value'");
+    try expectConfigError("a: b: c", 1, "unexpected ':'");
+}

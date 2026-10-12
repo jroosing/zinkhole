@@ -1,0 +1,17 @@
+.{
+    .name = .dnsblock,
+    .version = "0.1.0",
+    .fingerprint = 0x228559c08d161fc9, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.17.0",
+    // No dependencies on purpose: everything (YAML subset, DNS wire format,
+    // HTTP/TLS via std) is implemented in this repository or the standard library.
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+        "config.example.yaml",
+        "deploy",
+    },
+}
