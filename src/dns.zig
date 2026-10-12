@@ -68,7 +68,8 @@ pub const Rcode = enum(u4) {
 };
 
 /// The 16-bit flags word of the header. Fields are listed from the least
-/// significant bit, matching the wire layout once read as a big-endian u16.
+/// significant bit, matching the wire layout once read as a big-endian u16;
+/// convert with `@backingInt` / `@fromBackingInt`.
 pub const Flags = packed struct(u16) {
     rcode: Rcode,
     cd: bool,
@@ -131,7 +132,7 @@ pub fn parseQuery(msg: []const u8, name_buf: *[max_name_len]u8) QueryError!Query
 
     const name_len, var pos = try readQuestionName(msg, header_len, name_buf);
     if (msg.len - pos < 4) return error.FormatError;
-    const qtype: Type = @fromBackingInt(@intCast(readU16(msg, pos)));
+    const qtype: Type = @fromBackingInt(readU16(msg, pos));
     const qclass = readU16(msg, pos + 2);
     pos += 4;
 
@@ -238,7 +239,7 @@ pub const RecordIterator = struct {
         it.pos = rdata + rdata_len;
 
         return .{
-            .type = @fromBackingInt(@intCast(readU16(it.msg, fields))),
+            .type = @fromBackingInt(readU16(it.msg, fields)),
             .class = readU16(it.msg, fields + 2),
             .ttl = readU32(it.msg, fields + 4),
             .section = @fromBackingInt(@intCast(it.section)),
@@ -360,11 +361,11 @@ pub fn setId(msg: []u8, id: u16) void {
 }
 
 pub fn readFlags(msg: []const u8) Flags {
-    return @bitCast(readU16(msg, 2));
+    return @fromBackingInt(readU16(msg, 2));
 }
 
 pub fn writeFlags(msg: []u8, flags: Flags) void {
-    writeU16(msg, 2, @bitCast(flags));
+    writeU16(msg, 2, @backingInt(flags));
 }
 
 // ---------------------------------------------------------------------------
@@ -402,7 +403,7 @@ pub fn writeResponse(out: []u8, query: []const u8, q: *const Query, options: Res
     flags.rcode = options.rcode;
 
     try b.int(u16, q.id);
-    try b.int(u16, @bitCast(flags));
+    try b.int(u16, @backingInt(flags));
     try b.int(u16, 1);
     try b.int(u16, @intCast(options.answers.len));
     try b.int(u16, 0);
@@ -783,7 +784,7 @@ test "isAtOrBelow" {
 test "Type formatting" {
     var buf: [16]u8 = undefined;
     try testing.expectEqualStrings("AAAA", try std.fmt.bufPrint(&buf, "{f}", .{Type.aaaa}));
-    try testing.expectEqualStrings("TYPE999", try std.fmt.bufPrint(&buf, "{f}", .{@as(Type, @fromBackingInt(@intCast(999)))}));
+    try testing.expectEqualStrings("TYPE999", try std.fmt.bufPrint(&buf, "{f}", .{@as(Type, @fromBackingInt(999))}));
 }
 
 test "random and mutated messages never break the parsers" {

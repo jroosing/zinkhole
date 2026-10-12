@@ -20,6 +20,9 @@ No web UI, no database, no state on disk: one static binary and one YAML file.
   names, reverse lookups of private IPs) never leak upstream; client EDNS
   options (cookies, client subnet) are stripped before forwarding; Firefox's
   DNS-over-HTTPS canary is answered so it keeps using your resolver.
+- **DNS over TLS** to upstream servers, so your ISP can neither read nor
+  alter your queries. Connections are reused, so after the first query it is
+  as fast as plain DNS.
 - **Caching** of upstream answers (LRU, TTL-aware, bounded).
 - UDP and TCP, IPv4 and IPv6, upstream failover, TCP fallback for large
   answers.
@@ -67,7 +70,9 @@ setting. A minimal config only needs upstream servers:
 
 ```yaml
 upstream:
-  servers: [9.9.9.9, 149.112.112.112]
+  servers:
+    - tls://9.9.9.9#dns.quad9.net          # DNS over TLS: address#certificate name
+    - tls://149.112.112.112#dns.quad9.net
 blocking:
   lists:
     - https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts
@@ -109,7 +114,8 @@ so clients cannot get around a block through HTTPS/SVCB records.
 | `blocklist.zig` | Line parser for all list formats, streaming loader (file/HTTPS) |
 | `local.zig` | Local records, wildcards, reverse lookups, private zones |
 | `cache.zig` | Bounded LRU response cache |
-| `upstream.zig` | Forwarding with failover and TCP fallback |
+| `upstream.zig` | Forwarding with failover; plain DNS with TCP fallback |
+| `dot.zig` | DNS over TLS: pooled TLS connections, certificate checks |
 | `dns.zig` | DNS wire format: parsing, building, TTL handling |
 
 **Domain set.** Every domain is stored once in one byte array as
@@ -127,6 +133,16 @@ immutable once built; a reload builds new ones on the side and swaps a
 pointer under a read-write lock that queries hold only for the in-memory
 lookup, never during network I/O.
 
+**DNS over TLS.** A TLS handshake costs several round trips, so each
+upstream server keeps up to 4 idle connections open (about 52 KB each). A
+connection carries one query at a time and is thrown away after any error,
+so a reused connection never holds a stray answer. Connections idle for more
+than 8 seconds are closed (Cloudflare and Quad9 close them after about 10),
+and if a reused connection turns out to be closed, the query is retried once
+on a new one. Servers are addressed by IP, so no name lookup is needed to
+reach them (no bootstrap problem); the configured name is checked against the
+certificate, which must chain to the system's CA certificates.
+
 **List loading.** The server starts answering immediately with local records
 and inline rules while lists download in the background. This also lets the
 host resolve the list servers' names through dnsblock itself. Lists are
@@ -140,10 +156,13 @@ the refresh is retried with exponential backoff.
   length read from a DNS message is checked before use; malformed packets get
   `FORMERR` or are dropped. The parsers are tested against random and mutated
   input, and the server has been run under ThreadSanitizer with concurrent
-  queries and reloads.
-- Spoofing resistance upstream: a fresh socket (random source port) and a
-  random query ID per exchange, and only answers from the right address with
-  the same ID and question are accepted.
+  queries and reloads. Pointer-stability locks make safe builds panic if a
+  buffer that other code points into (the listener sockets workers use, the
+  domain bytes a hash table reads) could be reallocated.
+- Upstream queries can use DNS over TLS with certificate verification. For
+  plain DNS upstreams: a fresh socket (random source port) and a random
+  query ID per exchange, and only answers from the right address with the
+  same ID and question are accepted.
 - Only allowed client networks are answered (default: private ranges), so an
   accidentally exposed port is not an open resolver. Zone transfers and
   non-IN classes are refused.
@@ -155,6 +174,7 @@ the refresh is retried with exponential backoff.
 
 ## Limitations
 
-- Upstream servers speak plain DNS (no DNS-over-TLS/HTTPS upstream).
+- No DNS over HTTPS upstream, and dnsblock itself answers plain DNS only
+  (inside a LAN, encrypting the client side adds little).
 - Regular-expression rules and per-client blocking groups are not supported.
 - Lists are downloaded again on every start (nothing is stored on disk).

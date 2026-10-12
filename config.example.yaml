@@ -32,12 +32,21 @@ server:
   workers: 4
 
 upstream:
-  # Plain DNS servers that answer everything not handled locally. Tried in
-  # order; the one that answered last is tried first. (Required.)
+  # DNS servers that answer everything not handled locally. Tried in order;
+  # the one that answered last is tried first. (Required.)
+  #
+  # DNS over TLS (recommended): tls://<ip>[:port]#<name>, where <name> is the
+  # name on the server's certificate. Queries are encrypted, so your ISP can
+  # neither read nor alter them. The port defaults to 853.
+  #   Quad9:      tls://9.9.9.9#dns.quad9.net       tls://149.112.112.112#dns.quad9.net
+  #   Cloudflare: tls://1.1.1.1#cloudflare-dns.com  tls://1.0.0.1#cloudflare-dns.com
+  #   Google:     tls://8.8.8.8#dns.google          tls://8.8.4.4#dns.google
+  # Plain DNS: <ip>[:port], e.g. 192.168.1.1 (your router) or "[2620:fe::fe]:53".
+  # Avoid mixing the two: whenever a plain server is used, queries are unencrypted.
   servers:
-    - 9.9.9.9                # example: Quad9
-    - 149.112.112.112        # example
-    - "[2620:fe::fe]:53"     # example: IPv6 with explicit port
+    - tls://9.9.9.9#dns.quad9.net                   # example
+    - tls://149.112.112.112#dns.quad9.net           # example
+    - "tls://[2620:fe::fe]#dns.quad9.net"           # example: IPv6 needs quotes
   # How long to wait for one server before trying the next.
   timeout_ms: 2000
 

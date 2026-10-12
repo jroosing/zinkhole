@@ -57,6 +57,10 @@ pub const DomainSet = struct {
         if (set.bytes.items.len + 1 + name.len > std.math.maxInt(u32)) return error.SetFull;
         // Reserve first, so nothing can fail after the map entry exists.
         try set.bytes.ensureUnusedCapacity(gpa, 1 + name.len);
+        // The hash contexts read `bytes` while the map rehashes, so it must
+        // not move until the entry is complete.
+        set.bytes.lockPointers();
+        defer set.bytes.unlockPointers();
 
         const gop = try set.map.getOrPutContextAdapted(gpa, name, set.adapter(), set.context());
         if (gop.found_existing) {

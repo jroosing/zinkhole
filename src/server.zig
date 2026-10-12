@@ -31,6 +31,8 @@ pub const Server = struct {
     tcp_listeners: std.ArrayList(net.Server) = .empty,
     workers: []Worker = &.{},
     group: Io.Group = .init,
+    /// Set once workers hold pointers into the socket lists.
+    pointers_locked: bool = false,
 
     const Worker = struct {
         server: *Server,
@@ -80,6 +82,13 @@ pub const Server = struct {
         server.workers = try server.gpa.alloc(Worker, udp_count + tcp_count);
         for (server.workers) |*worker| worker.server = server;
 
+        // Workers keep pointers into the socket lists: from here on, any
+        // operation that could move them panics instead of leaving workers
+        // with dangling pointers.
+        server.udp_sockets.lockPointers();
+        server.tcp_listeners.lockPointers();
+        server.pointers_locked = true;
+
         var next: usize = 0;
         for (server.udp_sockets.items) |*socket| {
             for (0..udp_workers) |_| {
@@ -98,6 +107,10 @@ pub const Server = struct {
     /// Stops all workers and closes the sockets.
     pub fn deinit(server: *Server) void {
         server.group.cancel(server.io);
+        if (server.pointers_locked) {
+            server.udp_sockets.unlockPointers();
+            server.tcp_listeners.unlockPointers();
+        }
         for (server.udp_sockets.items) |socket| socket.close(server.io);
         for (server.tcp_listeners.items) |*listener| listener.deinit(server.io);
         server.udp_sockets.deinit(server.gpa);

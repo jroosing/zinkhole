@@ -65,6 +65,9 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     };
     const gpa = if (builtin.mode == .debug) debug_allocator.allocator() else std.heap.smp_allocator;
 
+    // Blocking I/O on a fixed set of threads. All code takes an `Io`, so the
+    // evented implementations (io_uring, Grand Central Dispatch) could be
+    // swapped in here once they leave experimental status.
     var threaded: Io.Threaded = .init(gpa, .{
         .stack_size = thread_stack_size,
         .argv0 = .init(init.args),
@@ -150,10 +153,9 @@ fn run(io: Io, gpa: Allocator, config_path: []const u8, cfg: *Config) !void {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var upstream: Upstream = .{
-        .servers = try arena.dupe(Io.net.IpAddress, cfg.upstream.servers),
-        .timeout_ms = cfg.upstream.timeout_ms,
-    };
+    var upstream: Upstream = undefined;
+    try upstream.init(io, gpa, cfg.upstream.servers, cfg.upstream.timeout_ms);
+    defer upstream.deinit();
     var cache: Cache = try .init(gpa, .{
         .capacity = cfg.cache.size,
         .min_ttl = cfg.cache.min_ttl,
@@ -203,7 +205,7 @@ fn run(io: Io, gpa: Allocator, config_path: []const u8, cfg: *Config) !void {
 
     signals.install();
     log.info("dnsblock {s} ready ({d} upstream servers, {d} local records)", .{
-        version, upstream.servers.len, cfg.local.records.len,
+        version, upstream.endpoints.len, cfg.local.records.len,
     });
     app.supervise();
 }
@@ -414,4 +416,7 @@ test {
     _ = @import("config.zig");
     _ = @import("rules.zig");
     _ = @import("resolver.zig");
+    _ = @import("upstream.zig");
+    _ = @import("dot.zig");
+    _ = @import("tcp.zig");
 }

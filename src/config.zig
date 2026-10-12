@@ -13,6 +13,7 @@ const dns = @import("dns.zig");
 const ip = @import("ip.zig");
 const local = @import("local.zig");
 const blocklist = @import("blocklist.zig");
+const upstream_mod = @import("upstream.zig");
 
 const log = std.log.scoped(.config);
 
@@ -37,7 +38,7 @@ pub const Config = struct {
     };
 
     pub const Upstream = struct {
-        servers: []const net.IpAddress = &.{},
+        servers: []const upstream_mod.Server = &.{},
         timeout_ms: u32 = 2000,
     };
 
@@ -214,7 +215,7 @@ const Decoder = struct {
     fn decodeUpstream(d: *Decoder, node: yaml.Node, upstream: *Config.Upstream) Error!void {
         for (try d.mapping(node, "upstream")) |pair| {
             if (is(pair, "servers")) {
-                upstream.servers = try d.socketAddresses(pair);
+                upstream.servers = try d.upstreamServers(pair);
             } else if (is(pair, "timeout_ms")) {
                 upstream.timeout_ms = try d.integer(u32, pair, 100, 30_000);
             } else {
@@ -339,6 +340,36 @@ const Decoder = struct {
                 return d.fail(item.line, "'{s}' is not an IP address with optional port", .{text});
         }
         return addresses;
+    }
+
+    /// Plain DNS: `ip`, `ip:port`, `[ipv6]:port`. DNS over TLS:
+    /// `tls://ip[:port]#name`, where `name` is what the server's certificate
+    /// must carry (the format Unbound uses, minus the hostname lookup).
+    fn upstreamServers(d: *Decoder, pair: yaml.Pair) Error![]const upstream_mod.Server {
+        const items = try d.nonEmptyList(pair);
+        const servers = try d.arena.alloc(upstream_mod.Server, items.len);
+        for (items, servers) |item, *server| {
+            const text = try d.scalar(item, pair.key);
+            const tls_prefix = "tls://";
+            if (!std.mem.startsWith(u8, text, tls_prefix)) {
+                server.* = .{ .address = ip.parseSocketAddress(text, upstream_mod.plain_port) orelse
+                    return d.fail(item.line, "'{s}' is not an IP address with optional port", .{text}) };
+                continue;
+            }
+            const rest = text[tls_prefix.len..];
+            const hash = std.mem.findScalar(u8, rest, '#') orelse
+                return d.fail(item.line, "'{s}' needs the server's TLS name after '#', e.g. tls://9.9.9.9#dns.quad9.net", .{text});
+            const address = ip.parseSocketAddress(rest[0..hash], upstream_mod.tls_port) orelse
+                return d.fail(item.line, "'{s}' is not an IP address with optional port", .{rest[0..hash]});
+            var name_buf: [dns.max_name_len]u8 = undefined;
+            const name = dns.normalizeName(rest[hash + 1 ..], &name_buf) orelse
+                return d.fail(item.line, "'{s}' is not a valid TLS name", .{rest[hash + 1 ..]});
+            if (ip.Ip.parse(name) != null) {
+                return d.fail(item.line, "the TLS name must be a hostname (e.g. dns.quad9.net), not an IP address", .{});
+            }
+            server.* = .{ .address = address, .tls_name = try d.arena.dupe(u8, name) };
+        }
+        return servers;
     }
 
     /// Blocklist sources: http(s) URLs or file paths.
@@ -483,6 +514,8 @@ test "full configuration" {
         \\  servers:
         \\    - 9.9.9.9
         \\    - "[2620:fe::fe]:53"
+        \\    - tls://149.112.112.112#DNS.Quad9.net
+        \\    - "tls://[2620:fe::9]:8853#dns.quad9.net"
         \\  timeout_ms: 1500
         \\cache:
         \\  size: 100
@@ -512,7 +545,14 @@ test "full configuration" {
     try testing.expectEqual(5353, config.server.listen[1].getPort());
     try testing.expectEqual(2, config.server.allow_clients.len);
     try testing.expectEqual(2, config.server.workers);
-    try testing.expectEqual(2, config.upstream.servers.len);
+    const servers = config.upstream.servers;
+    try testing.expectEqual(4, servers.len);
+    try testing.expectEqual(null, servers[0].tls_name);
+    try testing.expectEqual(53, servers[0].address.getPort());
+    try testing.expectEqualStrings("dns.quad9.net", servers[2].tls_name.?);
+    try testing.expectEqual(853, servers[2].address.getPort());
+    try testing.expectEqual(8853, servers[3].address.getPort());
+    try testing.expect(servers[3].address == .ip6);
     try testing.expectEqual(1500, config.upstream.timeout_ms);
     try testing.expectEqual(100, config.cache.size);
     try testing.expectEqual(10, config.cache.min_ttl);
@@ -550,6 +590,10 @@ test "configuration errors name the line" {
     try expectConfigError("upstrem:\n  servers: [1.1.1.1]", 1, "unknown section");
     try expectConfigError("upstream:\n  servers: [dns.google]", 2, "not an IP address");
     try expectConfigError("upstream:\n  servers: []", 2, "empty");
+    try expectConfigError("upstream:\n  servers: [tls://9.9.9.9]", 2, "needs the server's TLS name");
+    try expectConfigError("upstream:\n  servers: [tls://dns.quad9.net#dns.quad9.net]", 2, "not an IP address");
+    try expectConfigError("upstream:\n  servers: [tls://9.9.9.9#9.9.9.9]", 2, "must be a hostname");
+    try expectConfigError("upstream:\n  servers: [tls://9.9.9.9#bad_name!]", 2, "not a valid TLS name");
     try expectConfigError("upstream:\n  servers: [1.1.1.1]\nserver:\n  workers: 0", 4, "between 1 and 64");
     try expectConfigError("upstream:\n  servers: [1.1.1.1]\nblocking:\n  response: refuse", 4, "zero, nxdomain");
     try expectConfigError("upstream:\n  servers: [1.1.1.1]\nblocking:\n  block:\n    - not a domain", 5, "not a valid domain");
