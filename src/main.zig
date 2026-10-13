@@ -26,6 +26,7 @@ const Server = @import("server.zig").Server;
 const Upstream = @import("upstream.zig").Upstream;
 
 const log = std.log.scoped(.main);
+const testing = std.testing;
 
 pub const std_options: std.Options = .{
     // All levels are compiled in; `log.level` in the config filters at runtime.
@@ -35,7 +36,8 @@ pub const std_options: std.Options = .{
     .http_enable_ssl_key_log_file = false,
 };
 
-const version = "0.1.0";
+/// From build.zig.zon (see build.zig).
+const version = @import("build_options").version;
 const default_config_path = "/etc/zinkhole/config.yaml";
 
 /// Answering queries needs little stack; TLS handshakes during list
@@ -55,6 +57,7 @@ const usage =
     \\Options:
     \\  -c, --config <path>  configuration file (default: /etc/zinkhole/config.yaml)
     \\  -t, --test           check the configuration, load all lists, then exit
+    \\  --check              only validate the configuration (no network), then exit
     \\  --healthcheck [addr] ask a running server (default 127.0.0.1:53) for
     \\                       "localhost"; exit 0 if it answers (for containers)
     \\  -h, --help           show this help
@@ -86,6 +89,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     var config_path: []const u8 = default_config_path;
     var test_only = false;
+    var check_only = false;
     var args = init.args.iterate();
     _ = args.skip(); // program name
     while (args.next()) |arg| {
@@ -96,6 +100,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             };
         } else if (eql(arg, "-t") or eql(arg, "--test")) {
             test_only = true;
+        } else if (eql(arg, "--check")) {
+            check_only = true;
         } else if (eql(arg, "--healthcheck")) {
             return healthcheck(io, args.next() orelse "127.0.0.1:53");
         } else if (eql(arg, "-h") or eql(arg, "--help")) {
@@ -110,18 +116,9 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         }
     }
 
-    var diag: config.Diagnostic = .{};
-    var cfg = config.load(io, gpa, config_path, &diag) catch |err| switch (err) {
-        error.OutOfMemory => |e| return e,
-        error.InvalidConfig => {
-            if (diag.line == 0) {
-                printTo(io, .stderr(), "{s}: {s}\n", .{ config_path, diag.message() });
-            } else {
-                printTo(io, .stderr(), "{s}:{d}: {s}\n", .{ config_path, diag.line, diag.message() });
-            }
-            return 1;
-        },
-    };
+    if (check_only) return checkConfig(io, gpa, config_path, .stdout(), .stderr());
+
+    var cfg = try loadConfig(io, gpa, config_path, .stderr()) orelse return 1;
     log_output.setLevel(cfg.log.level);
 
     defer cfg.deinit();
@@ -130,6 +127,32 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         log.err("{t}", .{err});
         return 1;
     };
+    return 0;
+}
+
+/// Loads the config file; null (after saying why on `err_out`) if it is invalid.
+fn loadConfig(io: Io, gpa: Allocator, config_path: []const u8, err_out: Io.File) Allocator.Error!?Config {
+    var diag: config.Diagnostic = .{};
+    return config.load(io, gpa, config_path, &diag) catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        error.InvalidConfig => {
+            if (diag.line == 0) {
+                printTo(io, err_out, "{s}: {s}\n", .{ config_path, diag.message() });
+            } else {
+                printTo(io, err_out, "{s}:{d}: {s}\n", .{ config_path, diag.line, diag.message() });
+            }
+            return null;
+        },
+    };
+}
+
+/// `--check`: only validates the config file, with no network access and no
+/// lists, so it is quick and cannot fail because a list server is down. It
+/// answers "would this binary accept this config?", e.g. before an update.
+fn checkConfig(io: Io, gpa: Allocator, config_path: []const u8, out: Io.File, err_out: Io.File) !u8 {
+    var cfg = try loadConfig(io, gpa, config_path, err_out) orelse return 1;
+    defer cfg.deinit();
+    printTo(io, out, "configuration OK\n", .{});
     return 0;
 }
 
@@ -632,6 +655,77 @@ fn randomSeed(io: Io) u64 {
     var bytes: [8]u8 = undefined;
     io.random(&bytes);
     return std.mem.readInt(u64, &bytes, .little);
+}
+
+/// What `--check` returned and printed for a config file with this `text`.
+/// (Output goes to files, not the test runner's own stdout.)
+const CheckResult = struct {
+    code: u8,
+    out: [256]u8 = undefined,
+    out_len: usize = 0,
+    err: [256]u8 = undefined,
+    err_len: usize = 0,
+
+    fn stdout(r: *const CheckResult) []const u8 {
+        return r.out[0..r.out_len];
+    }
+
+    fn stderr(r: *const CheckResult) []const u8 {
+        return r.err[0..r.err_len];
+    }
+};
+
+fn checkText(text: []const u8) !CheckResult {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "config.yaml", .data = text });
+    var out_file = try tmp.dir.createFile(testing.io, "out.txt", .{ .read = true });
+    defer out_file.close(testing.io);
+    var err_file = try tmp.dir.createFile(testing.io, "err.txt", .{ .read = true });
+    defer err_file.close(testing.io);
+    var path_buf: [96]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/config.yaml", .{tmp.sub_path});
+
+    var result: CheckResult = .{ .code = try checkConfig(testing.io, testing.allocator, path, out_file, err_file) };
+    result.out_len = try out_file.readPositionalAll(testing.io, &result.out, 0);
+    result.err_len = try err_file.readPositionalAll(testing.io, &result.err, 0);
+    return result;
+}
+
+test "--check accepts a valid config and rejects an invalid one" {
+    const valid = try checkText("upstream:\n  servers: [1.1.1.1]\n");
+    try testing.expectEqual(0, valid.code);
+    try testing.expectEqualStrings("configuration OK\n", valid.stdout());
+
+    const bad_address = try checkText("upstream:\n  servers: [not-an-address]\n");
+    try testing.expectEqual(1, bad_address.code);
+    try testing.expect(std.mem.find(u8, bad_address.stderr(), ":2: ") != null);
+
+    const no_upstream = try checkText("local:\n  ttl: 60\n");
+    try testing.expectEqual(1, no_upstream.code);
+    try testing.expectEqualStrings("", no_upstream.stdout());
+}
+
+test "--check does not load lists, so an unreachable source is fine" {
+    // The config parser warns about the http:// source; keep the output quiet.
+    const log_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = log_level;
+    // 192.0.2.1 is a documentation address: loading it would take until a timeout.
+    const started = Io.Clock.awake.now(testing.io);
+    const result = try checkText("upstream:\n  servers: [1.1.1.1]\nblocking:\n  lists: [http://192.0.2.1/hosts.txt, /no/such/file.txt]\n");
+    try testing.expectEqual(0, result.code);
+    try testing.expect(started.untilNow(testing.io, .awake).toMilliseconds() < 1000);
+}
+
+test "the version is MAJOR.MINOR.PATCH, taken from build.zig.zon" {
+    var parts = std.mem.splitScalar(u8, @import("build_options").version, '.');
+    var count: usize = 0;
+    while (parts.next()) |part| : (count += 1) {
+        _ = try std.fmt.parseInt(u32, part, 10);
+    }
+    try testing.expectEqual(3, count);
+    try testing.expectEqualStrings(@import("build_options").version, version);
 }
 
 test {

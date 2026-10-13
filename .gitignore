@@ -1,5 +1,7 @@
+# Local configuration (see config.example.yaml)
 .zig-cache/
+.zig-global-cache/
+/config.yaml
+dist/
 zig-out/
 zig-pkg/
-# Local configuration (see config.example.yaml)
-/config.yaml

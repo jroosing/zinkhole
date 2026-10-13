@@ -54,6 +54,7 @@ port in `server.listen` for a quick test):
 
 ```sh
 cp config.example.yaml config.yaml     # then edit it
+./zig-out/bin/zinkhole --check -c config.yaml  # only validate (no network)
 ./zig-out/bin/zinkhole --test -c config.yaml   # validate and load all lists
 ./zig-out/bin/zinkhole -c config.yaml
 ```

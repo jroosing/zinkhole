@@ -1,5 +1,9 @@
 const std = @import("std");
 
+/// The single source of the version: `zinkhole --version` and the release
+/// tag (checked by CI) both come from here.
+const manifest = @import("build.zig.zon");
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     // `zig build --release` picks ReleaseSafe: optimized, but bounds and
@@ -13,6 +17,7 @@ pub fn build(b: *std.Build) void {
     const network = b.option(bool, "network", "Also run the tests that need the internet") orelse false;
     const options = b.addOptions();
     options.addOption(bool, "network_tests", network);
+    options.addOption([]const u8, "version", manifest.version);
 
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
