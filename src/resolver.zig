@@ -62,9 +62,9 @@ pub const Resolver = struct {
         r.stats.count(outcome);
         if (log_query) {
             const micros: u64 = @intCast(@max(0, started.untilNow(r.io).raw.toMicroseconds()));
-            log.info("{f} {s} {f} {t} {d}.{d}ms", .{
+            log.info("{f} {f} {f} {t} {d}.{d}ms", .{
                 ip.Ip.fromAddress(client),
-                if (q.name.len == 0) "." else q.name,
+                dns.printable(q.name),
                 q.qtype,
                 outcome,
                 micros / 1000,

@@ -551,6 +551,29 @@ pub fn isAtOrBelow(name: []const u8, zone: []const u8) bool {
     return name.len == zone.len or name[name.len - zone.len - 1] == '.';
 }
 
+/// A name as it appears in logs: "." for the root, and every byte outside
+/// printable ASCII (or a backslash) as \xNN. Query names come from the
+/// network and may hold any byte but '.', including line breaks and
+/// terminal escapes.
+pub fn printable(name: []const u8) Printable {
+    return .{ .name = name };
+}
+
+pub const Printable = struct {
+    name: []const u8,
+
+    pub fn format(p: Printable, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (p.name.len == 0) return w.writeByte('.');
+        for (p.name) |c| {
+            if (c >= 0x20 and c < 0x7f and c != '\\') {
+                try w.writeByte(c);
+            } else {
+                try w.print("\\x{x:0>2}", .{c});
+            }
+        }
+    }
+};
+
 pub fn readU16(msg: []const u8, offset: usize) u16 {
     return std.mem.readInt(u16, msg[offset..][0..2], .big);
 }
@@ -842,4 +865,14 @@ test "random and mutated messages never break the parsers" {
             _ = rewriteForUpstream(msg, &parsed);
         } else |_| {}
     }
+}
+
+test "names are printed safely for logs" {
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("www.example.com", try std.fmt.bufPrint(&buf, "{f}", .{printable("www.example.com")}));
+    try testing.expectEqualStrings(".", try std.fmt.bufPrint(&buf, "{f}", .{printable("")}));
+    // Line breaks, terminal escapes, NUL and backslashes cannot forge or
+    // garble log lines.
+    try testing.expectEqualStrings("a\\x0ainfo(main)", try std.fmt.bufPrint(&buf, "{f}", .{printable("a\ninfo(main)")}));
+    try testing.expectEqualStrings("\\x1b[31mred\\x00\\x5c", try std.fmt.bufPrint(&buf, "{f}", .{printable("\x1b[31mred\x00\\")}));
 }

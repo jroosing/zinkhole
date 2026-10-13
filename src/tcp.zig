@@ -4,6 +4,7 @@
 //!   * DNS over TCP framing (RFC 1035 4.2.2, RFC 7766): every message is
 //!     preceded by its length as a big-endian u16.
 //!   * `connect` with a deadline.
+//!   * `listen` without SO_REUSEPORT.
 //!   * `DeadlineReader`/`DeadlineWriter`: `Io.Reader`/`Io.Writer` streams over
 //!     a socket whose reads and writes fail once the deadline has passed,
 //!     used underneath TLS.
@@ -11,6 +12,7 @@
 const std = @import("std");
 const Io = std.Io;
 const net = Io.net;
+const posix = std.posix;
 
 pub const SocketError = Io.Operation.NetRead.Error ||
     Io.Operation.NetWrite.Error ||
@@ -97,6 +99,97 @@ fn waitUntil(io: Io, event: *Io.Event, deadline: Io.Timeout) Io.Event.WaitTimeou
         return;
     }
 }
+
+pub const ListenError = error{
+    AddressInUse,
+    AddressUnavailable,
+    AddressFamilyUnsupported,
+    AccessDenied,
+    SystemResources,
+    Unexpected,
+};
+
+/// Like `IpAddress.listen(.{ .reuse_address = true })`, but with only
+/// SO_REUSEADDR (so a restart can bind again despite connections in
+/// TIME_WAIT) and not SO_REUSEPORT, which would let another socket bind the
+/// same port and take a share of the connections. `ip6_only` makes an IPv6
+/// listener IPv6-only, so that an IPv4 listener can share its port.
+pub fn listen(address: net.IpAddress, ip6_only: bool) ListenError!net.Server {
+    const family: u32 = switch (address) {
+        .ip4 => posix.AF.INET,
+        .ip6 => posix.AF.INET6,
+    };
+    const rc = posix.system.socket(family, posix.SOCK.STREAM, posix.IPPROTO.TCP);
+    switch (posix.errno(rc)) {
+        .SUCCESS => {},
+        .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+        .MFILE, .NFILE, .NOBUFS, .NOMEM => return error.SystemResources,
+        else => return error.Unexpected,
+    }
+    const fd: posix.socket_t = @intCast(rc);
+    errdefer _ = posix.system.close(fd);
+    try setOption(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, 1);
+    if (address == .ip6) try setOption(fd, posix.IPPROTO.IPV6, posix.IPV6.V6ONLY, @intFromBool(ip6_only));
+
+    var storage: SocketAddress = .from(address);
+    switch (posix.errno(posix.system.bind(fd, &storage.any, storage.len()))) {
+        .SUCCESS => {},
+        .ADDRINUSE => return error.AddressInUse,
+        .ADDRNOTAVAIL => return error.AddressUnavailable,
+        .ACCES, .PERM => return error.AccessDenied,
+        else => return error.Unexpected,
+    }
+    switch (posix.errno(posix.system.listen(fd, 128))) {
+        .SUCCESS => {},
+        .ADDRINUSE => return error.AddressInUse,
+        else => return error.Unexpected,
+    }
+    // The resolved port, if `address` asked for any (port 0).
+    var len: posix.socklen_t = @sizeOf(SocketAddress);
+    if (posix.errno(posix.system.getsockname(fd, &storage.any, &len)) != .SUCCESS) return error.Unexpected;
+    return .{ .socket = .{ .handle = fd, .address = storage.toAddress() }, .options = {} };
+}
+
+fn setOption(fd: posix.socket_t, level: i32, name: u32, value: u32) error{Unexpected}!void {
+    const bytes: []const u8 = @ptrCast(&value);
+    if (posix.errno(posix.system.setsockopt(fd, level, name, bytes.ptr, @intCast(bytes.len))) != .SUCCESS) {
+        return error.Unexpected;
+    }
+}
+
+const SocketAddress = extern union {
+    any: posix.sockaddr,
+    in: posix.sockaddr.in,
+    in6: posix.sockaddr.in6,
+
+    fn from(address: net.IpAddress) SocketAddress {
+        return switch (address) {
+            .ip4 => |a| .{ .in = .{ .port = std.mem.nativeToBig(u16, a.port), .addr = @bitCast(a.bytes) } },
+            .ip6 => |a| .{ .in6 = .{
+                .port = std.mem.nativeToBig(u16, a.port),
+                .flowinfo = a.flow,
+                .addr = a.bytes,
+                .scope_id = a.interface.index,
+            } },
+        };
+    }
+
+    fn len(sa: *const SocketAddress) posix.socklen_t {
+        return if (sa.any.family == posix.AF.INET) @sizeOf(posix.sockaddr.in) else @sizeOf(posix.sockaddr.in6);
+    }
+
+    fn toAddress(sa: *const SocketAddress) net.IpAddress {
+        if (sa.any.family == posix.AF.INET) {
+            return .{ .ip4 = .{ .bytes = @bitCast(sa.in.addr), .port = std.mem.bigToNative(u16, sa.in.port) } };
+        }
+        return .{ .ip6 = .{
+            .bytes = sa.in6.addr,
+            .port = std.mem.bigToNative(u16, sa.in6.port),
+            .flow = sa.in6.flowinfo,
+            .interface = .{ .index = sa.in6.scope_id },
+        } };
+    }
+};
 
 /// An `Io.Reader` over a socket. Reads fail with `error.Timeout` (in `err`)
 /// once `deadline` has passed; set a new deadline before each exchange.

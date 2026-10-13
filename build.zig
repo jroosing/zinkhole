@@ -34,7 +34,8 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run zinkhole");
     run_step.dependOn(&run_cmd.step);
 
-    const tests = b.addTest(.{ .root_module = root_module });
+    const test_filters = b.option([]const []const u8, "test-filter", "Only run tests whose name contains this") orelse &.{};
+    const tests = b.addTest(.{ .root_module = root_module, .filters = test_filters });
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
 }

@@ -119,6 +119,8 @@ const Parser = struct {
     fn parseMapping(p: *Parser, indent: u32, depth: u32) Error!Node {
         const first_line = p.lines[p.index].number;
         var pairs: std.ArrayList(Pair) = .empty;
+        // A hash set, not a scan: a mapping can have tens of thousands of keys.
+        var keys: std.StringHashMapUnmanaged(void) = .empty;
         while (p.index < p.lines.len) {
             const line = p.lines[p.index];
             if (line.indent < indent) break;
@@ -126,9 +128,7 @@ const Parser = struct {
             if (isSequenceItem(line.text)) return p.fail(line.number, "expected 'key: value', found a list item");
 
             const key, const rest = try p.splitKey(line);
-            for (pairs.items) |existing| {
-                if (std.mem.eql(u8, existing.key, key)) return p.fail(line.number, "duplicate key");
-            }
+            if ((try keys.getOrPut(p.arena, key)).found_existing) return p.fail(line.number, "duplicate key");
             p.index += 1;
 
             const value: Node = if (!isBlankOrComment(rest))

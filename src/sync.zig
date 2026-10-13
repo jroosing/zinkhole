@@ -65,6 +65,8 @@ pub const Origin = struct {
     allow_clients: []const ip.Cidr,
     listeners: std.ArrayList(net.Server) = .empty,
     group: Io.Group = .init,
+    /// Set once the serve tasks hold pointers into `listeners`.
+    pointers_locked: bool = false,
     /// Guards `text`, which `publish` replaces.
     mutex: Io.Mutex = .init,
     text: []u8 = &.{},
@@ -82,7 +84,11 @@ pub const Origin = struct {
         };
         errdefer origin.deinit();
         for (addresses) |listen_address| {
-            var listener = try listen_address.listen(io, .{ .reuse_address = true });
+            // IPv6-only next to an IPv4 listener on the same port.
+            const ip6_only = listen_address == .ip6 and for (addresses) |other| {
+                if (other == .ip4 and other.getPort() == listen_address.getPort()) break true;
+            } else false;
+            var listener = try tcp.listen(listen_address, ip6_only);
             origin.listeners.append(gpa, listener) catch |err| {
                 listener.deinit(io);
                 return err;
@@ -90,12 +96,13 @@ pub const Origin = struct {
         }
         // Tasks keep pointers into the list from here on.
         origin.listeners.lockPointers();
+        origin.pointers_locked = true;
         for (origin.listeners.items) |*listener| try origin.group.concurrent(io, serve, .{ origin, listener });
     }
 
     pub fn deinit(origin: *Origin) void {
         origin.group.cancel(origin.io);
-        origin.listeners.unlockPointers();
+        if (origin.pointers_locked) origin.listeners.unlockPointers();
         for (origin.listeners.items) |*listener| listener.deinit(origin.io);
         origin.listeners.deinit(origin.gpa);
         origin.gpa.free(origin.text);
@@ -130,6 +137,9 @@ pub const Origin = struct {
                 },
             };
             defer stream.close(io);
+            // Before reading anything: a client that may not sync must not
+            // get to hold the only serve task for a request's deadline.
+            if (!ip.isAllowed(origin.allow_clients, stream.socket.address)) continue;
             origin.handle(stream) catch |err| {
                 if (err == error.Canceled) return error.Canceled;
                 log.debug("request from {f}: {t}", .{ stream.socket.address, err });
@@ -145,10 +155,19 @@ pub const Origin = struct {
         var reader: tcp.DeadlineReader = .init(io, stream.socket.handle, &in_buf, deadline);
         var writer: tcp.DeadlineWriter = .init(io, stream.socket.handle, &out_buf, deadline);
         var server: std.http.Server = .init(&reader.interface, &writer.interface);
+        origin.answer(&server) catch |err| {
+            // The deadline streams report every socket error as ReadFailed or
+            // WriteFailed. A cancellation hidden in there must still end the
+            // task: swallowed, it would leave `deinit` waiting forever.
+            if (reader.err) |socket_err| if (socket_err == error.Canceled) return error.Canceled;
+            if (writer.err) |socket_err| if (socket_err == error.Canceled) return error.Canceled;
+            return err;
+        };
+    }
+
+    fn answer(origin: *Origin, server: *std.http.Server) !void {
+        const io = origin.io;
         var request = try server.receiveHead();
-        if (!ip.isAllowed(origin.allow_clients, stream.socket.address)) {
-            return request.respond("", .{ .status = .forbidden, .keep_alive = false });
-        }
         if (request.head.method != .GET or !std.mem.eql(u8, request.head.target, path)) {
             return request.respond("", .{ .status = .not_found, .keep_alive = false });
         }
@@ -211,8 +230,12 @@ pub const Synced = struct {
 };
 
 /// Asks the origin at `url` (e.g. http://192.168.1.5:5380) for its Policy
-/// settings; `have` is the fingerprint of the ones the replica has.
-pub fn fetch(io: Io, gpa: std.mem.Allocator, url: []const u8, secret: []const u8, have: ?Fingerprint) !Fetched {
+/// settings; `have` is the fingerprint of the ones the replica has. A
+/// replica keeps one `client` for all syncs, so an https:// origin does not
+/// cost a rescan of the system's CA certificates on every sync.
+pub fn fetch(client: *std.http.Client, url: []const u8, secret: []const u8, have: ?Fingerprint) !Fetched {
+    const io = client.io;
+    const gpa = client.allocator;
     var nonce_bytes: [@sizeOf(Nonce) / 2]u8 = undefined;
     io.random(&nonce_bytes);
     const nonce: Nonce = std.fmt.bytesToHex(nonce_bytes, .lower);
@@ -221,8 +244,6 @@ pub fn fetch(io: Io, gpa: std.mem.Allocator, url: []const u8, secret: []const u8
     const full_url = std.fmt.bufPrint(&url_buf, "{s}{s}", .{ std.mem.trimEnd(u8, url, "/"), path }) catch return error.InvalidUrl;
     const uri = std.Uri.parse(full_url) catch return error.InvalidUrl;
 
-    var client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer client.deinit();
     const have_tag = if (have) |fingerprint| etag(fingerprint) else undefined;
     const headers = [_]std.http.Header{
         .{ .name = nonce_header, .value = &nonce },
@@ -291,8 +312,8 @@ const state_header = "# zinkhole sync ";
 
 /// Writes `synced` to the state file: the proof as a comment line, then the
 /// text, so the file stays valid YAML and can be appended to a config to
-/// promote the replica. Written to a temporary file and renamed, so a crash
-/// never leaves half a file.
+/// promote the replica. Written to a temporary file, flushed to disk, and
+/// renamed, so neither a crash nor a power loss leaves half a file.
 pub fn saveState(io: Io, dir: Io.Dir, synced: Synced) !void {
     const tmp_name = state_file ++ ".tmp";
     {
@@ -304,8 +325,15 @@ pub fn saveState(io: Io, dir: Io.Dir, synced: Synced) !void {
         try file.writeStreamingAll(io, &std.fmt.bytesToHex(synced.signature, .lower));
         try file.writeStreamingAll(io, "\n");
         try file.writeStreamingAll(io, synced.text);
+        // Without this, the rename can reach the disk before the data does.
+        try file.sync(io);
     }
     try dir.rename(tmp_name, dir, state_file, io);
+    // Make the rename itself durable (best effort: not every file system
+    // lets a directory be synced).
+    var dir_file = dir.openFile(io, ".", .{ .allow_directory = true }) catch return;
+    defer dir_file.close(io);
+    dir_file.sync(io) catch {};
 }
 
 /// Reads the state file; null if there is none. A file whose signature does
@@ -337,7 +365,33 @@ pub fn loadState(io: Io, gpa: std.mem.Allocator, dir: Io.Dir, secret: []const u8
 const testing = std.testing;
 
 const test_secret = "0123456789abcdef0123456789abcdef";
+
+/// Turns a test that hangs into one that fails: panics if still running
+/// after `seconds`, unless stopped first.
+const Watchdog = struct {
+    future: Io.Future(void),
+
+    fn start(seconds: i64) !Watchdog {
+        return .{ .future = try testing.io.concurrent(bark, .{seconds}) };
+    }
+
+    fn stop(watchdog: *Watchdog) void {
+        watchdog.future.cancel(testing.io);
+    }
+
+    fn bark(seconds: i64) void {
+        testing.io.sleep(.fromSeconds(seconds), .awake) catch return; // stopped in time
+        @panic("test timed out (watchdog)");
+    }
+};
 const loopback_clients = [_]ip.Cidr{ip.Cidr.parse("127.0.0.0/8").?};
+
+/// `fetch` with a client of its own.
+fn testFetch(url: []const u8, secret: []const u8, have: ?Fingerprint) !Fetched {
+    var client: std.http.Client = .{ .allocator = testing.allocator, .io = testing.io };
+    defer client.deinit();
+    return fetch(&client, url, secret, have);
+}
 
 /// An origin serving on an ephemeral loopback port.
 fn testOrigin(origin: *Origin, allow_clients: []const ip.Cidr) !void {
@@ -356,7 +410,7 @@ test "a replica fetches the Policy settings the origin publishes" {
     try origin.publish(text);
 
     var url_buf: [64]u8 = undefined;
-    var fetched = try fetch(testing.io, testing.allocator, try originUrl(&origin, &url_buf), test_secret, null);
+    var fetched = try testFetch(try originUrl(&origin, &url_buf), test_secret, null);
     defer fetched.deinit(testing.allocator);
     try testing.expect(fetched == .changed);
     try testing.expectEqualStrings(text, fetched.changed.text);
@@ -370,16 +424,16 @@ test "unchanged settings are reported as unchanged, until the origin publishes" 
     var url_buf: [64]u8 = undefined;
     const url = try originUrl(&origin, &url_buf);
 
-    var first = try fetch(testing.io, testing.allocator, url, test_secret, null);
+    var first = try testFetch(url, test_secret, null);
     defer first.deinit(testing.allocator);
     const have = first.changed.fingerprint;
 
-    var again = try fetch(testing.io, testing.allocator, url, test_secret, have);
+    var again = try testFetch(url, test_secret, have);
     defer again.deinit(testing.allocator);
     try testing.expect(again == .unchanged);
 
     try origin.publish("local:\n  ttl: 120\n");
-    var changed = try fetch(testing.io, testing.allocator, url, test_secret, have);
+    var changed = try testFetch(url, test_secret, have);
     defer changed.deinit(testing.allocator);
     try testing.expectEqualStrings("local:\n  ttl: 120\n", changed.changed.text);
     try testing.expect(!std.mem.eql(u8, &have, &changed.changed.fingerprint));
@@ -471,7 +525,7 @@ test "answers signed with another secret are rejected" {
     try origin.publish("local:\n  ttl: 60\n");
     var url_buf: [64]u8 = undefined;
     const other_secret = "fedcba9876543210fedcba9876543210";
-    try testing.expectError(error.BadSignature, fetch(testing.io, testing.allocator, try originUrl(&origin, &url_buf), other_secret, null));
+    try testing.expectError(error.BadSignature, testFetch(try originUrl(&origin, &url_buf), other_secret, null));
 }
 
 test "answers changed on the way are rejected" {
@@ -483,7 +537,7 @@ test "answers changed on the way are rejected" {
     try proxy.start(origin.address(), .tamper);
     defer proxy.stop();
     var url_buf: [64]u8 = undefined;
-    try testing.expectError(error.BadSignature, fetch(testing.io, testing.allocator, try proxy.url(&url_buf), test_secret, null));
+    try testing.expectError(error.BadSignature, testFetch(try proxy.url(&url_buf), test_secret, null));
 }
 
 test "replayed answers are rejected, including 'unchanged'" {
@@ -498,9 +552,9 @@ test "replayed answers are rejected, including 'unchanged'" {
     try replay.start(origin.address(), .replay);
     defer replay.stop();
     const url = try replay.url(&url_buf);
-    var first = try fetch(testing.io, testing.allocator, url, test_secret, null);
+    var first = try testFetch(url, test_secret, null);
     defer first.deinit(testing.allocator);
-    try testing.expectError(error.BadSignature, fetch(testing.io, testing.allocator, url, test_secret, null));
+    try testing.expectError(error.BadSignature, testFetch(url, test_secret, null));
 
     // A recorded "unchanged", replayed after the settings changed.
     var replay_unchanged: Proxy = undefined;
@@ -508,11 +562,11 @@ test "replayed answers are rejected, including 'unchanged'" {
     defer replay_unchanged.stop();
     var url2_buf: [64]u8 = undefined;
     const url2 = try replay_unchanged.url(&url2_buf);
-    var unchanged = try fetch(testing.io, testing.allocator, url2, test_secret, first.changed.fingerprint);
+    var unchanged = try testFetch(url2, test_secret, first.changed.fingerprint);
     defer unchanged.deinit(testing.allocator);
     try testing.expect(unchanged == .unchanged);
     try origin.publish("local:\n  ttl: 120\n");
-    try testing.expectError(error.BadSignature, fetch(testing.io, testing.allocator, url2, test_secret, first.changed.fingerprint));
+    try testing.expectError(error.BadSignature, testFetch(url2, test_secret, first.changed.fingerprint));
 }
 
 /// The status the origin answers a bare request with.
@@ -547,7 +601,11 @@ test "only allowed clients get answers, and only at GET /sync" {
     defer lan_only.deinit();
     try lan_only.publish("local:\n  ttl: 60\n");
     var lan_buf: [64]u8 = undefined;
-    try testing.expectError(error.UnexpectedStatus, fetch(testing.io, testing.allocator, try originUrl(&lan_only, &lan_buf), test_secret, null));
+    if (testFetch(try originUrl(&lan_only, &lan_buf), test_secret, null)) |fetched| {
+        var unexpected = fetched;
+        unexpected.deinit(testing.allocator);
+        return error.TestUnexpectedResult;
+    } else |_| {}
 }
 
 test "the state file keeps the last synced settings, and rejects tampering" {
@@ -557,7 +615,7 @@ test "the state file keeps the last synced settings, and rejects tampering" {
     const text = "local:\n  records:\n    nas.lan: 10.0.0.10\n";
     try origin.publish(text);
     var url_buf: [64]u8 = undefined;
-    var fetched = try fetch(testing.io, testing.allocator, try originUrl(&origin, &url_buf), test_secret, null);
+    var fetched = try testFetch(try originUrl(&origin, &url_buf), test_secret, null);
     defer fetched.deinit(testing.allocator);
 
     var tmp = testing.tmpDir(.{});
@@ -580,4 +638,57 @@ test "the state file keeps the last synced settings, and rejects tampering" {
     defer testing.allocator.free(tampered);
     try tmp.dir.writeFile(testing.io, .{ .sub_path = state_file, .data = tampered });
     try testing.expectError(error.BadSignature, loadState(testing.io, testing.allocator, tmp.dir, test_secret));
+}
+
+test "an origin that cannot listen on an address fails cleanly" {
+    var origin: Origin = undefined;
+    // 192.0.2.1 (a documentation address) is not on this host.
+    const addresses = [_]net.IpAddress{ .{ .ip4 = .loopback(0) }, .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 5380 } } };
+    if (origin.init(testing.io, testing.allocator, &addresses, test_secret, &loopback_clients)) |_| {
+        origin.deinit();
+        return error.TestUnexpectedResult;
+    } else |_| {}
+}
+
+test "connections from clients outside the allowed networks are closed before reading" {
+    var watchdog: Watchdog = try .start(10);
+    defer watchdog.stop();
+    var origin: Origin = undefined;
+    try testOrigin(&origin, &.{ip.Cidr.parse("192.168.0.0/16").?});
+    defer origin.deinit();
+    const stream = try origin.address().connect(testing.io, .{ .mode = .stream, .protocol = .tcp });
+    defer stream.close(testing.io);
+
+    // Sending nothing must not keep the origin's only serve task busy.
+    var buf: [16]u8 = undefined;
+    var reader: tcp.DeadlineReader = .init(testing.io, stream.socket.handle, &buf, tcp.deadlineIn(testing.io, 1000));
+    try testing.expectError(error.EndOfStream, reader.interface.takeByte());
+}
+
+test "shutting down while a request is half-received does not hang" {
+    var watchdog: Watchdog = try .start(10);
+    defer watchdog.stop();
+    var origin: Origin = undefined;
+    try testOrigin(&origin, &loopback_clients);
+    const stream = try origin.address().connect(testing.io, .{ .mode = .stream, .protocol = .tcp });
+    defer stream.close(testing.io);
+    // Half a request head: the origin's serve task is now waiting for more.
+    var write_buf: [64]u8 = undefined;
+    var writer = stream.writer(testing.io, &write_buf);
+    try writer.interface.writeAll("GET /sync HTTP/1.1\r\n");
+    try writer.interface.flush();
+    try testing.io.sleep(.fromMilliseconds(100), .awake);
+
+    origin.deinit(); // must cancel the serve task, not wait forever
+}
+
+test "no other socket can take over the sync port" {
+    var origin: Origin = undefined;
+    try testOrigin(&origin, &loopback_clients);
+    defer origin.deinit();
+    if (origin.address().listen(testing.io, .{ .reuse_address = true })) |intruder| {
+        var listener = intruder;
+        listener.deinit(testing.io);
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(error.AddressInUse, err);
 }

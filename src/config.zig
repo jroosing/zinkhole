@@ -190,7 +190,7 @@ pub fn parse(gpa: Allocator, source: []const u8, diag: *Diagnostic) Error!Config
 
     var config: Config = .{ .arena = .init(gpa) };
     errdefer config.deinit();
-    var decoder: Decoder = .{ .arena = config.arena.allocator(), .diag = diag };
+    var decoder: Decoder = .{ .arena = config.arena.allocator(), .scratch = tree_arena.allocator(), .diag = diag };
     try decoder.decodeRoot(root, &config);
     config.policy_text = try policyText(config.arena.allocator(), source, root);
     config.source = try config.arena.allocator().dupe(u8, source);
@@ -210,7 +210,7 @@ pub fn parseReplica(gpa: Allocator, source: []const u8, synced: []const u8, diag
         error.OutOfMemory => |e| return e,
         error.InvalidYaml => return diag.fail(yaml_diag.line, "{s}", .{yaml_diag.message}),
     };
-    var decoder: Decoder = .{ .arena = config.arena.allocator(), .diag = diag };
+    var decoder: Decoder = .{ .arena = config.arena.allocator(), .scratch = tree_arena.allocator(), .diag = diag };
     for (try decoder.mapping(root, "top level")) |pair| {
         if (is(pair, "blocking")) {
             try decoder.decodeBlocking(pair.value, &config.blocking);
@@ -255,6 +255,8 @@ fn lineStart(source: []const u8, line: u32) usize {
 /// Turns the YAML tree into a `Config`, copying kept strings into `arena`.
 const Decoder = struct {
     arena: Allocator,
+    /// Freed when parsing ends; for bookkeeping that the config does not keep.
+    scratch: Allocator,
     diag: *Diagnostic,
 
     fn fail(d: *Decoder, line: u32, comptime format: []const u8, args: anytype) error{InvalidConfig} {
@@ -446,15 +448,18 @@ const Decoder = struct {
     fn records(d: *Decoder, node: yaml.Node) Error![]const local.Record {
         const pairs = try d.mapping(node, "local.records");
         const result = try d.arena.alloc(local.Record, pairs.len);
-        for (pairs, result, 0..) |pair, *record, i| {
+        // Names seen so far: a hash set, as there can be tens of thousands.
+        var exact_names: std.StringHashMapUnmanaged(void) = .empty;
+        var wildcard_names: std.StringHashMapUnmanaged(void) = .empty;
+        for (pairs, result) |pair, *record| {
             const wildcard = std.mem.startsWith(u8, pair.key, "*.");
             var name_buf: [dns.max_name_len]u8 = undefined;
-            const name = dns.normalizeName(if (wildcard) pair.key[2..] else pair.key, &name_buf) orelse
+            const normalized = dns.normalizeName(if (wildcard) pair.key[2..] else pair.key, &name_buf) orelse
                 return d.fail(pair.line, "invalid hostname '{s}'", .{pair.key});
-            for (result[0..i]) |previous| {
-                if (previous.wildcard == wildcard and std.mem.eql(u8, previous.name, name)) {
-                    return d.fail(pair.line, "hostname '{s}' is defined twice", .{pair.key});
-                }
+            const name = try d.arena.dupe(u8, normalized);
+            const seen = if (wildcard) &wildcard_names else &exact_names;
+            if ((try seen.getOrPut(d.scratch, name)).found_existing) {
+                return d.fail(pair.line, "hostname '{s}' is defined twice", .{pair.key});
             }
 
             const values: []const yaml.Node = switch (pair.value.value) {
@@ -472,7 +477,7 @@ const Decoder = struct {
                 address.* = ip.Ip.parse(text) orelse
                     return d.fail(value.line, "'{s}' is not an IP address", .{text});
             }
-            record.* = .{ .name = try d.arena.dupe(u8, name), .wildcard = wildcard, .addresses = addresses };
+            record.* = .{ .name = name, .wildcard = wildcard, .addresses = addresses };
         }
         return result;
     }
@@ -859,4 +864,25 @@ test "a replica keeps its state in /var/lib/zinkhole unless told otherwise" {
     var custom = try parse(testing.allocator, test_replica ++ "  state_dir: /tmp/zh\n", &diag);
     defer custom.deinit();
     try testing.expectEqualStrings("/tmp/zh", custom.sync.replica.state_dir);
+}
+
+test "a config with many local records parses quickly" {
+    // About 900 KB: close to the 1 MiB limit, as a large synced config can be.
+    const count = 40_000;
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(testing.allocator);
+    try source.appendSlice(testing.allocator, "upstream:\n  servers: [1.1.1.1]\nlocal:\n  records:\n");
+    for (0..count) |i| try source.print(testing.allocator, "    host{d}.lan: 10.0.0.1\n", .{i});
+
+    const started = Io.Clock.awake.now(testing.io);
+    var diag: Diagnostic = .{};
+    var config = try parse(testing.allocator, source.items, &diag);
+    defer config.deinit();
+    const elapsed = started.untilNow(testing.io, .awake).toMilliseconds();
+    try testing.expectEqual(count, config.local.records.len);
+    // Duplicate checks must not compare every entry with every other one.
+    if (elapsed > 2000) {
+        std.debug.print("parsing took {d} ms\n", .{elapsed});
+        return error.TestTooSlow;
+    }
 }

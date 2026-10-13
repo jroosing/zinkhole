@@ -9,6 +9,7 @@ const net = Io.net;
 const Allocator = std.mem.Allocator;
 
 const dns = @import("dns.zig");
+const ip = @import("ip.zig");
 const tcp = @import("tcp.zig");
 const Resolver = @import("resolver.zig").Resolver;
 
@@ -61,9 +62,9 @@ pub const Server = struct {
                 return err;
             };
 
-            // SO_REUSEADDR/SO_REUSEPORT: lets an IPv6 dual-stack listener and
-            // an IPv4 listener share the port, and allows quick restarts.
-            var listener = address.listen(server.io, .{ .reuse_address = true }) catch |err| {
+            // Quick restarts, but no other socket on the port; IPv6-only next
+            // to an IPv4 listener on the same port, as for UDP.
+            var listener = tcp.listen(address, ip6_only orelse false) catch |err| {
                 log.err("cannot listen on {f} (tcp): {t}", .{ address, err });
                 return err;
             };
@@ -153,6 +154,9 @@ pub const Server = struct {
                 },
             };
             defer stream.close(io);
+            // Checked per connection, not just per query: a client that may
+            // not query must not get to hold one of the few TCP workers.
+            if (!ip.isAllowed(worker.server.resolver.allow_clients, stream.socket.address)) continue;
             serveConnection(worker, stream) catch |err| {
                 if (err == error.Canceled) return error.Canceled;
                 log.debug("tcp {f}: {t}", .{ stream.socket.address, err });
@@ -179,4 +183,120 @@ fn hasIp4OnPort(addresses: []const net.IpAddress, port: u16) bool {
         if (address == .ip4 and address.getPort() == port) return true;
     }
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+
+const testing = std.testing;
+const config_mod = @import("config.zig");
+const Policy = @import("policy.zig").Policy;
+const Cache = @import("cache.zig").Cache;
+const Upstream = @import("upstream.zig").Upstream;
+
+/// A server on loopback with one local record and no upstream servers.
+const TestServer = struct {
+    config: config_mod.Config,
+    policy: Policy,
+    cache: Cache,
+    upstream: Upstream,
+    resolver: Resolver,
+    server: Server,
+
+    fn init(t: *TestServer, allow_clients: []const ip.Cidr) !void {
+        const io = testing.io;
+        const gpa = testing.allocator;
+        var diag: config_mod.Diagnostic = .{};
+        t.config = try config_mod.parse(gpa, "upstream:\n  servers: [9.9.9.9]\nlocal:\n  records:\n    nas.lan: 10.0.0.10\n", &diag);
+        errdefer t.config.deinit();
+        t.policy = try .init(io, gpa, &t.config);
+        errdefer t.policy.deinit();
+        t.cache = try .init(gpa, .{ .capacity = 4, .min_ttl = 0, .max_ttl = 60, .seed = 1 });
+        errdefer t.cache.deinit();
+        try t.upstream.init(io, gpa, &.{}, 100);
+        errdefer t.upstream.deinit();
+        t.resolver = .{
+            .io = io,
+            .policy = &t.policy,
+            .cache = &t.cache,
+            .upstream = &t.upstream,
+            .allow_clients = allow_clients,
+            .log_queries = .init(false),
+        };
+        t.server = .{ .io = io, .gpa = gpa, .resolver = &t.resolver };
+        errdefer t.server.deinit();
+        try t.server.listen(&.{.{ .ip4 = .loopback(0) }});
+        try t.server.start(1);
+    }
+
+    fn deinit(t: *TestServer) void {
+        t.server.deinit();
+        t.upstream.deinit();
+        t.cache.deinit();
+        t.policy.deinit();
+        t.config.deinit();
+    }
+
+    fn connect(t: *TestServer) !net.Stream {
+        return t.server.tcp_listeners.items[0].socket.address.connect(testing.io, .{ .mode = .stream, .protocol = .tcp });
+    }
+};
+
+test "allowed clients are answered over TCP" {
+    var t: TestServer = undefined;
+    try t.init(&.{ip.Cidr.parse("127.0.0.0/8").?});
+    defer t.deinit();
+    const stream = try t.connect();
+    defer stream.close(testing.io);
+
+    var query_buf: [512]u8 = undefined;
+    const query = dns.testQuery(&query_buf, 7, "nas.lan", .a, null);
+    try tcp.writeMessage(testing.io, stream.socket.handle, query, tcp.deadlineIn(testing.io, 1000));
+    var response_buf: [512]u8 = undefined;
+    const response = try tcp.readMessage(testing.io, stream.socket.handle, &response_buf, tcp.deadlineIn(testing.io, 1000));
+    try testing.expectEqual(1, dns.readU16(response, 6));
+}
+
+test "TCP connections from clients outside the allowed networks are closed at once" {
+    var t: TestServer = undefined;
+    try t.init(&.{ip.Cidr.parse("10.0.0.0/8").?});
+    defer t.deinit();
+    const stream = try t.connect();
+    defer stream.close(testing.io);
+
+    // An allowed client would get 5 s to send its query; this one gets none.
+    var buf: [2]u8 = undefined;
+    try testing.expectError(error.EndOfStream, tcp.readMessage(testing.io, stream.socket.handle, &buf, tcp.deadlineIn(testing.io, 1000)));
+}
+
+/// A TCP port that is free right now.
+fn freePort() !u16 {
+    const any: net.IpAddress = .{ .ip4 = .unspecified(0) };
+    var probe = try any.listen(testing.io, .{});
+    defer probe.deinit(testing.io);
+    return probe.socket.address.getPort();
+}
+
+test "IPv4 and IPv6 listeners share a port, as in the default config" {
+    var t: TestServer = undefined;
+    try t.init(&.{ip.Cidr.parse("127.0.0.0/8").?});
+    defer t.deinit();
+    const port = try freePort();
+    var server: Server = .{ .io = testing.io, .gpa = testing.allocator, .resolver = &t.resolver };
+    defer server.deinit();
+    try server.listen(&.{ .{ .ip4 = .unspecified(port) }, .{ .ip6 = .unspecified(port) } });
+    try testing.expectEqual(2, server.tcp_listeners.items.len);
+}
+
+test "no other socket can take over the DNS port" {
+    var t: TestServer = undefined;
+    try t.init(&.{ip.Cidr.parse("127.0.0.0/8").?});
+    defer t.deinit();
+    // Not even one that asks for SO_REUSEPORT, as std's reuse_address does.
+    const address = t.server.tcp_listeners.items[0].socket.address;
+    if (address.listen(testing.io, .{ .reuse_address = true })) |intruder| {
+        var listener = intruder;
+        listener.deinit(testing.io);
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(error.AddressInUse, err);
 }

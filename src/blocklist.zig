@@ -219,6 +219,8 @@ fn loadUrl(gpa: Allocator, client: *std.http.Client, url: []const u8, sink: *Sin
 
     var redirect_buffer: [8 * 1024]u8 = undefined;
     var response = try request.receiveHead(&redirect_buffer);
+    // `request.uri` is where the redirects (if any) ended up.
+    try refuseDowngrade(url, request.uri);
     if (response.head.status != .ok) {
         log.warn("{s}: HTTP status {d}", .{ url, @backingInt(response.head.status) });
         return error.HttpError;
@@ -239,6 +241,13 @@ fn loadUrl(gpa: Allocator, client: *std.http.Client, url: []const u8, sink: *Sin
         error.ReadFailed => return response.bodyErr() orelse error.ReadFailed,
         else => |e| return e,
     };
+}
+
+/// A list configured as https:// must not arrive over plain http after a
+/// redirect: on the way, anyone could rewrite its rules.
+fn refuseDowngrade(source: []const u8, final: std.Uri) error{InsecureRedirect}!void {
+    const was_https = std.mem.startsWith(u8, source, "https://");
+    if (was_https and !std.ascii.eqlIgnoreCase(final.scheme, "https")) return error.InsecureRedirect;
 }
 
 /// Feeds everything `reader` produces to the line parser.
@@ -460,4 +469,13 @@ test "random lines never break the parser" {
         try parseLine(buf[0..len], &sink);
     }
     try testing.expect(sink.stats.rules + sink.stats.skipped > 0);
+}
+
+test "a list fetched over https is never accepted from a redirect to http" {
+    const https = "https://lists.example/ads.txt";
+    try testing.expectError(error.InsecureRedirect, refuseDowngrade(https, try std.Uri.parse("http://lists.example/ads.txt")));
+    try refuseDowngrade(https, try std.Uri.parse("https://cdn.example/ads.txt"));
+    // A configured http:// list is already warned about; upgrades are fine.
+    try refuseDowngrade("http://lists.example/ads.txt", try std.Uri.parse("http://cdn.example/ads.txt"));
+    try refuseDowngrade("http://lists.example/ads.txt", try std.Uri.parse("https://lists.example/ads.txt"));
 }

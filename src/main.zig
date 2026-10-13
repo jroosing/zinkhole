@@ -255,12 +255,14 @@ fn run(io: Io, gpa: Allocator, config_path: []const u8, cfg: *Config) !void {
 
     var origin: sync.Origin = undefined;
     const serving = cfg.sync == .origin;
+    if (serving) try origin.init(io, gpa, cfg.sync.origin.serve, cfg.sync.origin.secret, allow_clients);
+    // Right after init: its tasks point into `origin` and must stop before
+    // this frame ends, whatever fails next.
+    defer if (serving) origin.deinit();
     if (serving) {
-        try origin.init(io, gpa, cfg.sync.origin.serve, cfg.sync.origin.secret, allow_clients);
         try origin.publish(cfg.policy_text);
         for (origin.listeners.items) |listener| log.info("serving the Policy settings to replicas on {f}", .{listener.socket.address});
     }
-    defer if (serving) origin.deinit();
 
     var app: App = .{
         .io = io,
@@ -273,6 +275,7 @@ fn run(io: Io, gpa: Allocator, config_path: []const u8, cfg: *Config) !void {
         .origin = if (serving) &origin else null,
         .replica = replica,
         .synced = &synced,
+        .sync_client = .{ .allocator = gpa, .io = io },
     };
     defer app.deinit();
 
@@ -328,6 +331,8 @@ const App = struct {
     replica: ?Config.Sync.Replica,
     /// Replica only: the settings last synced from the origin (owned).
     synced: *?sync.Synced,
+    /// Replica only: one HTTP client for every sync (keeps the CA bundle).
+    sync_client: std.http.Client,
     sync_task: ?Io.Future(Io.Cancelable!?sync.Fetched) = null,
     sync_done: std.atomic.Value(bool) = .init(false),
     /// Why the last sync task failed; written by the task before `sync_done`.
@@ -345,6 +350,7 @@ const App = struct {
     task_arena: std.heap.ArenaAllocator,
 
     fn deinit(app: *App) void {
+        app.sync_client.deinit();
         app.task_arena.deinit();
     }
 
@@ -463,7 +469,7 @@ const App = struct {
     /// Runs as a background task: one sync request to the origin.
     fn fetchSettings(app: *App, url: []const u8, secret: []const u8, have: ?sync.Fingerprint) Io.Cancelable!?sync.Fetched {
         defer app.sync_done.store(true, .release);
-        return sync.fetch(app.io, app.gpa, url, secret, have) catch |err| {
+        return sync.fetch(&app.sync_client, url, secret, have) catch |err| {
             const any: anyerror = err;
             if (any == error.Canceled) return error.Canceled;
             app.sync_error = err;
@@ -644,4 +650,5 @@ test {
     _ = @import("upstream.zig");
     _ = @import("dot.zig");
     _ = @import("tcp.zig");
+    _ = @import("server.zig");
 }
