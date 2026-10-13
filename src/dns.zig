@@ -328,12 +328,24 @@ pub fn ageTtls(msg: []u8, elapsed: u32) MalformedError!void {
     }
 }
 
+/// A query in the form sent to upstream servers (see `rewriteForUpstream`).
+pub const UpstreamQuery = struct {
+    bytes: []u8,
+    /// Offset just past the question section.
+    question_end: usize,
+
+    /// True if `response` answers this query (see `isResponseTo`).
+    pub fn isAnswer(query: UpstreamQuery, response: []const u8) bool {
+        return isResponseTo(response, query.bytes, query.question_end);
+    }
+};
+
 /// Rewrites a parsed query in place into the form sent upstream: header and
 /// question stay, other records are dropped, and the client's OPT record is
 /// replaced by a fresh one with no options and our UDP payload size. Client
 /// cookies, client subnet and other EDNS options never reach upstream
 /// servers, and the answers are safe to share between clients via the cache.
-pub fn rewriteForUpstream(msg: []u8, q: *const Query) []u8 {
+pub fn rewriteForUpstream(msg: []u8, q: *const Query) UpstreamQuery {
     var flags = q.flags; // keeps RD, CD and AD
     flags.aa = false;
     flags.tc = false;
@@ -349,7 +361,7 @@ pub fn rewriteForUpstream(msg: []u8, q: *const Query) []u8 {
         // The client's OPT record took at least as much space, so this fits.
         if (b.opt(edns.dnssec_ok)) writeU16(msg, 10, 1) else |_| {}
     }
-    return msg[0..b.len];
+    return .{ .bytes = msg[0..b.len], .question_end = q.question_end };
 }
 
 pub fn readId(msg: []const u8) u16 {
@@ -724,7 +736,7 @@ test "rewriteForUpstream drops EDNS options and extra records" {
     const msg = buf[0 .. original.len + 12];
 
     const q = try parseQuery(msg, &name_buf);
-    const rewritten = rewriteForUpstream(msg, &q);
+    const rewritten = rewriteForUpstream(msg, &q).bytes;
     try testing.expectEqual(q.question_end + 11, rewritten.len);
     const again = try parseQuery(rewritten, &name_buf);
     try testing.expectEqual(edns_payload_size, again.edns.?.udp_size);
@@ -735,7 +747,7 @@ test "rewriteForUpstream drops EDNS options and extra records" {
     // Without EDNS nothing follows the question.
     const plain = testQuery(&buf, 4, "example.com", .a, null);
     const plain_q = try parseQuery(plain, &name_buf);
-    try testing.expectEqual(plain_q.question_end, rewriteForUpstream(plain, &plain_q).len);
+    try testing.expectEqual(plain_q.question_end, rewriteForUpstream(plain, &plain_q).bytes.len);
 }
 
 test "header-only error responses" {

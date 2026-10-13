@@ -35,7 +35,8 @@ Requires Zig 0.17.
 
 ```sh
 zig build --release            # ReleaseSafe: optimized, bounds checks kept
-zig build test                 # unit tests
+zig build test                 # unit tests (offline)
+zig build test -Dnetwork       # also DNS over TLS to a public server
 zig build --release -Dtarget=aarch64-linux-musl -Dstrip=true   # e.g. Raspberry Pi 64-bit
 zig build --release -Dtarget=arm-linux-musleabihf -Dstrip=true # Raspberry Pi 32-bit
 ```
@@ -183,8 +184,8 @@ so clients cannot get around a block through HTTPS/SVCB records.
 | `blocklist.zig` | Line parser for all list formats, streaming loader (file/HTTPS) |
 | `local.zig` | Local records, wildcards, reverse lookups, private zones |
 | `cache.zig` | Bounded LRU response cache |
-| `upstream.zig` | Forwarding with failover; plain DNS with TCP fallback |
-| `dot.zig` | DNS over TLS: pooled TLS connections, certificate checks |
+| `upstream.zig` | Failover over upstream servers; plain DNS with TCP fallback |
+| `dot.zig` | DNS over TLS: pooled TLS connections, certificate checks (`dot.Tls`) |
 | `dns.zig` | DNS wire format: parsing, building, TTL handling |
 
 **Domain set.** Every domain is stored once in one byte array as

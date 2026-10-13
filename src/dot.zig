@@ -45,8 +45,49 @@ pub const Trust = struct {
     }
 };
 
+/// An upstream server reached over DNS over TLS.
+pub const Tls = struct {
+    address: net.IpAddress,
+    /// The name the server's certificate must carry.
+    name: []const u8,
+    trust: *Trust,
+    pool: Pool = .{},
+
+    /// `name` and `trust` must outlive the adapter.
+    pub fn init(address: net.IpAddress, name: []const u8, trust: *Trust) Tls {
+        return .{ .address = address, .name = name, .trust = trust };
+    }
+
+    pub fn deinit(tls: *Tls) void {
+        tls.pool.deinit();
+    }
+
+    /// Sends `query` and reads the answer into `out`, reusing a pooled
+    /// connection when possible.
+    pub fn exchange(tls: *Tls, io: Io, query: dns.UpstreamQuery, out: []u8, deadline: Io.Timeout) ![]u8 {
+        if (tls.pool.take(io, nowSeconds(io))) |connection| {
+            if (connection.exchange(query, out, deadline)) |response| {
+                tls.pool.put(io, connection, nowSeconds(io));
+                return response;
+            } else |err| {
+                connection.destroy();
+                if (err == error.Canceled) return error.Canceled;
+                // Most likely the server closed the idle connection; DNS queries
+                // are safe to repeat, so try once more on a new connection.
+                log.debug("tls://{f}: reused connection failed ({t}), reconnecting", .{ tls.address, err });
+            }
+        }
+
+        const connection = try Connection.open(io, tls.trust, &tls.address, tls.name, deadline);
+        errdefer connection.destroy();
+        const response = try connection.exchange(query, out, deadline);
+        tls.pool.put(io, connection, nowSeconds(io));
+        return response;
+    }
+};
+
 /// Idle connections to one server, most recently used last.
-pub const Pool = struct {
+const Pool = struct {
     mutex: Io.Mutex = .init,
     idle: [max_idle_connections]*Connection = undefined,
     len: usize = 0,
@@ -84,39 +125,6 @@ pub const Pool = struct {
         pool.len = 0;
     }
 };
-
-/// Sends `query` to the DNS-over-TLS server at `address` and reads the answer
-/// into `out`. Reuses a pooled connection when possible.
-pub fn exchange(
-    io: Io,
-    trust: *Trust,
-    pool: *Pool,
-    address: *const net.IpAddress,
-    tls_name: []const u8,
-    query: []const u8,
-    question_end: usize,
-    out: []u8,
-    deadline: Io.Timeout,
-) ![]u8 {
-    if (pool.take(io, nowSeconds(io))) |connection| {
-        if (connection.exchange(query, question_end, out, deadline)) |response| {
-            pool.put(io, connection, nowSeconds(io));
-            return response;
-        } else |err| {
-            connection.destroy();
-            if (err == error.Canceled) return error.Canceled;
-            // Most likely the server closed the idle connection; DNS queries
-            // are safe to repeat, so try once more on a new connection.
-            log.debug("tls://{f}: reused connection failed ({t}), reconnecting", .{ address.*, err });
-        }
-    }
-
-    const connection = try Connection.open(io, trust, address, tls_name, deadline);
-    errdefer connection.destroy();
-    const response = try connection.exchange(query, question_end, out, deadline);
-    pool.put(io, connection, nowSeconds(io));
-    return response;
-}
 
 /// One TLS connection with its buffers, in a single allocation that must not
 /// move (the TLS client points into it).
@@ -181,15 +189,15 @@ const Connection = struct {
         connection.gpa.destroy(connection);
     }
 
-    fn exchange(connection: *Connection, query: []const u8, question_end: usize, out: []u8, deadline: Io.Timeout) ![]u8 {
+    fn exchange(connection: *Connection, query: dns.UpstreamQuery, out: []u8, deadline: Io.Timeout) ![]u8 {
         connection.socket_reader.deadline = deadline;
         connection.socket_writer.deadline = deadline;
 
         var prefix: [2]u8 = undefined;
-        std.mem.writeInt(u16, &prefix, @intCast(query.len), .big);
+        std.mem.writeInt(u16, &prefix, @intCast(query.bytes.len), .big);
         const writer = &connection.tls.writer;
         writer.writeAll(&prefix) catch return connection.writeError();
-        writer.writeAll(query) catch return connection.writeError();
+        writer.writeAll(query.bytes) catch return connection.writeError();
         writer.flush() catch return connection.writeError(); // encrypts
         connection.socket_writer.interface.flush() catch return connection.writeError(); // sends
 
@@ -199,7 +207,7 @@ const Connection = struct {
         reader.readSliceAll(out[0..len]) catch |err| return connection.readError(err);
 
         const response = out[0..len];
-        if (!dns.isResponseTo(response, query, question_end)) return error.InvalidResponse;
+        if (!query.isAnswer(response)) return error.InvalidResponse;
         return response;
     }
 

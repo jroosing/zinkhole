@@ -243,7 +243,7 @@ fn run(io: Io, gpa: Allocator, config_path: []const u8, cfg: *Config) !void {
 
     signals.install();
     log.info("zinkhole {s} ready ({d} upstream servers, {d} local records)", .{
-        version, upstream.endpoints.len, cfg.local.records.len,
+        version, upstream.servers.len, cfg.local.records.len,
     });
     app.supervise();
 }

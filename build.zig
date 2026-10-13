@@ -10,6 +10,9 @@ pub fn build(b: *std.Build) void {
     // Debug info only takes disk space (it is never loaded into memory), but
     // it makes panic messages useful, so it is kept unless asked otherwise.
     const strip = b.option(bool, "strip", "Omit debug info from the binary") orelse false;
+    const network = b.option(bool, "network", "Also run the tests that need the internet") orelse false;
+    const options = b.addOptions();
+    options.addOption(bool, "network_tests", network);
 
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -17,6 +20,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .strip = strip,
     });
+    root_module.addOptions("build_options", options);
 
     const exe = b.addExecutable(.{
         .name = "zinkhole",

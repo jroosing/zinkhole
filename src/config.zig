@@ -38,7 +38,7 @@ pub const Config = struct {
     };
 
     pub const Upstream = struct {
-        servers: []const upstream_mod.Server = &.{},
+        servers: []const upstream_mod.ServerAddress = &.{},
         timeout_ms: u32 = 2000,
     };
 
@@ -346,9 +346,9 @@ const Decoder = struct {
     /// Plain DNS: `ip`, `ip:port`, `[ipv6]:port`. DNS over TLS:
     /// `tls://ip[:port]#name`, where `name` is what the server's certificate
     /// must carry (the format Unbound uses, minus the hostname lookup).
-    fn upstreamServers(d: *Decoder, pair: yaml.Pair) Error![]const upstream_mod.Server {
+    fn upstreamServers(d: *Decoder, pair: yaml.Pair) Error![]const upstream_mod.ServerAddress {
         const items = try d.nonEmptyList(pair);
-        const servers = try d.arena.alloc(upstream_mod.Server, items.len);
+        const servers = try d.arena.alloc(upstream_mod.ServerAddress, items.len);
         for (items, servers) |item, *server| {
             const text = try d.scalar(item, pair.key);
             const tls_prefix = "tls://";
