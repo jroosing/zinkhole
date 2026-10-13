@@ -47,6 +47,8 @@ build() {
 		sed "/^BASE_URL=/s/@VERSION@/$(version)/" "$script" >"$dist/$(basename "$script")"
 		chmod 755 "$dist/$(basename "$script")"
 	done
+	# MIT asks for the notice to accompany copies of the software.
+	install -m 644 LICENSE "$dist/LICENSE"
 	# What deploy/install.sh needs next to it. The Proxmox installer and `update`
 	# use it instead of GitLab's source archive, which has no checksum we control.
 	tar -czf "$dist/zinkhole-deploy.tar.gz" deploy/install.sh deploy/zinkhole.service deploy/openrc/zinkhole config.example.yaml

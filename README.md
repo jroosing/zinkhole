@@ -493,3 +493,9 @@ the lists, the new ones are used right away, even if some of them failed.
   (inside a LAN, encrypting the client side adds little).
 - Regular-expression rules and per-client blocking groups are not supported.
 - Lists are downloaded again on every start (nothing is stored on disk).
+
+## License
+
+[MIT](LICENSE): free to use, copy, modify and distribute, including
+commercially. The only condition is that the copyright notice and license text
+stay with the code.

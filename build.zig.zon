@@ -9,6 +9,7 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        "LICENSE",
         "src",
         "README.md",
         "config.example.yaml",
