@@ -10,6 +10,7 @@
 #   * installs the `update` command.
 #
 # setup.env (shell syntax) holds ZINKHOLE_ROLE (standalone, origin or replica),
+# ZINKHOLE_ROOT_HASH (a crypt(3) hash of the root password, or empty for none),
 # ZINKHOLE_IPV6 (on or off: whether zinkhole listens on IPv6), ZINKHOLE_SERVE
 # and ZINKHOLE_SECRET (origin), ZINKHOLE_ORIGIN and ZINKHOLE_SECRET (replica),
 # and optionally ZINKHOLE_BASE_URL (a download location for `update` other than
@@ -22,6 +23,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 rm -f "$here/setup.env" # holds the secret
 : "${ZINKHOLE_ROLE:?}"
 ZINKHOLE_IPV6=${ZINKHOLE_IPV6:-off}
+ZINKHOLE_ROOT_HASH=${ZINKHOLE_ROOT_HASH:-}
 
 say() { echo "==> $*"; }
 die() {
@@ -174,6 +176,10 @@ ZINKHOLE_BASE_URL=$base sh "$tmp/update.sh" "$@"
 STUB
 }
 
+if [ -n "$ZINKHOLE_ROOT_HASH" ]; then
+	say "Setting the root password"
+	echo "root:$ZINKHOLE_ROOT_HASH" | chpasswd -e
+fi
 say "Upgrading the OS packages"
 install_packages
 if [ "$ZINKHOLE_IPV6" = on ]; then

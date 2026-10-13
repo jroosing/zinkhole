@@ -14,6 +14,9 @@
 #   ZINKHOLE_IP6           off (default), auto (SLAAC), dhcp, or a static
 #                          address with prefix, e.g. fd00::5/64
 #   ZINKHOLE_GATEWAY6      static IPv6 only, optional
+#   ZINKHOLE_PASSWORD      root password of the container (default: none; use
+#                          'pct enter'). Prefer the prompt: a value typed on the
+#                          command line stays in the shell history.
 #   ZINKHOLE_ROLE          standalone (default), origin or replica
 #   ZINKHOLE_ORIGIN        replica: the origin's URL, e.g. http://192.168.1.5:5380
 #   ZINKHOLE_SECRET        replica: the origin's secret (origin: generated)
@@ -63,6 +66,29 @@ ask_secret() {
 	fi
 }
 
+# The root password for the console, asked twice and not echoed. Empty means
+# none: the container is then entered with `pct enter`. A variable that is
+# set, even empty, is taken as the answer.
+ask_password() {
+	if [[ -n ${ZINKHOLE_PASSWORD+x} ]]; then return 0; fi
+	ZINKHOLE_PASSWORD=""
+	interactive || return 0
+	local first second _
+	for _ in 1 2 3; do
+		read -r -s -p "Root password for the container (empty: none, use 'pct enter'): " first
+		echo
+		[[ -n $first ]] || return 0
+		read -r -s -p "Root password again: " second
+		echo
+		if [[ $first == "$second" ]]; then
+			ZINKHOLE_PASSWORD=$first
+			return 0
+		fi
+		echo "The passwords differ." >&2
+	done
+	die "the passwords did not match"
+}
+
 check_host() {
 	[[ $EUID -eq 0 ]] || die "run this as root on a Proxmox node"
 	local tool
@@ -105,6 +131,7 @@ collect_settings() {
 		read -r -p "IPv6 gateway (optional): " ZINKHOLE_GATEWAY6
 	fi
 	ask ZINKHOLE_ROLE "Role: standalone, origin or replica" standalone
+	ask_password
 	ZINKHOLE_BRIDGE=${ZINKHOLE_BRIDGE:-vmbr0}
 	ZINKHOLE_VLAN=${ZINKHOLE_VLAN:-}
 	# A DHCP container gets its name server from DHCP, unless one is given.
@@ -161,6 +188,17 @@ collect_settings() {
 	[[ -n $ZINKHOLE_STORAGE ]] || die "no storage for container disks found; set ZINKHOLE_STORAGE"
 	[[ -n $ZINKHOLE_TEMPLATE_STORAGE ]] || die "no storage for templates found; set ZINKHOLE_TEMPLATE_STORAGE"
 	[[ $ZINKHOLE_CORES =~ ^[0-9]+$ && $ZINKHOLE_MEMORY =~ ^[0-9]+$ && $ZINKHOLE_DISK =~ ^[0-9]+$ ]] || die "cores, memory and disk must be numbers"
+	ROOT_HASH=""
+	if [[ -n $ZINKHOLE_PASSWORD ]]; then
+		((${#ZINKHOLE_PASSWORD} >= 5)) || die "the root password needs at least 5 characters"
+		[[ $ZINKHOLE_PASSWORD != *$'\n'* ]] || die "the root password cannot contain a line break"
+		command -v openssl >/dev/null 2>&1 || die "openssl not found (needed to hash the root password)"
+		# printf is a shell built-in and openssl reads stdin, so the password
+		# is never on the command line of any process.
+		ROOT_HASH=$(printf '%s\n' "$ZINKHOLE_PASSWORD" | openssl passwd -6 -stdin)
+		# shellcheck disable=SC2016 # a literal $6$ prefix, nothing to expand
+		[[ $ROOT_HASH == '$6$'* ]] || die "could not hash the root password"
+	fi
 	if [[ $ZINKHOLE_ROLE != standalone ]]; then
 		# The secret goes into a YAML file and a shell file: keep it plain.
 		[[ $ZINKHOLE_SECRET =~ ^[A-Za-z0-9._~+=/-]{32,}$ ]] || die "the secret needs at least 32 characters from A-Z a-z 0-9 . _ ~ + = / -"
@@ -173,11 +211,13 @@ collect_settings() {
 }
 
 confirm() {
+	local password="none"
+	if [[ -n $ROOT_HASH ]]; then password="set"; fi
 	cat <<EOF
 
   $OS_NAME container $ZINKHOLE_CTID "$ZINKHOLE_HOSTNAME", $ZINKHOLE_CORES core(s), $ZINKHOLE_MEMORY MB RAM, $ZINKHOLE_DISK GB on $ZINKHOLE_STORAGE
   IPv4 $ZINKHOLE_IP${ZINKHOLE_GATEWAY:+ via $ZINKHOLE_GATEWAY} on $ZINKHOLE_BRIDGE${ZINKHOLE_VLAN:+ (VLAN $ZINKHOLE_VLAN)}, IPv6 $ZINKHOLE_IP6
-  role: $ZINKHOLE_ROLE${ZINKHOLE_ORIGIN:+ of $ZINKHOLE_ORIGIN}
+  role: $ZINKHOLE_ROLE${ZINKHOLE_ORIGIN:+ of $ZINKHOLE_ORIGIN}, root password: $password
 
 EOF
 	if interactive && [[ -z ${ZINKHOLE_YES:-} ]]; then
@@ -253,6 +293,8 @@ install_in_container() {
 		if [[ $ZINKHOLE_IP6 == off ]]; then echo "ZINKHOLE_IPV6='off'"; else echo "ZINKHOLE_IPV6='on'"; fi
 		echo "ZINKHOLE_ORIGIN='$ZINKHOLE_ORIGIN'"
 		echo "ZINKHOLE_SECRET='$ZINKHOLE_SECRET'"
+		# Only the hash ($6$salt$hash: letters, digits, . / and $) is sent.
+		echo "ZINKHOLE_ROOT_HASH='$ROOT_HASH'"
 		# Only a download location that is not the project's own is remembered.
 		if [[ -n ${ZINKHOLE_BASE_URL:-} ]]; then echo "ZINKHOLE_BASE_URL='$ZINKHOLE_BASE_URL'"; fi
 	} >"$WORK/setup.env"
@@ -290,6 +332,7 @@ zinkhole $VERSION runs in container $ZINKHOLE_CTID ($ZINKHOLE_HOSTNAME) at $ip${
 
   Try it:      dig @$ip example.com
   Use it:      hand out $ip${ip6:+ (and $ip6)} as the DNS server (usually in your router's DHCP settings)
+  Console:     ${ROOT_HASH:+log in as root with the password you set (Proxmox console), or }pct enter $ZINKHOLE_CTID
   Edit config: pct enter $ZINKHOLE_CTID    then edit /etc/zinkhole/config.yaml
                apply with: systemctl reload zinkhole   (Alpine: rc-service zinkhole reload)
   Update:      pct exec $ZINKHOLE_CTID -- update       (OS packages and zinkhole)

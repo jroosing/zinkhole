@@ -162,7 +162,8 @@ bash -c "$(curl -fsSL https://gitlab.com/kyura4k/zinkhole/-/releases/permalink/l
 bash -c "$(curl -fsSL https://gitlab.com/kyura4k/zinkhole/-/releases/permalink/latest/downloads/zinkhole-alpine.sh)"
 ```
 
-It asks a few questions, shows what it is about to do, and then:
+It asks a few questions (including an optional **root password**), shows what
+it is about to do, and then:
 
 1. creates an unprivileged container (1 core, 128 MB RAM, 1 GB disk, no swap)
    with a **static or DHCP address** (your choice) and optional IPv6, starting
@@ -184,6 +185,7 @@ also makes it non-interactive. All are optional except the IPv4 address:
 | `ZINKHOLE_GATEWAY` | static only: the node's default gateway |
 | `ZINKHOLE_IP6` | `off`, `auto` (SLAAC), `dhcp`, or a static address like `fd00::5/64` (`off`) |
 | `ZINKHOLE_GATEWAY6` | static IPv6 only, optional |
+| `ZINKHOLE_PASSWORD` | root password of the container (none; see below) |
 | `ZINKHOLE_ROLE` | `standalone`, `origin` or `replica` |
 | `ZINKHOLE_ORIGIN`, `ZINKHOLE_SECRET` | replica: the origin's URL and secret |
 | `ZINKHOLE_CTID`, `ZINKHOLE_HOSTNAME` | next free ID, `zinkhole-<node>` |
@@ -205,6 +207,14 @@ Afterwards, test with `dig @192.168.1.5 example.com`, hand out the
 container's address as the DNS server (typically in your router's DHCP
 settings), and never forward port 53 from the internet to it.
 
+- **Root password:** asked silently and twice; leave it empty for none, and
+  enter the container with `pct enter <id>`. With a password you can also log
+  in as `root` on the Proxmox console (at least 5 characters). It does not
+  enable SSH logins with a password (Debian's default allows only keys for
+  root). The node hashes it (SHA-512) before it goes into the container, so it
+  is never on a command line or stored in plain text; `ZINKHOLE_PASSWORD` is
+  there for unattended installs, but a value typed in a shell is kept in the
+  shell history, so prefer the prompt.
 - **Static or DHCP?** Clients need a DNS server whose address never changes.
   Static is the simplest way to get that. With `dhcp` the script shows the
   address the container received; give the container a fixed lease on your
