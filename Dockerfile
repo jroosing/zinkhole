@@ -51,12 +51,15 @@ RUN set -eu; \
         *) echo "unsupported target architecture: $TARGETARCH" >&2; exit 1 ;; \
     esac; \
     zig build --release -Dstrip=true -Dtarget="$target" --prefix /out
+# An empty state directory for replicas (sync); see the runtime stages.
+RUN mkdir -p /out/state
 
 # --- Alpine runtime (docker build --target alpine): has a shell -------------
 FROM alpine:${ALPINE_VERSION} AS alpine
 RUN apk add --no-cache ca-certificates \
     && addgroup -S zinkhole \
-    && adduser -S -D -H -h /var/empty -s /sbin/nologin -G zinkhole zinkhole
+    && adduser -S -D -H -h /var/empty -s /sbin/nologin -G zinkhole zinkhole \
+    && install -d -o zinkhole -g zinkhole -m 0700 /var/lib/zinkhole
 COPY --from=build /out/bin/zinkhole /usr/local/bin/zinkhole
 COPY config.example.yaml /etc/zinkhole/config.yaml
 USER zinkhole
@@ -73,6 +76,9 @@ FROM scratch
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /out/bin/zinkhole /usr/local/bin/zinkhole
 COPY config.example.yaml /etc/zinkhole/config.yaml
+# A replica keeps its last synced settings here; mount a volume on it. Owned
+# by the runtime user, so a new named volume starts out writable for it.
+COPY --from=build --chown=65532:65532 /out/state /var/lib/zinkhole
 
 # Unprivileged (there is no /etc/passwd, so a numeric user). Docker lets
 # containers bind ports below 1024 without privileges

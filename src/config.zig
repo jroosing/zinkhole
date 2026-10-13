@@ -28,6 +28,12 @@ pub const Config = struct {
     blocking: Blocking = .{},
     local: Local = .{},
     log: Log = .{},
+    sync: Sync = .none,
+    /// The `blocking:` and `local:` sections exactly as written (comments
+    /// included): what an origin serves to its replicas.
+    policy_text: []const u8 = "",
+    /// The file's text, which a replica combines with each sync.
+    source: []const u8 = "",
 
     pub const Server = struct {
         listen: []const net.IpAddress = &default_listen,
@@ -89,6 +95,32 @@ pub const Config = struct {
         queries: bool = false,
     };
 
+    /// Whether this instance serves its Policy settings to replicas, takes
+    /// them from an origin, or neither.
+    pub const Sync = union(enum) {
+        none,
+        origin: Origin,
+        replica: Replica,
+
+        pub const Origin = struct {
+            /// HTTP listen addresses for replicas.
+            serve: []const net.IpAddress,
+            secret: []const u8,
+        };
+
+        pub const Replica = struct {
+            /// The origin's URL, e.g. http://192.168.1.5:5380.
+            origin: []const u8,
+            secret: []const u8,
+            /// Seconds between syncs.
+            interval: u32,
+            /// Where the replica keeps its last synced settings.
+            state_dir: []const u8,
+        };
+    };
+
+    pub const min_secret_len = 32;
+
     pub fn deinit(config: *Config) void {
         config.arena.deinit();
         config.* = undefined;
@@ -117,6 +149,8 @@ const default_allow_clients = [_]ip.Cidr{
 pub const Diagnostic = struct {
     /// 0 when the problem is not tied to a line.
     line: u32 = 0,
+    /// The line is in the settings synced from the origin, not in the file.
+    from_origin: bool = false,
     buf: [256]u8 = undefined,
     len: usize = 0,
 
@@ -158,7 +192,64 @@ pub fn parse(gpa: Allocator, source: []const u8, diag: *Diagnostic) Error!Config
     errdefer config.deinit();
     var decoder: Decoder = .{ .arena = config.arena.allocator(), .diag = diag };
     try decoder.decodeRoot(root, &config);
+    config.policy_text = try policyText(config.arena.allocator(), source, root);
+    config.source = try config.arena.allocator().dupe(u8, source);
     return config;
+}
+
+/// A replica's config: its own file's `source` plus the Policy settings
+/// `synced` from its origin (the origin's `policy_text`).
+pub fn parseReplica(gpa: Allocator, source: []const u8, synced: []const u8, diag: *Diagnostic) Error!Config {
+    var config = try parse(gpa, source, diag);
+    errdefer config.deinit();
+    diag.from_origin = true;
+    var tree_arena: std.heap.ArenaAllocator = .init(gpa);
+    defer tree_arena.deinit();
+    var yaml_diag: yaml.Diagnostic = .{};
+    const root = yaml.parse(tree_arena.allocator(), synced, &yaml_diag) catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        error.InvalidYaml => return diag.fail(yaml_diag.line, "{s}", .{yaml_diag.message}),
+    };
+    var decoder: Decoder = .{ .arena = config.arena.allocator(), .diag = diag };
+    for (try decoder.mapping(root, "top level")) |pair| {
+        if (is(pair, "blocking")) {
+            try decoder.decodeBlocking(pair.value, &config.blocking);
+        } else if (is(pair, "local")) {
+            try decoder.decodeLocal(pair.value, &config.local);
+        } else {
+            return diag.fail(pair.line, "the origin may only send 'blocking' and 'local', not '{s}'", .{pair.key});
+        }
+    }
+    diag.from_origin = false;
+    config.policy_text = try config.arena.allocator().dupe(u8, synced);
+    return config;
+}
+
+/// The text of the `blocking:` and `local:` sections, each from its key's
+/// line up to the next top-level key, so comments and formatting are kept.
+fn policyText(arena: Allocator, source: []const u8, root: yaml.Node) Allocator.Error![]const u8 {
+    const pairs = switch (root.value) {
+        .mapping => |pairs| pairs,
+        else => return "",
+    };
+    var text: std.ArrayList(u8) = .empty;
+    for (pairs, 0..) |pair, i| {
+        if (!is(pair, "blocking") and !is(pair, "local")) continue;
+        const start = lineStart(source, pair.line);
+        const end = if (i + 1 < pairs.len) lineStart(source, pairs[i + 1].line) else source.len;
+        try text.appendSlice(arena, source[start..end]);
+        if (text.items[text.items.len - 1] != '\n') try text.append(arena, '\n');
+    }
+    return text.items;
+}
+
+/// Byte offset at which the 1-based `line` starts.
+fn lineStart(source: []const u8, line: u32) usize {
+    var offset: usize = 0;
+    for (1..line) |_| {
+        offset = (std.mem.findScalarPos(u8, source, offset, '\n') orelse return source.len) + 1;
+    }
+    return offset;
 }
 
 /// Turns the YAML tree into a `Config`, copying kept strings into `arena`.
@@ -171,7 +262,10 @@ const Decoder = struct {
     }
 
     fn decodeRoot(d: *Decoder, root: yaml.Node, config: *Config) Error!void {
+        // Lines of the sections a replica takes from its origin instead.
+        var policy_line: ?u32 = null;
         for (try d.mapping(root, "top level")) |pair| {
+            if (is(pair, "blocking") or is(pair, "local")) policy_line = policy_line orelse pair.line;
             if (is(pair, "server")) {
                 try d.decodeServer(pair.value, &config.server);
             } else if (is(pair, "upstream")) {
@@ -184,8 +278,15 @@ const Decoder = struct {
                 try d.decodeLocal(pair.value, &config.local);
             } else if (is(pair, "log")) {
                 try d.decodeLog(pair.value, &config.log);
+            } else if (is(pair, "sync")) {
+                config.sync = try d.decodeSync(pair);
             } else {
                 return d.fail(pair.line, "unknown section '{s}'", .{pair.key});
+            }
+        }
+        if (config.sync == .replica) {
+            if (policy_line) |line| {
+                return d.fail(line, "'blocking' and 'local' are synced from the origin; remove them from a replica's config", .{});
             }
         }
         if (config.upstream.servers.len == 0) {
@@ -274,6 +375,50 @@ const Decoder = struct {
                 return d.unknownKey(pair, "local");
             }
         }
+    }
+
+    fn decodeSync(d: *Decoder, section: yaml.Pair) Error!Config.Sync {
+        var serve: ?[]const net.IpAddress = null;
+        var origin: ?[]const u8 = null;
+        var secret: ?[]const u8 = null;
+        var interval: u32 = 60;
+        var state_dir: []const u8 = "/var/lib/zinkhole";
+        for (try d.mapping(section.value, "sync")) |pair| {
+            if (is(pair, "serve")) {
+                const items = try d.nonEmptyList(pair);
+                const addresses = try d.arena.alloc(net.IpAddress, items.len);
+                for (items, addresses) |item, *address| {
+                    const text = try d.scalar(item, pair.key);
+                    address.* = ip.parseSocketAddress(text, 0) orelse
+                        return d.fail(item.line, "'{s}' is not an IP address with a port", .{text});
+                    if (address.getPort() == 0) return d.fail(item.line, "'{s}' needs a port, e.g. 192.168.1.5:5380", .{text});
+                }
+                serve = addresses;
+            } else if (is(pair, "origin")) {
+                const url = try d.scalar(pair.value, pair.key);
+                if (!blocklist.isUrl(url)) return d.fail(pair.value.line, "sync.origin must start with http:// or https://", .{});
+                _ = std.Uri.parse(url) catch return d.fail(pair.value.line, "invalid URL '{s}'", .{url});
+                origin = try d.arena.dupe(u8, url);
+            } else if (is(pair, "secret")) {
+                const text = try d.scalar(pair.value, pair.key);
+                if (text.len < Config.min_secret_len) {
+                    return d.fail(pair.value.line, "sync.secret must be at least {d} characters", .{Config.min_secret_len});
+                }
+                secret = try d.arena.dupe(u8, text);
+            } else if (is(pair, "interval")) {
+                interval = try d.integer(u32, pair, 1, 86_400);
+            } else if (is(pair, "state_dir")) {
+                state_dir = try d.arena.dupe(u8, try d.scalar(pair.value, pair.key));
+            } else {
+                return d.unknownKey(pair, "sync");
+            }
+        }
+        if ((serve == null) == (origin == null)) {
+            return d.fail(section.line, "sync: set either 'serve' (origin) or 'origin' (replica)", .{});
+        }
+        const key = secret orelse return d.fail(section.line, "sync needs a secret, the same on origin and replicas", .{});
+        if (serve) |addresses| return .{ .origin = .{ .serve = addresses, .secret = key } };
+        return .{ .replica = .{ .origin = origin.?, .secret = key, .interval = interval, .state_dir = state_dir } };
     }
 
     fn decodeLog(d: *Decoder, node: yaml.Node, log_config: *Config.Log) Error!void {
@@ -606,4 +751,112 @@ test "configuration errors name the line" {
     try expectConfigError("upstream:\n  servers: [1.1.1.1]\nserver:\n  allow_clients: [192.168.0.0/40]", 4, "invalid network");
     try expectConfigError("upstream: [1.1.1.1]", 1, "expected 'key: value'");
     try expectConfigError("a: b: c", 1, "unexpected ':'");
+}
+
+const test_secret = "0123456789abcdef0123456789abcdef";
+
+test "the sync section makes an instance an origin or a replica" {
+    var diag: Diagnostic = .{};
+    const base = "upstream:\n  servers: [1.1.1.1]\n";
+
+    var origin = try parse(testing.allocator, base ++
+        \\sync:
+        \\  serve: ["192.168.1.5:5380"]
+        \\  secret: 
+    ++ test_secret, &diag);
+    defer origin.deinit();
+    try testing.expect(origin.sync == .origin);
+    try testing.expectEqual(5380, origin.sync.origin.serve[0].getPort());
+    try testing.expectEqualStrings(test_secret, origin.sync.origin.secret);
+
+    var replica = try parse(testing.allocator, base ++
+        \\sync:
+        \\  origin: http://192.168.1.5:5380
+        \\  interval: 30
+        \\  secret: 
+    ++ test_secret, &diag);
+    defer replica.deinit();
+    try testing.expect(replica.sync == .replica);
+    try testing.expectEqualStrings("http://192.168.1.5:5380", replica.sync.replica.origin);
+    try testing.expectEqual(30, replica.sync.replica.interval);
+
+    var standalone = try parse(testing.allocator, base, &diag);
+    defer standalone.deinit();
+    try testing.expect(standalone.sync == .none);
+}
+
+test "sync configuration errors" {
+    const base = "upstream:\n  servers: [1.1.1.1]\n";
+    try expectConfigError(base ++ "sync:\n  serve: [\"10.0.0.1:5380\"]\n  origin: http://10.0.0.2:5380\n  secret: " ++ test_secret, 3, "either 'serve' (origin) or 'origin' (replica)");
+    try expectConfigError(base ++ "sync:\n  serve: [\"10.0.0.1:5380\"]\n  secret: short", 5, "at least 32 characters");
+    try expectConfigError(base ++ "sync:\n  serve: [\"10.0.0.1:5380\"]", 3, "needs a secret");
+    try expectConfigError(base ++ "sync:\n  serve: [10.0.0.1]\n  secret: " ++ test_secret, 4, "needs a port");
+    try expectConfigError(base ++ "sync:\n  origin: ftp://10.0.0.1\n  secret: " ++ test_secret, 4, "http:// or https://");
+    try expectConfigError(base ++ "sync:\n  secret: " ++ test_secret, 3, "either 'serve' (origin) or 'origin' (replica)");
+    try expectConfigError(base ++ "blocking:\n  block: [ads.example]\nsync:\n  origin: http://10.0.0.1:5380\n  secret: " ++ test_secret, 3, "synced from the origin");
+}
+
+test "the Policy settings text is the blocking and local sections, as written" {
+    var diag: Diagnostic = .{};
+    var config = try parse(testing.allocator,
+        \\upstream:
+        \\  servers: [1.1.1.1]
+        \\blocking:
+        \\  # ads
+        \\  block: [ads.example]
+        \\sync:
+        \\  serve: ["10.0.0.1:5380"]
+        \\  secret: 
+    ++ test_secret ++ "\n" ++
+        \\local:
+        \\  records:
+        \\    nas.lan: 10.0.0.10
+    , &diag);
+    defer config.deinit();
+    try testing.expectEqualStrings(
+        \\blocking:
+        \\  # ads
+        \\  block: [ads.example]
+        \\local:
+        \\  records:
+        \\    nas.lan: 10.0.0.10
+        \\
+    , config.policy_text);
+}
+
+const test_replica = "upstream:\n  servers: [1.1.1.1]\nsync:\n  origin: http://10.0.0.1:5380\n  secret: " ++ test_secret ++ "\n";
+
+test "a replica takes its Policy settings from the synced text" {
+    const synced = "blocking:\n  block: [ads.example]\nlocal:\n  records:\n    nas.lan: 10.0.0.10\n";
+    var diag: Diagnostic = .{};
+    var config = try parseReplica(testing.allocator, test_replica, synced, &diag);
+    defer config.deinit();
+    try testing.expect(config.sync == .replica);
+    try testing.expectEqual(1, config.blocking.block.len);
+    try testing.expectEqualStrings("nas.lan", config.local.records[0].name);
+    try testing.expectEqualStrings(synced, config.policy_text);
+}
+
+test "synced text other than Policy settings is rejected, naming the origin" {
+    var diag: Diagnostic = .{};
+    try testing.expectError(error.InvalidConfig, parseReplica(testing.allocator, test_replica, "server:\n  workers: 2\n", &diag));
+    try testing.expect(diag.from_origin);
+    try testing.expectEqual(1, diag.line);
+
+    diag = .{};
+    try testing.expectError(error.InvalidConfig, parseReplica(testing.allocator, test_replica, "local:\n  records:\n    nas.lan: 999.1.1.1\n", &diag));
+    try testing.expect(diag.from_origin);
+    try testing.expectEqual(3, diag.line);
+}
+
+test "a replica keeps its state in /var/lib/zinkhole unless told otherwise" {
+    var diag: Diagnostic = .{};
+    var config = try parse(testing.allocator, test_replica, &diag);
+    defer config.deinit();
+    try testing.expectEqualStrings("/var/lib/zinkhole", config.sync.replica.state_dir);
+    try testing.expectEqualStrings(test_replica, config.source);
+
+    var custom = try parse(testing.allocator, test_replica ++ "  state_dir: /tmp/zh\n", &diag);
+    defer custom.deinit();
+    try testing.expectEqualStrings("/tmp/zh", custom.sync.replica.state_dir);
 }

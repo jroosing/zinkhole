@@ -53,6 +53,8 @@ start_pre() {
 			adduser -S -D -H -h /var/empty -s /sbin/nologin -G "$zinkhole_user" "$zinkhole_user"
 		eend $? || return 1
 	fi
+	# A sync replica keeps its last synced settings here.
+	checkpath -d -m 0700 -o "$zinkhole_user:$zinkhole_user" /var/lib/zinkhole
 	if [ ! -r "$zinkhole_config" ]; then
 		eerror "$zinkhole_config is missing (start from config.example.yaml)"
 		return 1

@@ -1,0 +1,16 @@
+# The replica of the sync test (deploy/sync/test.sh). It has no `blocking` or
+# `local` sections: those come from the origin.
+
+server:
+  # Docker Desktop (macOS, Windows) shows clients with public addresses.
+  allow_clients: [0.0.0.0/0, "::/0"]
+
+upstream:
+  servers:
+    - tls://9.9.9.9#dns.quad9.net
+    - tls://149.112.112.112#dns.quad9.net
+
+sync:
+  origin: http://origin:5380
+  secret: change-me-to-a-long-random-secret-shared-by-both
+  interval: 5            # seconds; the default is 60

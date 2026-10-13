@@ -1,0 +1,22 @@
+# The origin of the sync test (deploy/sync/test.sh). Its `blocking` and
+# `local` sections are what replicas sync.
+
+server:
+  # Docker Desktop (macOS, Windows) shows clients with public addresses.
+  allow_clients: [0.0.0.0/0, "::/0"]
+
+upstream:
+  servers:
+    - tls://9.9.9.9#dns.quad9.net
+    - tls://149.112.112.112#dns.quad9.net
+
+blocking:
+  block: [ads.example]
+
+local:
+  records:
+    nas.lan: 192.168.1.10
+
+sync:
+  serve: ["0.0.0.0:5380"]
+  secret: change-me-to-a-long-random-secret-shared-by-both

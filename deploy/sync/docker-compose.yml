@@ -1,0 +1,41 @@
+# Two zinkhole instances, an origin and a replica that syncs the origin's
+# local records and blocking settings (see docs/adr/0002). Used by test.sh;
+# also a starting point for running two instances.
+#
+#   docker compose -f deploy/sync/docker-compose.yml up -d --build
+#   dig @127.0.0.1 -p 5302 nas.lan        # asks the replica
+#
+# On two hosts, run one service on each: point the replica's `sync.origin` at
+# the origin host's address and publish port 5380 on the origin.
+
+x-zinkhole: &zinkhole
+  build: ../..
+  image: zinkhole:latest
+  restart: unless-stopped
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  sysctls:
+    net.ipv4.ip_unprivileged_port_start: 0
+
+services:
+  origin:
+    <<: *zinkhole
+    ports:
+      - "127.0.0.1:5301:53/udp"
+      - "127.0.0.1:5301:53/tcp"
+    volumes:
+      - ${ZINKHOLE_ORIGIN_CONFIG:-./origin.yaml}:/etc/zinkhole/config.yaml:ro
+
+  replica:
+    <<: *zinkhole
+    ports:
+      - "127.0.0.1:5302:53/udp"
+      - "127.0.0.1:5302:53/tcp"
+    volumes:
+      - ./replica.yaml:/etc/zinkhole/config.yaml:ro
+      # The replica's last synced settings, so it can start without the origin.
+      - replica-state:/var/lib/zinkhole
+
+volumes:
+  replica-state:

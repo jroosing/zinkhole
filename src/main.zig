@@ -19,6 +19,7 @@ const Policy = @import("policy.zig").Policy;
 const Lists = @import("policy.zig").Lists;
 const Sources = @import("policy.zig").Sources;
 const Schedule = @import("refresh.zig").Schedule;
+const sync = @import("sync.zig");
 const Cache = @import("cache.zig").Cache;
 const Resolver = @import("resolver.zig").Resolver;
 const Server = @import("server.zig").Server;
@@ -41,6 +42,10 @@ const default_config_path = "/etc/zinkhole/config.yaml";
 /// downloads need the most (measured: 256 KiB overflows in debug builds,
 /// 512 KiB suffices). Only touched pages consume memory.
 const thread_stack_size = 1024 * 1024;
+/// A sync with the origin taking longer than this is canceled (and failed).
+const sync_timeout_s = 10;
+/// Failed syncs in a row before a warning (single failures are routine).
+const sync_failures_before_warning = 3;
 
 const usage =
     \\Usage: zinkhole [options]
@@ -178,6 +183,9 @@ fn check(io: Io, gpa: Allocator, cfg: *const Config) !u8 {
         error.Canceled => unreachable, // nothing cancels the main thread
     };
     defer lists.destroy();
+    if (cfg.sync == .replica) {
+        printTo(io, .stdout(), "replica: local records and blocking come from {s}\n", .{cfg.sync.replica.origin});
+    }
     printTo(io, .stdout(), "configuration OK: {d} local records, {d} inline rules, {d} blocked and {d} allowed domains from lists\n", .{
         cfg.local.records.len,
         cfg.blocking.block.len + cfg.blocking.allow.len,
@@ -210,6 +218,21 @@ fn run(io: Io, gpa: Allocator, config_path: []const u8, cfg: *Config) !void {
     });
     defer cache.deinit();
 
+    // The sync settings only change on restart; a long-lived copy outlives
+    // the configs that reloads and syncs replace.
+    const replica: ?Config.Sync.Replica = switch (cfg.sync) {
+        .replica => |settings| .{
+            .origin = try arena.dupe(u8, settings.origin),
+            .secret = try arena.dupe(u8, settings.secret),
+            .interval = settings.interval,
+            .state_dir = try arena.dupe(u8, settings.state_dir),
+        },
+        else => null,
+    };
+    // A replica starts from the settings it last synced, if it has any.
+    var synced: ?sync.Synced = if (replica) |settings| startReplica(io, gpa, cfg, settings) else null;
+    defer if (synced) |s| gpa.free(s.text);
+
     // Serve right away with local records and inline rules; lists load in
     // the background. This also lets this host resolve the list servers'
     // names through us while starting.
@@ -230,6 +253,15 @@ fn run(io: Io, gpa: Allocator, config_path: []const u8, cfg: *Config) !void {
     try server.listen(cfg.server.listen);
     try server.start(cfg.server.workers);
 
+    var origin: sync.Origin = undefined;
+    const serving = cfg.sync == .origin;
+    if (serving) {
+        try origin.init(io, gpa, cfg.sync.origin.serve, cfg.sync.origin.secret, allow_clients);
+        try origin.publish(cfg.policy_text);
+        for (origin.listeners.items) |listener| log.info("serving the Policy settings to replicas on {f}", .{listener.socket.address});
+    }
+    defer if (serving) origin.deinit();
+
     var app: App = .{
         .io = io,
         .gpa = gpa,
@@ -238,6 +270,9 @@ fn run(io: Io, gpa: Allocator, config_path: []const u8, cfg: *Config) !void {
         .policy = &policy,
         .resolver = &resolver,
         .task_arena = .init(gpa),
+        .origin = if (serving) &origin else null,
+        .replica = replica,
+        .synced = &synced,
     };
     defer app.deinit();
 
@@ -248,8 +283,35 @@ fn run(io: Io, gpa: Allocator, config_path: []const u8, cfg: *Config) !void {
     app.supervise();
 }
 
-/// State of the supervising main thread. It runs the list loads; the
-/// Refresh schedule decides when.
+/// Loads a replica's state file and, if it holds valid settings, makes them
+/// part of `cfg`. Returns them (owned), or null to start without any.
+fn startReplica(io: Io, gpa: Allocator, cfg: *Config, replica: Config.Sync.Replica) ?sync.Synced {
+    var dir = Io.Dir.cwd().openDir(io, replica.state_dir, .{}) catch |err| {
+        log.warn("cannot open the state directory {s} ({t}); synced settings will not survive a restart", .{ replica.state_dir, err });
+        return null;
+    };
+    defer dir.close(io);
+    const synced = sync.loadState(io, gpa, dir, replica.secret) catch |err| {
+        log.err("ignoring {s}/{s}: {t}", .{ replica.state_dir, sync.state_file, err });
+        return null;
+    } orelse {
+        log.warn("no synced settings yet: no local records or blocking until the first sync from {s}", .{replica.origin});
+        return null;
+    };
+    var diag: config.Diagnostic = .{};
+    const combined = config.parseReplica(gpa, cfg.source, synced.text, &diag) catch |err| {
+        log.err("ignoring {s}/{s}: {t} (line {d}: {s})", .{ replica.state_dir, sync.state_file, err, diag.line, diag.message() });
+        gpa.free(synced.text);
+        return null;
+    };
+    cfg.deinit();
+    cfg.* = combined;
+    log.info("starting with the settings last synced from {s}", .{replica.origin});
+    return synced;
+}
+
+/// State of the supervising main thread. It runs the list loads (the
+/// Refresh schedule decides when) and, on a replica, the syncs.
 const App = struct {
     io: Io,
     gpa: Allocator,
@@ -259,6 +321,21 @@ const App = struct {
     policy: *Policy,
     resolver: *Resolver,
     schedule: Schedule = .{},
+
+    /// Origin only: serves the Policy settings to replicas.
+    origin: ?*sync.Origin,
+    /// Replica only: where to sync from (a copy that lives as long as `App`).
+    replica: ?Config.Sync.Replica,
+    /// Replica only: the settings last synced from the origin (owned).
+    synced: *?sync.Synced,
+    sync_task: ?Io.Future(Io.Cancelable!?sync.Fetched) = null,
+    sync_done: std.atomic.Value(bool) = .init(false),
+    /// Why the last sync task failed; written by the task before `sync_done`.
+    sync_error: anyerror = error.Unknown,
+    sync_started: i64 = 0,
+    /// When to sync next (boot-clock seconds); 0 means now.
+    next_sync: i64 = 0,
+    sync_failures: u32 = 0,
 
     /// The running list load, if any. It returns the lists (null when it ran
     /// out of memory); the supervisor decides whether they are used.
@@ -277,11 +354,16 @@ const App = struct {
             if (signals.reload.swap(false, .acq_rel)) app.reload();
             if (signals.stats.swap(false, .acq_rel)) app.logStats();
             app.scheduleLists();
+            app.scheduleSync();
         }
         log.info("shutting down", .{});
         if (app.task) |*task| {
             discardLoad(task.cancel(app.io));
             app.task = null;
+        }
+        if (app.sync_task) |*task| {
+            app.discardSync(task.cancel(app.io));
+            app.sync_task = null;
         }
     }
 
@@ -352,22 +434,127 @@ const App = struct {
         if (loaded) |lists| lists.destroy();
     }
 
+    fn scheduleSync(app: *App) void {
+        const replica = app.replica orelse return;
+        const now = nowSeconds(app.io);
+        if (app.sync_task) |*task| {
+            if (app.sync_done.load(.acquire)) {
+                const fetched = task.await(app.io) catch null; // only `cancel` cancels it
+                app.sync_task = null;
+                app.finishSync(now, fetched);
+            } else if (now - app.sync_started > sync_timeout_s) {
+                app.discardSync(task.cancel(app.io));
+                app.sync_task = null;
+                app.sync_error = error.Timeout;
+                app.finishSync(now, null);
+            }
+            return;
+        }
+        if (now < app.next_sync) return;
+        const have = if (app.synced.*) |synced| synced.fingerprint else null;
+        app.sync_done.store(false, .release);
+        app.sync_task = app.io.concurrent(fetchSettings, .{ app, replica.origin, replica.secret, have }) catch |err| {
+            app.sync_error = err;
+            return app.finishSync(now, null);
+        };
+        app.sync_started = now;
+    }
+
+    /// Runs as a background task: one sync request to the origin.
+    fn fetchSettings(app: *App, url: []const u8, secret: []const u8, have: ?sync.Fingerprint) Io.Cancelable!?sync.Fetched {
+        defer app.sync_done.store(true, .release);
+        return sync.fetch(app.io, app.gpa, url, secret, have) catch |err| {
+            const any: anyerror = err;
+            if (any == error.Canceled) return error.Canceled;
+            app.sync_error = err;
+            return null;
+        };
+    }
+
+    fn discardSync(app: *App, result: Io.Cancelable!?sync.Fetched) void {
+        var fetched = (result catch return) orelse return;
+        fetched.deinit(app.gpa);
+    }
+
+    /// `fetched` is null when the sync failed (see `sync_error`).
+    fn finishSync(app: *App, now: i64, fetched: ?sync.Fetched) void {
+        const replica = app.replica.?;
+        app.next_sync = now + replica.interval;
+        const result = fetched orelse {
+            app.sync_failures +|= 1;
+            if (app.sync_failures == sync_failures_before_warning) {
+                log.warn("cannot sync from {s} ({t}); keeping the current settings", .{ replica.origin, app.sync_error });
+            } else {
+                log.debug("sync from {s}: {t}", .{ replica.origin, app.sync_error });
+            }
+            return;
+        };
+        if (app.sync_failures >= sync_failures_before_warning) log.info("syncing from {s} again", .{replica.origin});
+        app.sync_failures = 0;
+        switch (result) {
+            .unchanged => {},
+            .changed => |synced| app.applySynced(synced),
+        }
+    }
+
+    /// Applies settings from the origin like a reload; takes ownership.
+    fn applySynced(app: *App, synced: sync.Synced) void {
+        const replica = app.replica.?;
+        var diag: config.Diagnostic = .{};
+        var new_config = config.parseReplica(app.gpa, app.config.source, synced.text, &diag) catch |err| {
+            app.gpa.free(synced.text);
+            switch (err) {
+                error.InvalidConfig => log.err("the settings from {s} are invalid here, keeping the current ones: line {d} of its blocking/local sections: {s}", .{
+                    replica.origin, diag.line, diag.message(),
+                }),
+                error.OutOfMemory => log.err("sync failed: out of memory", .{}),
+            }
+            return;
+        };
+        app.policy.applyConfig(&new_config) catch {
+            log.err("sync failed: out of memory", .{});
+            app.gpa.free(synced.text);
+            new_config.deinit();
+            return;
+        };
+        if (!Sources.fromConfig(&new_config).eql(.fromConfig(app.config))) app.schedule.sourcesChanged();
+        app.config.deinit();
+        app.config.* = new_config;
+        if (app.synced.*) |old| app.gpa.free(old.text);
+        app.synced.* = synced;
+        log.info("applied the settings synced from {s}", .{replica.origin});
+
+        var dir = Io.Dir.cwd().openDir(app.io, replica.state_dir, .{}) catch |err| {
+            return log.warn("cannot save the synced settings in {s}: {t}", .{ replica.state_dir, err });
+        };
+        defer dir.close(app.io);
+        sync.saveState(app.io, dir, synced) catch |err| log.warn("cannot save the synced settings in {s}: {t}", .{ replica.state_dir, err });
+    }
+
     fn reload(app: *App) void {
         var diag: config.Diagnostic = .{};
-        var new_config = config.load(app.io, app.gpa, app.config_path, &diag) catch |err| {
+        var new_config = app.loadConfig(&diag) catch |err| {
             switch (err) {
                 error.InvalidConfig => log.err("reload failed, keeping the current configuration: {s}:{d}: {s}", .{
-                    app.config_path, diag.line, diag.message(),
+                    if (diag.from_origin) "settings synced from the origin" else app.config_path, diag.line, diag.message(),
                 }),
                 error.OutOfMemory => log.err("reload failed: out of memory", .{}),
             }
             return;
         };
+        if (std.meta.activeTag(new_config.sync) != std.meta.activeTag(app.config.sync)) {
+            log.err("reload failed: changing the sync role (origin, replica or neither) needs a restart", .{});
+            new_config.deinit();
+            return;
+        }
         app.policy.applyConfig(&new_config) catch {
             log.err("reload failed: out of memory", .{});
             new_config.deinit();
             return;
         };
+        if (app.origin) |origin| origin.publish(new_config.policy_text) catch log.err("cannot publish the new settings: out of memory", .{});
+        // A replica syncs right away, as a manual "sync now".
+        if (new_config.sync == .replica) app.next_sync = 0;
         log_output.setLevel(new_config.log.level);
         app.resolver.log_queries.store(new_config.log.queries, .monotonic);
 
@@ -375,6 +562,15 @@ const App = struct {
         app.config.deinit();
         app.config.* = new_config;
         log.info("configuration reloaded (server, upstream and cache settings apply after a restart)", .{});
+    }
+
+    /// The config file, plus the last synced settings on a replica.
+    fn loadConfig(app: *App, diag: *config.Diagnostic) config.Error!Config {
+        var own = try config.load(app.io, app.gpa, app.config_path, diag);
+        const synced = app.synced.* orelse return own;
+        if (own.sync != .replica) return own;
+        defer own.deinit();
+        return config.parseReplica(app.gpa, own.source, synced.text, diag);
     }
 
     fn logStats(app: *App) void {
@@ -411,7 +607,9 @@ const signals = struct {
 
 fn printTo(io: Io, file: Io.File, comptime format: []const u8, args: anytype) void {
     var buffer: [1024]u8 = undefined;
-    var writer = file.writer(io, &buffer);
+    // Streaming, not positional: each call makes a new writer, and a
+    // positional one would start at offset 0 when stdout is a regular file.
+    var writer = file.writerStreaming(io, &buffer);
     writer.interface.print(format, args) catch {};
     writer.interface.flush() catch {};
 }
@@ -441,6 +639,7 @@ test {
     _ = @import("config.zig");
     _ = @import("policy.zig");
     _ = @import("refresh.zig");
+    _ = @import("sync.zig");
     _ = @import("resolver.zig");
     _ = @import("upstream.zig");
     _ = @import("dot.zig");

@@ -86,6 +86,20 @@ _Avoid_: special-use name, internal name, LAN name
 A public DNS server that answers the queries zinkhole does not answer itself. Upstream servers are tried in order, and the next one is used when one fails.
 _Avoid_: resolver, forwarder, backend
 
+### Redundancy
+
+**Origin**:
+The zinkhole instance whose config file is the source of truth for the Policy settings (local records, rules, lists); it serves them to replicas. Every instance answers queries alike; the role only says where settings come from.
+_Avoid_: master, primary, leader
+
+**Replica**:
+A zinkhole instance that takes its Policy settings from the origin. Its own config file holds only what is specific to it, such as listen addresses and upstream servers.
+_Avoid_: worker, slave, secondary
+
+**Sync**:
+A replica fetching the origin's settings, checking them and applying them.
+_Avoid_: push, replication
+
 ### Lifecycle
 
 **Reload**:

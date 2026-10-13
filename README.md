@@ -6,7 +6,8 @@ dependencies. It blocks ads and trackers using common blocklists, gives your
 own devices and apps hostnames, and forwards everything else to upstream DNS
 servers.
 
-No web UI, no database, no state on disk: one static binary and one YAML file.
+No web UI, no database, no state on disk: one static binary and one YAML file
+(a sync replica keeps one file: its last synced settings).
 
 ## Features
 
@@ -28,6 +29,8 @@ No web UI, no database, no state on disk: one static binary and one YAML file.
   answers.
 - Live reload with `SIGHUP`; local records apply instantly, and lists are
   re-downloaded only when their sources changed.
+- **Two instances, one config**: a replica syncs its local records and
+  blocking settings from an origin (see [Running two instances](#running-two-instances)).
 
 ## Build
 
@@ -124,11 +127,48 @@ for `localhost`). On Docker Desktop for macOS or Windows, UDP clients appear
 with public addresses and get `REFUSED`; for local testing there, add
 `0.0.0.0/0` to `server.allow_clients`. Docker on Linux keeps real addresses.
 
+### Running two instances
+
+For redundancy, run zinkhole on two hosts and hand out both addresses (e.g.
+via DHCP). One instance is the **origin**: you edit its config as usual. The
+other is a **replica**: every minute it asks the origin for its `blocking` and
+`local` sections and applies them like a reload. Each instance keeps its own
+`server`, `upstream`, `cache` and `log` settings and downloads its own lists.
+
+```yaml
+# origin (its config also has the blocking and local sections)
+sync:
+  serve: ["192.168.1.5:5380"]          # HTTP, for replicas only
+  secret: "…at least 32 random characters…"
+
+# replica (no blocking or local sections: those come from the origin)
+sync:
+  origin: http://192.168.1.5:5380
+  secret: "…the same secret…"
+  interval: 60                          # seconds
+```
+
+Answers are signed with the shared secret over a fresh challenge per
+request, so they cannot be forged or replayed on the LAN. A replica keeps the
+last settings it accepted in `/var/lib/zinkhole/synced.yaml` and starts from
+them if the origin is down. Reload the origin to publish a change; reload a
+replica to sync right away. Changing an instance's `sync` section needs a
+restart.
+
+**Promoting a replica** if the origin is gone for good: append the state
+file to its config (`cat /var/lib/zinkhole/synced.yaml >>
+/etc/zinkhole/config.yaml`), replace `sync.origin` with `sync.serve`, and
+restart. Make the old origin a replica before it comes back.
+
+[deploy/sync/](deploy/sync/) has a Docker Compose setup with both roles and
+an end-to-end test (`./deploy/sync/test.sh`). The design is in
+[docs/adr/0002](docs/adr/0002-sync-replicas-from-an-origin.md).
+
 ### Signals
 
 | Signal    | Effect                                                      |
 |-----------|-------------------------------------------------------------|
-| `SIGHUP`  | Reload the config file (server/upstream/cache need restart) |
+| `SIGHUP`  | Reload the config file (server/upstream/cache/sync need restart); on a replica, also sync now |
 | `SIGUSR1` | Log query statistics                                        |
 | `SIGTERM` | Shut down cleanly                                           |
 
@@ -180,6 +220,7 @@ so clients cannot get around a block through HTTPS/SVCB records.
 | `resolver.zig` | The query pipeline above, statistics, query log |
 | `policy.zig` | `Policy`: steps 2-4 of the pipeline, over the config's rules (rebuilt on reload) and `Lists` (downloaded) |
 | `refresh.zig` | When lists load: refresh interval, retry backoff, timeouts |
+| `sync.zig` | Sync: the origin's endpoint, signed fetches, the replica's state file |
 | `domain_set.zig` | Compact domain set with subdomain matching |
 | `blocklist.zig` | Line parser for all list formats, streaming loader (file/HTTPS) |
 | `local.zig` | Local records, wildcards, reverse lookups, private zones |
@@ -242,6 +283,11 @@ the lists, the new ones are used right away, even if some of them failed.
   deadlines and a per-connection query limit.
 - The config parser rejects YAML anchors/aliases (no "billion laughs") and
   duplicate keys; the file is limited to 1 MiB.
+- Sync answers are signed (HMAC-SHA256) over a random challenge from the
+  replica, and the state file is checked against the same signature. The sync
+  endpoint is read-only and serves only `blocking` and `local`, never the
+  secret; anyone on the LAN can read it, but those clients can already query
+  the local records.
 
 ## Limitations
 

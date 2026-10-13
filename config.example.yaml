@@ -114,3 +114,20 @@ log:
   level: info
   # Log every query: client, name, type, outcome and duration.
   queries: false
+
+# Two instances, one config (see README, "Running two instances"). Leave this
+# out to run a single instance. Changes need a restart.
+#
+# sync:
+#   # Origin: serve this config's `blocking` and `local` sections to replicas
+#   # over HTTP. Only clients in server.allow_clients get answers.
+#   serve: ["192.168.1.5:5380"]
+#   secret: "at least 32 random characters, the same on every instance"
+#
+# sync:
+#   # Replica: take `blocking` and `local` from the origin (leave them out of
+#   # this file), and keep the last ones in state_dir for restarts.
+#   origin: http://192.168.1.5:5380
+#   secret: "at least 32 random characters, the same on every instance"
+#   interval: 60                  # seconds between syncs
+#   state_dir: /var/lib/zinkhole
