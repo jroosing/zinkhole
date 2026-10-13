@@ -120,7 +120,7 @@ install_zinkhole() {
 
 zinkhole is installed as a service ($init_name) and starts at boot. Next:
   1. Edit /etc/zinkhole/config.yaml: upstream servers, lists, local hostnames.
-  2. Check it:  zinkhole --test -c /etc/zinkhole/config.yaml
+  2. Check it:  zinkhole --check -c /etc/zinkhole/config.yaml
   3. Start it:  $start
   Logs:         $logs
 EOF

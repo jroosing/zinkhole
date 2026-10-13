@@ -29,6 +29,9 @@ No web UI, no database, no state on disk: one static binary and one YAML file
   answers.
 - Live reload with `SIGHUP`; local records apply instantly, and lists are
   re-downloaded only when their sources changed.
+- **Proxmox in one command**: a script creates the LXC container (static or
+  DHCP address, IPv6 on or off), installs zinkhole in it, and gives it an
+  `update` command (see [Proxmox LXC](#proxmox-lxc)).
 - **Two instances, one config**: a replica syncs its local records and
   blocking settings from an origin (see [Running two instances](#running-two-instances)).
 
@@ -62,8 +65,9 @@ git tag v0.2.0 && git push origin main v0.2.0
 
 On a `v*` tag the pipeline runs the tests, **fails if the tag does not match
 `build.zig.zon`**, builds static `x86_64-linux-musl` and `aarch64-linux-musl`
-binaries, writes `SHA256SUMS`, and publishes everything as a public GitLab
-release. Downloads then work without a login, at stable links:
+binaries, packs the Proxmox scripts and `zinkhole-deploy.tar.gz` (the
+installer and service files), writes `SHA256SUMS`, and publishes everything as
+a public GitLab release. Downloads then work without a login, at stable links:
 
 ```
 https://gitlab.com/kyura4k/zinkhole/-/releases/permalink/latest/downloads/zinkhole-x86_64-linux-musl
@@ -132,8 +136,8 @@ service and binary but keeps the config.
   `/etc/systemd/resolved.conf`, or listen on the LAN address only, e.g.
   `server.listen: ["192.168.1.5:53"]`.
 - **Proxmox LXC with systemd:** the sandboxing needs the container's
-  *nesting* feature (on by default for new unprivileged containers). Without
-  it the service fails with status 226/NAMESPACE.
+  *nesting* feature. Without it the service fails with status 226/NAMESPACE.
+  See [Proxmox LXC](#proxmox-lxc) for the whole setup.
 
 No Zig on the build machine? Docker can build the binary (use
 `linux/arm64` for 64-bit ARM):
@@ -143,6 +147,140 @@ docker buildx build --platform linux/amd64 -t zinkhole --load .
 mkdir -p zig-out/bin && docker create --name zinkhole-tmp zinkhole
 docker cp zinkhole-tmp:/usr/local/bin/zinkhole zig-out/bin/ && docker rm zinkhole-tmp
 ```
+
+### Proxmox LXC
+
+One small container per node is the natural fit: zinkhole needs about 128 MB
+of RAM (large blocklists take ~35 MB, briefly twice that while refreshing) and
+a few MB of disk. On a Proxmox node, as root, one command creates the
+container and installs and configures zinkhole in it:
+
+```sh
+# Debian 13 (systemd)
+bash -c "$(curl -fsSL https://gitlab.com/kyura4k/zinkhole/-/releases/permalink/latest/downloads/zinkhole-debian.sh)"
+# Alpine (OpenRC): smaller, otherwise the same
+bash -c "$(curl -fsSL https://gitlab.com/kyura4k/zinkhole/-/releases/permalink/latest/downloads/zinkhole-alpine.sh)"
+```
+
+It asks a few questions, shows what it is about to do, and then:
+
+1. creates an unprivileged container (1 core, 128 MB RAM, 1 GB disk, no swap)
+   with a **static or DHCP address** (your choice) and optional IPv6, starting
+   at boot (`nesting` is enabled on Debian only: systemd's sandboxing needs it);
+2. upgrades the OS packages and installs zinkhole, writing a working
+   `/etc/zinkhole/config.yaml` (Quad9 over TLS, the StevenBlack blocklist);
+3. starts it, waits until it answers, and prints how to use and update it.
+
+The **role** question sets up [two instances](#running-two-instances) for
+you: *standalone* (the default), *origin* (a secret is generated and shown
+once) or *replica* (asks for the origin's URL and secret). Run it on each node.
+
+Every question can be answered up front with an environment variable, which
+also makes it non-interactive. All are optional except the IPv4 address:
+
+| Variable | Meaning (default) |
+|----------|-------------------|
+| `ZINKHOLE_IP` | `dhcp`, or a static address with prefix, e.g. `192.168.1.5/24` (required) |
+| `ZINKHOLE_GATEWAY` | static only: the node's default gateway |
+| `ZINKHOLE_IP6` | `off`, `auto` (SLAAC), `dhcp`, or a static address like `fd00::5/64` (`off`) |
+| `ZINKHOLE_GATEWAY6` | static IPv6 only, optional |
+| `ZINKHOLE_ROLE` | `standalone`, `origin` or `replica` |
+| `ZINKHOLE_ORIGIN`, `ZINKHOLE_SECRET` | replica: the origin's URL and secret |
+| `ZINKHOLE_CTID`, `ZINKHOLE_HOSTNAME` | next free ID, `zinkhole-<node>` |
+| `ZINKHOLE_BRIDGE`, `ZINKHOLE_VLAN` | `vmbr0`, none |
+| `ZINKHOLE_NAMESERVER` | what the container itself uses; the gateway (static) or what DHCP hands out |
+| `ZINKHOLE_STORAGE`, `ZINKHOLE_TEMPLATE_STORAGE` | the first suitable storage |
+| `ZINKHOLE_CORES`, `ZINKHOLE_MEMORY`, `ZINKHOLE_DISK` | `1`, `128` (MB), `1` (GB) |
+| `ZINKHOLE_YES=1` | do not ask for confirmation |
+| `ZINKHOLE_KEEP_ON_FAIL=1` | keep the container if the installation fails |
+
+```sh
+# Unattended: a replica of the origin from the example above
+ZINKHOLE_IP=192.168.1.6/24 ZINKHOLE_ROLE=replica ZINKHOLE_YES=1 \
+ZINKHOLE_ORIGIN=http://192.168.1.5:5380 ZINKHOLE_SECRET=<the origin's secret> \
+  bash -c "$(curl -fsSL https://gitlab.com/kyura4k/zinkhole/-/releases/permalink/latest/downloads/zinkhole-debian.sh)"
+```
+
+Afterwards, test with `dig @192.168.1.5 example.com`, hand out the
+container's address as the DNS server (typically in your router's DHCP
+settings), and never forward port 53 from the internet to it.
+
+- **Static or DHCP?** Clients need a DNS server whose address never changes.
+  Static is the simplest way to get that. With `dhcp` the script shows the
+  address the container received; give the container a fixed lease on your
+  DHCP server (its MAC address is in `pct config <id>`), or the address may
+  change one day. A DHCP container's name server comes from DHCP too. A DHCP
+  *origin* serves its settings on all addresses (still only to
+  `server.allow_clients`), since its address may change.
+- **IPv6** is `off` by default: the container gets no IPv6 address and zinkhole
+  listens on IPv4 only. With `auto`, `dhcp` or a static address, zinkhole also
+  listens on IPv6, and the script adds the container's own IPv6 network to
+  `server.allow_clients`: that list normally covers only private addresses, so
+  without it clients using a global IPv6 address would be refused. If the
+  network is not found (for example SLAAC is slow), the script says so; add
+  your IPv6 prefix to `server.allow_clients` yourself. An address from SLAAC
+  can change, so for a DNS server prefer a static or reserved one. Upstream
+  servers stay IPv4 (Quad9 over TLS); add IPv6 ones in the config if you want.
+
+- **Everything downloaded is checked** against the release's `SHA256SUMS`
+  before it is used (a download that does not match stops the script before
+  anything is created). The checksums come from the same GitLab release, so
+  they protect against corrupt downloads, not against a compromised project.
+- **If the installation fails** the new container is removed again, so a
+  retry starts clean (`ZINKHOLE_KEEP_ON_FAIL=1` keeps it for debugging).
+- **`update`**: inside the container (or `pct exec <id> -- update`) it
+  upgrades the OS packages, then updates zinkhole to the latest release if
+  there is a newer one. It checks that the new version accepts your config
+  (`--check`), keeps the old binary as `/usr/local/bin/zinkhole.old`, and puts
+  it back if the new one does not answer within 15 seconds. With several nodes,
+  **update the replicas before the origin**.
+- **Changing the config**: `pct enter <id>`, edit `/etc/zinkhole/config.yaml`,
+  then `systemctl reload zinkhole` (Alpine: `rc-service zinkhole reload`).
+- **Removing it**: `pct stop <id> && pct destroy <id>`.
+- **Backups**: the container holds only the config (and a replica's synced
+  state), so a normal Proxmox backup of it is enough.
+
+<details>
+<summary>The same by hand</summary>
+
+Create the container yourself (storage names and template versions differ per
+setup; `pveam available` lists the templates). For Alpine use an `alpine-*`
+template and drop `--features nesting=1`:
+
+```sh
+pveam update
+pveam download local debian-13-standard_<version>_amd64.tar.zst
+
+# static address; for DHCP use  --net0 name=eth0,bridge=vmbr0,ip=dhcp  and drop --nameserver
+pct create 200 local:vztmpl/debian-13-standard_<version>_amd64.tar.zst \
+  --hostname zinkhole --unprivileged 1 --features nesting=1 \
+  --cores 1 --memory 128 --swap 0 --rootfs local-lvm:1 \
+  --net0 name=eth0,bridge=vmbr0,ip=192.168.1.5/24,gw=192.168.1.1 \
+  --nameserver 192.168.1.1 --onboot 1 --start 1
+pct enter 200
+```
+
+Inside, install the latest [release](#releasing) (on Alpine:
+`apk add --no-cache curl ca-certificates`):
+
+```sh
+apt-get update && apt-get install -y curl ca-certificates
+base=https://gitlab.com/kyura4k/zinkhole/-/releases/permalink/latest/downloads
+bin=zinkhole-$(uname -m)-linux-musl      # x86_64 or aarch64
+
+mkdir /root/zinkhole && cd /root/zinkhole
+curl -fsSLO $base/$bin && curl -fsSLO $base/zinkhole-deploy.tar.gz && curl -fsSLO $base/SHA256SUMS
+grep -E " ($bin|zinkhole-deploy.tar.gz)\$" SHA256SUMS | sha256sum -c -    # must print "OK" twice
+chmod +x $bin && tar -xzf zinkhole-deploy.tar.gz
+./deploy/install.sh --binary ./$bin
+```
+
+Then edit `/etc/zinkhole/config.yaml`, check it with `zinkhole --check -c
+/etc/zinkhole/config.yaml`, and start the service (the installer prints the
+command). No release or no network in the container? Build the binary as in
+[Build](#build) and copy it and the `deploy/` folder in with `pct push`.
+
+</details>
 
 ### Docker
 
@@ -159,6 +297,23 @@ The image has a healthcheck (`zinkhole --healthcheck`, which asks the server
 for `localhost`). On Docker Desktop for macOS or Windows, UDP clients appear
 with public addresses and get `REFUSED`; for local testing there, add
 `0.0.0.0/0` to `server.allow_clients`. Docker on Linux keeps real addresses.
+
+- **No published image:** `docker compose up -d --build` builds it from this
+  repository (the Dockerfile cross-compiles with a pinned, checksum-verified
+  Zig, so no Zig is needed on the host). Without Compose:
+  `docker build -t zinkhole . && docker run -d --name zinkhole -p 53:53/udp
+  -p 53:53/tcp -v $PWD/config.yaml:/etc/zinkhole/config.yaml:ro zinkhole`.
+- **Port 53 taken on the host** (for example by `systemd-resolved`)? Publish
+  one address only, e.g. `"192.168.1.5:53:53/udp"` and `"192.168.1.5:53:53/tcp"`
+  in `docker-compose.yml`.
+- **A sync replica** saves its last settings in `/var/lib/zinkhole`, which the
+  hardened (`read_only`) container does not allow by default. Mount a volume
+  there: `- zinkhole-state:/var/lib/zinkhole` under `volumes:` and a top-level
+  `volumes: {zinkhole-state: {}}`. [deploy/sync/](deploy/sync/) is a complete
+  example with an origin and a replica.
+- **Docker inside a Proxmox LXC** needs the container's `nesting` and `keyctl`
+  features and adds a layer for little gain; for a DNS server the plain
+  [Proxmox LXC](#proxmox-lxc) install above is simpler, or use a VM.
 
 ### Running two instances
 

@@ -1,6 +1,7 @@
 # zinkhole CI (docs/adr/0003).
 #
-#   every push   formatting, unit tests (offline), config check, cross-build smoke test
+#   every push   formatting, shellcheck, unit tests (offline), config check,
+#                cross-build smoke test, and a trial build of the release files
 #   tag v<x.y.z> also: check the tag against build.zig.zon, build the release
 #                files, and publish them as a public GitLab release
 #
@@ -25,15 +26,19 @@ test:
     # GitLab only caches paths inside the project directory.
     ZIG_GLOBAL_CACHE_DIR: $CI_PROJECT_DIR/.zig-global-cache
   before_script:
+    - apk add --no-cache coreutils shellcheck >/dev/null
     - sh deploy/ci/install-zig.sh
   script:
     - zig fmt --check src build.zig
+    - shellcheck -x deploy/proxmox/*.sh deploy/ci/*.sh deploy/install.sh deploy/sync/test.sh
     - zig build test
     - zig build
     - ./zig-out/bin/zinkhole --check -c config.example.yaml
     # Every platform the README promises must still compile.
     - zig build --release -Dstrip=true -Dtarget=aarch64-linux-musl
     - zig build --release -Dstrip=true -Dtarget=arm-linux-musleabihf
+    # The release files (binaries, Proxmox scripts, deploy bundle) must build.
+    - sh deploy/ci/release.sh build
   cache:
     key: zig-0.17.0
     paths:

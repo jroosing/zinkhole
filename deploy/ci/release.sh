@@ -37,13 +37,19 @@ build() {
 	for target in $targets; do
 		zig build --release -Dstrip=true -Dtarget="$target" --prefix "$dist/$target"
 		install -m 755 "$dist/$target/bin/zinkhole" "$dist/zinkhole-$target"
-		rm -rf "$dist/$target"
+		rm -rf "${dist:?}/$target"
 	done
-	# The Proxmox scripts (ADR-0003) travel with the release they belong to.
+	# The Proxmox scripts (ADR-0003) travel with the release they belong to. The
+	# entry scripts learn their version (the BASE_URL line), so that they fetch
+	# lib.sh and everything else from this release and not a newer one.
 	for script in deploy/proxmox/*.sh; do
 		[ -e "$script" ] || continue
-		install -m 755 "$script" "$dist/$(basename "$script")"
+		sed "/^BASE_URL=/s/@VERSION@/$(version)/" "$script" >"$dist/$(basename "$script")"
+		chmod 755 "$dist/$(basename "$script")"
 	done
+	# What deploy/install.sh needs next to it. The Proxmox installer and `update`
+	# use it instead of GitLab's source archive, which has no checksum we control.
+	tar -czf "$dist/zinkhole-deploy.tar.gz" deploy/install.sh deploy/zinkhole.service deploy/openrc/zinkhole config.example.yaml
 	(cd "$dist" && sha256sum -- * >SHA256SUMS.tmp && mv SHA256SUMS.tmp SHA256SUMS)
 	echo "built $(version):"
 	(cd "$dist" && ls -l)
