@@ -54,7 +54,9 @@ upstream:
     - "tls://[2620:fe::fe]#dns.quad9.net"           # example: IPv6 needs quotes
   # How long to wait for one server before trying the next.
   timeout_ms: 2000
-  # Queries with upstream servers at once (1-1024). More wait for a free slot.
+  # Queries with upstream servers at once (1-1024). When all are busy (as in
+  # an upstream outage), a further cache miss gets SERVFAIL at once, so local
+  # records and cached answers keep working.
   # Each slot is a thread with buffers that cost memory only when used.
   max_in_flight: 64
 

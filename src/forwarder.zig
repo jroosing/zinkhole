@@ -1,7 +1,8 @@
 //! The forwarding stage (ADR-0005). A UDP query that only an upstream server
 //! can answer goes to one of a fixed pool of slots, so the workers that
 //! receive queries never wait for an upstream server. Each slot has a task of
-//! its own; when every slot is busy, `submit` waits for one to come free.
+//! its own. When every slot is busy, `submit` says so at once instead of
+//! waiting: otherwise an upstream outage would hold up local answers too.
 
 const std = @import("std");
 const Io = std.Io;
@@ -29,6 +30,9 @@ pub const Forwarder = struct {
     work: Io.Queue(*Slot),
     queue_buffer: []*Slot,
     group: Io.Group = .init,
+    /// Boot-clock seconds + 1 of the last warning that every slot was busy;
+    /// 0 for none yet. 32 bits: some 32-bit targets lack 64-bit atomics.
+    last_full_warning: std.atomic.Value(u32) = .init(0),
 
     /// One query with its answer. Owns copies of everything it needs, so it
     /// outlives the worker's buffers.
@@ -90,13 +94,21 @@ pub const Forwarder = struct {
     }
 
     /// Answers `query`, which came from `client` on `socket`, once an upstream
-    /// server has: copies it into a free slot, waiting while there is none.
-    pub fn submit(forwarder: *Forwarder, socket: *const net.Socket, client: net.IpAddress, query: []const u8, arrived: ?Io.Clock.Timestamp) Io.Cancelable!void {
-        if (query.len > max_query_len) return;
-        const slot = forwarder.free.getOne(forwarder.io) catch |err| switch (err) {
+    /// server has: copies it into a free slot. Returns false, without
+    /// waiting, when every slot is busy; the query is then not answered.
+    pub fn submit(forwarder: *Forwarder, socket: *const net.Socket, client: net.IpAddress, query: []const u8, arrived: ?Io.Clock.Timestamp) Io.Cancelable!bool {
+        if (query.len > max_query_len) return false;
+        var taken: [1]*Slot = undefined;
+        // With `min` 0 this never blocks.
+        const count = forwarder.free.get(forwarder.io, &taken, 0) catch |err| switch (err) {
             error.Canceled => |e| return e,
             error.Closed => unreachable, // the queues are never closed
         };
+        if (count == 0) {
+            forwarder.warnFull();
+            return false;
+        }
+        const slot = taken[0];
         @memcpy(slot.query[0..query.len], query);
         slot.query_len = query.len;
         slot.client = client;
@@ -104,6 +116,16 @@ pub const Forwarder = struct {
         slot.arrived = arrived;
         // Room for every slot: this never blocks.
         forwarder.work.putOneUncancelable(forwarder.io, slot) catch unreachable;
+        return true;
+    }
+
+    /// At most once a minute, so an outage does not flood the log.
+    fn warnFull(forwarder: *Forwarder) void {
+        const now: u32 = @intCast(@max(0, Io.Clock.boot.now(forwarder.io).toSeconds()) + 1);
+        const last = forwarder.last_full_warning.load(.monotonic);
+        if (last != 0 and now -| last < 60) return;
+        if (forwarder.last_full_warning.cmpxchgStrong(last, now, .monotonic, .monotonic) != null) return;
+        log.warn("all {d} forwarding slots are waiting for upstream servers; answering SERVFAIL until one is free (see upstream.max_in_flight)", .{forwarder.slots.len});
     }
 
     fn serve(forwarder: *Forwarder) Io.Cancelable!void {

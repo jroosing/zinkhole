@@ -1,7 +1,8 @@
 //! Network front end: UDP and TCP listeners served by a fixed pool of worker
 //! threads. A UDP worker answers what needs no upstream server and hands
 //! cache misses to the forwarding stage (forwarder.zig, ADR-0005), so it
-//! never waits for one. Memory is fixed at startup: each worker and each
+//! never waits for one; when every forwarding slot is busy, it answers
+//! SERVFAIL. Memory is fixed at startup: each worker and each
 //! forwarding slot owns one query and one response buffer, and answering a
 //! query allocates nothing (only cache insertions do).
 
@@ -159,10 +160,10 @@ pub const Server = struct {
             const response = switch (resolver.answerLocally(message.data, &worker.response, message.from, .udp, arrived)) {
                 .drop => continue,
                 .response => |response| response,
-                .upstream => {
-                    try worker.server.forwarder.submit(socket, message.from, message.data, arrived);
-                    continue;
-                },
+                .upstream => if (try worker.server.forwarder.submit(socket, message.from, message.data, arrived))
+                    continue
+                else
+                    resolver.failUpstream(message.data, &worker.response, message.from, .udp, arrived) orelse continue,
             };
             socket.send(io, &message.from, response) catch |err| switch (err) {
                 error.Canceled => |e| return e,
@@ -363,9 +364,14 @@ const TestClient = struct {
 
     /// The ID of the next answer, if one comes within `ms`.
     fn receiveId(c: *TestClient, ms: u32) !u16 {
+        return (try c.receive(ms)).id;
+    }
+
+    /// The ID and rcode of the next answer, if one comes within `ms`.
+    fn receive(c: *TestClient, ms: u32) !struct { id: u16, rcode: dns.Rcode } {
         var buf: [512]u8 = undefined;
         const message = try c.socket.receiveTimeout(testing.io, &buf, tcp.deadlineIn(testing.io, ms));
-        return dns.readId(message.data);
+        return .{ .id = dns.readId(message.data), .rcode = dns.readFlags(message.data).rcode };
     }
 };
 
@@ -391,6 +397,10 @@ test "local answers are not held up by queries waiting on an upstream server" {
 }
 
 test "uncached queries are forwarded in parallel, never more than the slots at once" {
+    // A full pool is logged as a warning; keep the test output quiet.
+    const log_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = log_level;
     var slow: upstream_mod.Stub = undefined;
     try slow.start(.answer);
     defer slow.stop();
@@ -405,16 +415,29 @@ test "uncached queries are forwarded in parallel, never more than the slots at o
     var name_buf: [32]u8 = undefined;
     for (1..9) |id| try client.send(@intCast(id), try std.fmt.bufPrint(&name_buf, "name{d}.example.com", .{id}));
     var answered: [8]bool = @splat(false);
-    for (0..8) |_| answered[(try client.receiveId(2000)) - 1] = true;
-    const elapsed = started.untilNow(testing.io).raw.toMilliseconds();
+    var servfails: usize = 0;
+    var last_answer_ms: i64 = 0;
+    for (0..8) |_| {
+        const answer = try client.receive(2000);
+        answered[answer.id - 1] = true;
+        if (answer.rcode == .servfail) servfails += 1 else last_answer_ms = started.untilNow(testing.io).raw.toMilliseconds();
+    }
 
     try testing.expectEqual([8]bool{ true, true, true, true, true, true, true, true }, answered);
-    // 4 slots: two rounds of 300 ms. One at a time would take 2.4 s.
-    try testing.expect(elapsed >= 550 and elapsed < 1500);
-    try testing.expectEqual(8, t.resolver.stats.get(.forwarded));
+    // 4 slots: the other 4 fail at once.
+    try testing.expectEqual(4, servfails);
+    // The 4 forwarded ones are answered together, after one round of 300 ms.
+    // One at a time would take 1.2 s.
+    try testing.expect(last_answer_ms >= 280 and last_answer_ms < 900);
+    try testing.expectEqual(4, t.resolver.stats.get(.forwarded));
+    try testing.expectEqual(4, t.resolver.stats.get(.failed));
 }
 
 test "stopping the server does not wait for queries at an upstream server" {
+    // A full pool is logged as a warning; keep the test output quiet.
+    const log_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = log_level;
     var watchdog: Watchdog = try .start(10);
     defer watchdog.stop();
     var silent: upstream_mod.Stub = undefined;
@@ -425,8 +448,8 @@ test "stopping the server does not wait for queries at an upstream server" {
     var client: TestClient = try .open(&t);
     defer client.close();
 
-    // 4 slots wait for an answer that never comes (2 s timeout), and the
-    // worker waits for a free slot.
+    // 4 slots wait for an answer that never comes (2 s timeout); the other 2
+    // queries fail at once.
     var name_buf: [32]u8 = undefined;
     for (1..7) |id| try client.send(@intCast(id), try std.fmt.bufPrint(&name_buf, "name{d}.example.com", .{id}));
     try testing.io.sleep(.fromMilliseconds(200), .awake);
@@ -434,4 +457,34 @@ test "stopping the server does not wait for queries at an upstream server" {
     const started = Io.Clock.Timestamp.now(testing.io, .awake);
     t.deinit();
     try testing.expect(started.untilNow(testing.io).raw.toMilliseconds() < 1000);
+}
+
+test "when every slot waits on an upstream server, more misses fail at once and local answers stay instant" {
+    // A full pool is logged as a warning; keep the test output quiet.
+    const log_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = log_level;
+    var silent: upstream_mod.Stub = undefined;
+    try silent.start(.silent);
+    defer silent.stop();
+    var t: TestServer = undefined;
+    try t.initWith(&.{ip.Cidr.parse("127.0.0.0/8").?}, &.{.{ .address = silent.address() }});
+    defer t.deinit();
+    var client: TestClient = try .open(&t);
+    defer client.close();
+
+    // The 4 slots wait 2 s for an answer that never comes.
+    var name_buf: [32]u8 = undefined;
+    for (1..7) |id| try client.send(@intCast(id), try std.fmt.bufPrint(&name_buf, "name{d}.example.com", .{id}));
+    try client.send(10, "nas.lan");
+
+    var seen: [3]u16 = undefined;
+    for (&seen) |*id| {
+        const answer = try client.receive(250);
+        id.* = answer.id;
+        try testing.expectEqual(if (answer.id == 10) dns.Rcode.noerror else .servfail, answer.rcode);
+    }
+    std.mem.sort(u16, &seen, {}, std.sort.asc(u16));
+    try testing.expectEqual([3]u16{ 5, 6, 10 }, seen);
+    try testing.expectEqual(2, t.resolver.stats.get(.failed));
 }

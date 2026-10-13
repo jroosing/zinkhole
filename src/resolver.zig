@@ -94,6 +94,15 @@ pub const Resolver = struct {
         return r.finish(msg, out, &q, client, transport, outcome, response, arrived);
     }
 
+    /// Answers SERVFAIL for `msg`, for which `answerLocally` returned
+    /// `.upstream`, when there is no room to ask an upstream server. Null
+    /// only if `msg` is no longer the query `answerLocally` saw.
+    pub fn failUpstream(r: *Resolver, msg: []u8, out: []u8, client: net.IpAddress, transport: Transport, arrived: ?Io.Clock.Timestamp) ?[]u8 {
+        var name_buf: [dns.max_name_len]u8 = undefined;
+        const q = dns.parseQuery(msg, &name_buf) catch return null;
+        return r.finish(msg, out, &q, client, transport, .failed, r.respond(out, msg, &q, .{ .rcode = .servfail }), arrived);
+    }
+
     /// Truncates for UDP clients, counts the Outcome and logs the query.
     fn finish(r: *Resolver, msg: []const u8, out: []u8, q: *const dns.Query, client: net.IpAddress, transport: Transport, outcome: Outcome, answer: []u8, arrived: ?Io.Clock.Timestamp) []u8 {
         var response = answer;

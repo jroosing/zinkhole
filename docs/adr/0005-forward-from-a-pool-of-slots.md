@@ -11,7 +11,10 @@ Each UDP worker used to answer a query from start to finish, the upstream round 
 ## How it works
 
 - **Slots.** They are allocated at startup, each with room for one query and one answer, so forwarding allocates nothing per query. Each slot has a task of its own that waits for work.
-- **Backpressure.** When every slot is busy, a worker waits for one to come free. Memory and threads stay bounded, even when an allowed client floods the server with uncached names.
+- **A full pool fails at once.** When every slot is busy, the worker answers SERVFAIL right away (counted as a `failed` Outcome) and does not wait for a slot. A warning is logged at most once a minute. Memory and threads stay bounded, even when an allowed client floods the server with uncached names.
+  - This happens when more than 64 uncached queries are in flight at the same moment, which is over 3,000 per second at a 20 ms round trip, so not in normal use. The case that matters is an upstream outage: then every forwarded query holds its slot for the whole timeout (2 s per server).
+  - Workers waiting for a slot, as first built, made local names and cache hits wait too. Measured with a dead upstream and 80 uncached queries outstanding: `nas.lan` took 1.5 s. An outage is exactly when local names matter most.
+  - With SERVFAIL, clients learn at once that this server cannot help, and retry or ask their other DNS server. Silently dropping the query, as Unbound does when its request list is full, would leave them waiting for their own timeout of 1–5 s.
 - **Unchanged exchanges.** A slot uses `Upstream.forward` as before:
   - a fresh socket with a random source port and a random query ID per exchange;
   - only answers from the server's address, with the same ID and question, are accepted;

@@ -560,7 +560,9 @@ uses a random hash seed, so list content cannot be crafted to degrade it.
 and private names, and cache hits itself. A cache miss goes to one of a fixed
 pool of forwarding slots (`upstream.max_in_flight`, 64 by default), and the
 worker goes back to receiving at once, so a slow upstream server never holds
-up an answer that needs none. When every slot is busy, workers wait for one.
+up an answer that needs none. When every slot is busy, as in an upstream
+outage, a cache miss gets SERVFAIL at once, so local names and cache hits keep
+answering instantly.
 Each worker and slot owns one fixed query buffer and one fixed response
 buffer, so answering a query allocates nothing; only cache insertions do, and
 the cache has a fixed capacity. On one CPU this answers about 340,000
