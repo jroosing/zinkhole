@@ -13,8 +13,9 @@
 # ZINKHOLE_ROOT_HASH (a crypt(3) hash of the root password, or empty for none),
 # ZINKHOLE_IPV6 (on or off: whether zinkhole listens on IPv6), ZINKHOLE_SERVE
 # and ZINKHOLE_SECRET (origin), ZINKHOLE_ORIGIN and ZINKHOLE_SECRET (replica),
-# and optionally ZINKHOLE_BASE_URL (a download location for `update` other than
-# the project's latest release).
+# ZINKHOLE_METRICS_PORT (empty: no metrics), ZINKHOLE_TZ (the Proxmox node's
+# time zone name, or empty), and optionally ZINKHOLE_BASE_URL (a download
+# location for `update` other than the project's latest release).
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -24,6 +25,8 @@ rm -f "$here/setup.env" # holds the secret
 : "${ZINKHOLE_ROLE:?}"
 ZINKHOLE_IPV6=${ZINKHOLE_IPV6:-off}
 ZINKHOLE_ROOT_HASH=${ZINKHOLE_ROOT_HASH:-}
+ZINKHOLE_METRICS_PORT=${ZINKHOLE_METRICS_PORT:-}
+ZINKHOLE_TZ=${ZINKHOLE_TZ:-}
 
 say() { echo "==> $*"; }
 die() {
@@ -40,7 +43,9 @@ install_packages() {
 	elif command -v apk >/dev/null 2>&1; then
 		apk update -q >/dev/null
 		apk upgrade -q >/dev/null
-		apk add -q curl ca-certificates >/dev/null
+		# Alpine's template has no zone files; Proxmox needs them to set the
+		# container's time zone, and zinkhole to count by local hours.
+		apk add -q curl ca-certificates tzdata >/dev/null
 	else
 		die "neither apt-get nor apk found"
 	fi
@@ -103,6 +108,7 @@ upstream:
   servers:
     - tls://9.9.9.9#dns.quad9.net
     - tls://149.112.112.112#dns.quad9.net
+    - tls://1.0.0.1#one.one.one.one
 YAML
 		write_server_section
 		if [ "$ZINKHOLE_ROLE" = replica ]; then
@@ -128,10 +134,22 @@ YAML
 			printf '\nsync:\n  origin: %s\n  secret: "%s"\n' "${ZINKHOLE_ORIGIN:?}" "${ZINKHOLE_SECRET:?}"
 			;;
 		esac
+		if [ -n "$ZINKHOLE_METRICS_PORT" ]; then
+			# Readable only by clients in server.allow_clients (docs/adr/0004).
+			printf '\nmetrics:\n  listen: ["%s:%s"]\n' "${ZINKHOLE_SERVE:?}" "$ZINKHOLE_METRICS_PORT"
+		fi
 	} >"$tmp"
 	install -d -m 755 /etc/zinkhole
 	install -m 644 "$tmp" /etc/zinkhole/config.yaml
 	rm -f "$tmp"
+}
+
+# Proxmox links /etc/localtime when the container starts (--timezone host),
+# but only to a zone file that was there: Alpine's arrived just now.
+set_timezone() {
+	[ -n "$ZINKHOLE_TZ" ] && [ -f "/usr/share/zoneinfo/$ZINKHOLE_TZ" ] || return 0
+	ln -sf "/usr/share/zoneinfo/$ZINKHOLE_TZ" /etc/localtime
+	echo "$ZINKHOLE_TZ" >/etc/timezone
 }
 
 restart_service() {
@@ -182,6 +200,7 @@ if [ -n "$ZINKHOLE_ROOT_HASH" ]; then
 fi
 say "Upgrading the OS packages"
 install_packages
+set_timezone
 if [ "$ZINKHOLE_IPV6" = on ]; then
 	say "Waiting for an IPv6 network"
 	wait_for_ipv6_network || true

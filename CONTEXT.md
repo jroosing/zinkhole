@@ -22,6 +22,10 @@ _Avoid_: resolution chain, filter chain
 How a single query was answered: local, blocked, private, cached, forwarded, failed, refused or invalid.
 _Avoid_: result, status
 
+**Metrics**:
+Counts of Outcomes and of upstream server attempts per local hour for the last 24 hours (so also "today", since 00:00 local time), plus the current state of the lists, sync and the instance. Kept in memory only: a restart starts them from zero. Served as JSON at `GET /metrics` (ADR-0004).
+_Avoid_: stats, statistics, telemetry
+
 **Policy**:
 Everything zinkhole uses to answer a name without asking an upstream server: local records, rules and private names.
 _Avoid_: rules, filter

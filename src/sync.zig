@@ -6,13 +6,13 @@ const net = Io.net;
 
 const ip = @import("ip.zig");
 const tcp = @import("tcp.zig");
+const HttpService = @import("http_service.zig").HttpService;
+const Metrics = @import("metrics.zig").Metrics;
 
 const log = std.log.scoped(.sync);
 
 /// The synced text is a config file's sections, so the config limit applies.
 const max_text_len = 1024 * 1024;
-/// A request to the origin, and an origin's whole answer, must fit in this.
-const request_timeout_ms = 5_000;
 const path = "/sync";
 
 /// Identifies one version of the synced text (SHA-256); sent as the ETag.
@@ -62,49 +62,31 @@ pub const Origin = struct {
     io: Io,
     gpa: std.mem.Allocator,
     secret: []u8,
-    allow_clients: []const ip.Cidr,
-    listeners: std.ArrayList(net.Server) = .empty,
-    group: Io.Group = .init,
-    /// Set once the serve tasks hold pointers into `listeners`.
-    pointers_locked: bool = false,
+    service: HttpService,
     /// Guards `text`, which `publish` replaces.
     mutex: Io.Mutex = .init,
     text: []u8 = &.{},
     fingerprint: Fingerprint,
+    metrics: ?*Metrics,
 
     /// Listens on `addresses` and starts serving (nothing until `publish`).
     /// `origin` must not move afterwards.
-    pub fn init(origin: *Origin, io: Io, gpa: std.mem.Allocator, addresses: []const net.IpAddress, secret: []const u8, allow_clients: []const ip.Cidr) !void {
+    /// Each fetch is reported to `metrics`, if set.
+    pub fn init(origin: *Origin, io: Io, gpa: std.mem.Allocator, addresses: []const net.IpAddress, secret: []const u8, allow_clients: []const ip.Cidr, metrics: ?*Metrics) !void {
         origin.* = .{
             .io = io,
             .gpa = gpa,
             .secret = try gpa.dupe(u8, secret),
-            .allow_clients = allow_clients,
+            .service = undefined,
             .fingerprint = fingerprintOf(""),
+            .metrics = metrics,
         };
-        errdefer origin.deinit();
-        for (addresses) |listen_address| {
-            // IPv6-only next to an IPv4 listener on the same port.
-            const ip6_only = listen_address == .ip6 and for (addresses) |other| {
-                if (other == .ip4 and other.getPort() == listen_address.getPort()) break true;
-            } else false;
-            var listener = try tcp.listen(listen_address, ip6_only);
-            origin.listeners.append(gpa, listener) catch |err| {
-                listener.deinit(io);
-                return err;
-            };
-        }
-        // Tasks keep pointers into the list from here on.
-        origin.listeners.lockPointers();
-        origin.pointers_locked = true;
-        for (origin.listeners.items) |*listener| try origin.group.concurrent(io, serve, .{ origin, listener });
+        errdefer gpa.free(origin.secret);
+        try origin.service.init(io, gpa, addresses, allow_clients, .{ .context = origin, .answer = answerRequest });
     }
 
     pub fn deinit(origin: *Origin) void {
-        origin.group.cancel(origin.io);
-        if (origin.pointers_locked) origin.listeners.unlockPointers();
-        for (origin.listeners.items) |*listener| listener.deinit(origin.io);
-        origin.listeners.deinit(origin.gpa);
+        origin.service.deinit();
         origin.gpa.free(origin.text);
         origin.gpa.free(origin.secret);
         origin.* = undefined;
@@ -112,7 +94,7 @@ pub const Origin = struct {
 
     /// The first listen address, with its port resolved.
     pub fn address(origin: *const Origin) net.IpAddress {
-        return origin.listeners.items[0].socket.address;
+        return origin.service.address();
     }
 
     /// Serves `text` (the config's `policy_text`) from now on.
@@ -125,47 +107,12 @@ pub const Origin = struct {
         origin.fingerprint = fingerprintOf(copy);
     }
 
-    fn serve(origin: *Origin, listener: *net.Server) Io.Cancelable!void {
-        const io = origin.io;
-        while (true) {
-            const stream = listener.accept(io) catch |err| switch (err) {
-                error.Canceled => |e| return e,
-                else => {
-                    log.debug("accept: {t}", .{err});
-                    try io.sleep(.fromMilliseconds(100), .awake);
-                    continue;
-                },
-            };
-            defer stream.close(io);
-            // Before reading anything: a client that may not sync must not
-            // get to hold the only serve task for a request's deadline.
-            if (!ip.isAllowed(origin.allow_clients, stream.socket.address)) continue;
-            origin.handle(stream) catch |err| {
-                if (err == error.Canceled) return error.Canceled;
-                log.debug("request from {f}: {t}", .{ stream.socket.address, err });
-            };
-        }
+    fn answerRequest(context: *anyopaque, server: *std.http.Server, client: net.IpAddress) anyerror!void {
+        const origin: *Origin = @ptrCast(@alignCast(context));
+        try origin.answer(server, client);
     }
 
-    fn handle(origin: *Origin, stream: net.Stream) !void {
-        const io = origin.io;
-        const deadline = tcp.deadlineIn(io, request_timeout_ms);
-        var in_buf: [4096]u8 = undefined;
-        var out_buf: [4096]u8 = undefined;
-        var reader: tcp.DeadlineReader = .init(io, stream.socket.handle, &in_buf, deadline);
-        var writer: tcp.DeadlineWriter = .init(io, stream.socket.handle, &out_buf, deadline);
-        var server: std.http.Server = .init(&reader.interface, &writer.interface);
-        origin.answer(&server) catch |err| {
-            // The deadline streams report every socket error as ReadFailed or
-            // WriteFailed. A cancellation hidden in there must still end the
-            // task: swallowed, it would leave `deinit` waiting forever.
-            if (reader.err) |socket_err| if (socket_err == error.Canceled) return error.Canceled;
-            if (writer.err) |socket_err| if (socket_err == error.Canceled) return error.Canceled;
-            return err;
-        };
-    }
-
-    fn answer(origin: *Origin, server: *std.http.Server) !void {
+    fn answer(origin: *Origin, server: *std.http.Server, client: net.IpAddress) !void {
         const io = origin.io;
         var request = try server.receiveHead();
         if (request.head.method != .GET or !std.mem.eql(u8, request.head.target, path)) {
@@ -203,6 +150,7 @@ pub const Origin = struct {
                 .{ .name = signature_header, .value = &signature },
             },
         });
+        if (origin.metrics) |metrics| metrics.fetchedBy(client, Io.Clock.real.now(io).toSeconds());
     }
 };
 
@@ -395,7 +343,7 @@ fn testFetch(url: []const u8, secret: []const u8, have: ?Fingerprint) !Fetched {
 
 /// An origin serving on an ephemeral loopback port.
 fn testOrigin(origin: *Origin, allow_clients: []const ip.Cidr) !void {
-    try origin.init(testing.io, testing.allocator, &.{.{ .ip4 = .loopback(0) }}, test_secret, allow_clients);
+    try origin.init(testing.io, testing.allocator, &.{.{ .ip4 = .loopback(0) }}, test_secret, allow_clients, null);
 }
 
 fn originUrl(origin: *const Origin, buf: []u8) ![]const u8 {
@@ -608,6 +556,23 @@ test "only allowed clients get answers, and only at GET /sync" {
     } else |_| {}
 }
 
+test "the origin reports who fetched the settings to the metrics" {
+    var metrics: Metrics = try .init(testing.io, testing.allocator, .{ .zone = .{}, .role = .origin, .started = 0 });
+    defer metrics.deinit();
+    var origin: Origin = undefined;
+    try origin.init(testing.io, testing.allocator, &.{.{ .ip4 = .loopback(0) }}, test_secret, &loopback_clients, &metrics);
+    defer origin.deinit();
+    try origin.publish("local:\n  ttl: 60\n");
+    var url_buf: [64]u8 = undefined;
+    var fetched = try testFetch(try originUrl(&origin, &url_buf), test_secret, null);
+    fetched.deinit(testing.allocator);
+
+    var out: Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try metrics.write(&out.writer, Io.Clock.real.now(testing.io).toSeconds(), .{ .preferred_upstream = 0, .cache_entries = 0, .cache_capacity = 0 });
+    try testing.expect(std.mem.indexOf(u8, out.written(), "\"address\": \"127.0.0.1\"") != null);
+}
+
 test "the state file keeps the last synced settings, and rejects tampering" {
     var origin: Origin = undefined;
     try testOrigin(&origin, &loopback_clients);
@@ -644,7 +609,7 @@ test "an origin that cannot listen on an address fails cleanly" {
     var origin: Origin = undefined;
     // 192.0.2.1 (a documentation address) is not on this host.
     const addresses = [_]net.IpAddress{ .{ .ip4 = .loopback(0) }, .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 5380 } } };
-    if (origin.init(testing.io, testing.allocator, &addresses, test_secret, &loopback_clients)) |_| {
+    if (origin.init(testing.io, testing.allocator, &addresses, test_secret, &loopback_clients, null)) |_| {
         origin.deinit();
         return error.TestUnexpectedResult;
     } else |_| {}

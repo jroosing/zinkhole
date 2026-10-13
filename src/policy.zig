@@ -290,6 +290,8 @@ pub const Lists = struct {
     complete: bool,
     /// The sources these lists were loaded from; their strings live in `arena`.
     sources: Sources = .empty,
+    /// Whether each source loaded: the blocklists, then the allowlists.
+    loaded: []const bool = &.{},
     arena: std.heap.ArenaAllocator,
 
     /// Lists with no entries; `complete` is false so the first real load
@@ -312,13 +314,15 @@ pub const Lists = struct {
         const started = Io.Clock.awake.now(io);
         var client: std.http.Client = .{ .allocator = gpa, .io = io };
         defer client.deinit();
-        var failed: usize = 0;
-        for (sources.blocklists) |source| {
-            if (!try lists.loadSource(io, &client, source, false)) failed += 1;
+        const loaded = try lists.arena.allocator().alloc(bool, sources.blocklists.len + sources.allowlists.len);
+        for (sources.blocklists, loaded[0..sources.blocklists.len]) |source, *ok| {
+            ok.* = try lists.loadSource(io, &client, source, false);
         }
-        for (sources.allowlists) |source| {
-            if (!try lists.loadSource(io, &client, source, true)) failed += 1;
+        for (sources.allowlists, loaded[sources.blocklists.len..]) |source, *ok| {
+            ok.* = try lists.loadSource(io, &client, source, true);
         }
+        lists.loaded = loaded;
+        const failed = std.mem.count(bool, loaded, &.{false});
         lists.complete = failed == 0;
         lists.block.shrink(gpa);
         lists.allow.shrink(gpa);
@@ -640,4 +644,23 @@ test "partial lists replace complete ones only when the sources changed" {
     try testing.expectEqual(.replaced, policy.replaceLists(try Lists.load(io, testing.allocator, ac)));
     try testing.expect(policy.decide("b.example", .a) == .upstream);
     try testing.expect(policy.decide("a.example", .a) == .blocked);
+}
+
+test "a load records which sources it got" {
+    const io = testing.io;
+    // The failed source is logged as a warning; keep the test output quiet.
+    const log_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = log_level;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "a.example\n" });
+    var a_buf: [64]u8 = undefined;
+    var missing_buf: [64]u8 = undefined;
+    const a = try std.fmt.bufPrint(&a_buf, ".zig-cache/tmp/{s}/a.txt", .{tmp.sub_path});
+    const missing = try std.fmt.bufPrint(&missing_buf, ".zig-cache/tmp/{s}/missing.txt", .{tmp.sub_path});
+
+    const lists = try Lists.load(io, testing.allocator, .{ .blocklists = &.{ a, missing }, .allowlists = &.{a} });
+    defer lists.destroy();
+    try testing.expectEqualSlices(bool, &.{ true, false, true }, lists.loaded);
 }

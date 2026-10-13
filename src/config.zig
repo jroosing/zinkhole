@@ -29,6 +29,8 @@ pub const Config = struct {
     local: Local = .{},
     log: Log = .{},
     sync: Sync = .none,
+    /// Null when metrics are not served.
+    metrics: ?Metrics = null,
     /// The `blocking:` and `local:` sections exactly as written (comments
     /// included): what an origin serves to its replicas.
     policy_text: []const u8 = "",
@@ -117,6 +119,11 @@ pub const Config = struct {
             /// Where the replica keeps its last synced settings.
             state_dir: []const u8,
         };
+    };
+
+    pub const Metrics = struct {
+        /// HTTP listen addresses for `GET /metrics`.
+        listen: []const net.IpAddress,
     };
 
     pub const min_secret_len = 32;
@@ -266,6 +273,7 @@ const Decoder = struct {
     fn decodeRoot(d: *Decoder, root: yaml.Node, config: *Config) Error!void {
         // Lines of the sections a replica takes from its origin instead.
         var policy_line: ?u32 = null;
+        var metrics_line: u32 = 0;
         for (try d.mapping(root, "top level")) |pair| {
             if (is(pair, "blocking") or is(pair, "local")) policy_line = policy_line orelse pair.line;
             if (is(pair, "server")) {
@@ -282,9 +290,16 @@ const Decoder = struct {
                 try d.decodeLog(pair.value, &config.log);
             } else if (is(pair, "sync")) {
                 config.sync = try d.decodeSync(pair);
+            } else if (is(pair, "metrics")) {
+                config.metrics = try d.decodeMetrics(pair.value);
+                metrics_line = pair.line;
             } else {
                 return d.fail(pair.line, "unknown section '{s}'", .{pair.key});
             }
+        }
+        if (config.metrics) |metrics| {
+            try d.checkPortsFree(metrics_line, "metrics.listen", metrics.listen, "server.listen", config.server.listen);
+            if (config.sync == .origin) try d.checkPortsFree(metrics_line, "metrics.listen", metrics.listen, "sync.serve", config.sync.origin.serve);
         }
         if (config.sync == .replica) {
             if (policy_line) |line| {
@@ -387,15 +402,7 @@ const Decoder = struct {
         var state_dir: []const u8 = "/var/lib/zinkhole";
         for (try d.mapping(section.value, "sync")) |pair| {
             if (is(pair, "serve")) {
-                const items = try d.nonEmptyList(pair);
-                const addresses = try d.arena.alloc(net.IpAddress, items.len);
-                for (items, addresses) |item, *address| {
-                    const text = try d.scalar(item, pair.key);
-                    address.* = ip.parseSocketAddress(text, 0) orelse
-                        return d.fail(item.line, "'{s}' is not an IP address with a port", .{text});
-                    if (address.getPort() == 0) return d.fail(item.line, "'{s}' needs a port, e.g. 192.168.1.5:5380", .{text});
-                }
-                serve = addresses;
+                serve = try d.httpAddresses(pair, 5380);
             } else if (is(pair, "origin")) {
                 const url = try d.scalar(pair.value, pair.key);
                 if (!blocklist.isUrl(url)) return d.fail(pair.value.line, "sync.origin must start with http:// or https://", .{});
@@ -421,6 +428,42 @@ const Decoder = struct {
         const key = secret orelse return d.fail(section.line, "sync needs a secret, the same on origin and replicas", .{});
         if (serve) |addresses| return .{ .origin = .{ .serve = addresses, .secret = key } };
         return .{ .replica = .{ .origin = origin.?, .secret = key, .interval = interval, .state_dir = state_dir } };
+    }
+
+    fn decodeMetrics(d: *Decoder, node: yaml.Node) Error!Config.Metrics {
+        var listen: ?[]const net.IpAddress = null;
+        for (try d.mapping(node, "metrics")) |pair| {
+            if (is(pair, "listen")) {
+                listen = try d.httpAddresses(pair, 9153);
+            } else {
+                return d.unknownKey(pair, "metrics");
+            }
+        }
+        return .{ .listen = listen orelse return d.fail(node.line, "metrics needs 'listen', e.g. [\"192.168.1.5:9153\"]", .{}) };
+    }
+
+    /// HTTP listen addresses, each with a port.
+    fn httpAddresses(d: *Decoder, pair: yaml.Pair, comptime example_port: u16) Error![]const net.IpAddress {
+        const items = try d.nonEmptyList(pair);
+        const addresses = try d.arena.alloc(net.IpAddress, items.len);
+        for (items, addresses) |item, *address| {
+            const text = try d.scalar(item, pair.key);
+            address.* = ip.parseSocketAddress(text, 0) orelse
+                return d.fail(item.line, "'{s}' is not an IP address with a port", .{text});
+            if (address.getPort() == 0) return d.fail(item.line, "'{s}' needs a port, e.g. 192.168.1.5:{d}", .{ text, example_port });
+        }
+        return addresses;
+    }
+
+    /// TCP listeners of `name` and `other_name` must not take the same
+    /// address and port; an unspecified address takes the port on all.
+    fn checkPortsFree(d: *Decoder, line: u32, comptime name: []const u8, addresses: []const net.IpAddress, comptime other_name: []const u8, others: []const net.IpAddress) Error!void {
+        for (addresses) |address| for (others) |other| {
+            if (address.getPort() != other.getPort()) continue;
+            if (address.eql(&other) or isUnspecified(address) or isUnspecified(other)) {
+                return d.fail(line, name ++ ": port {d} is already in use by " ++ other_name, .{address.getPort()});
+            }
+        };
     }
 
     fn decodeLog(d: *Decoder, node: yaml.Node, log_config: *Config.Log) Error!void {
@@ -623,6 +666,13 @@ const Decoder = struct {
     }
 };
 
+fn isUnspecified(address: net.IpAddress) bool {
+    return switch (address) {
+        .ip4 => |a| std.mem.allEqual(u8, &a.bytes, 0),
+        .ip6 => |a| std.mem.allEqual(u8, &a.bytes, 0),
+    };
+}
+
 fn is(pair: yaml.Pair, key: []const u8) bool {
     return std.mem.eql(u8, pair.key, key);
 }
@@ -799,6 +849,38 @@ test "sync configuration errors" {
     try expectConfigError(base ++ "sync:\n  origin: ftp://10.0.0.1\n  secret: " ++ test_secret, 4, "http:// or https://");
     try expectConfigError(base ++ "sync:\n  secret: " ++ test_secret, 3, "either 'serve' (origin) or 'origin' (replica)");
     try expectConfigError(base ++ "blocking:\n  block: [ads.example]\nsync:\n  origin: http://10.0.0.1:5380\n  secret: " ++ test_secret, 3, "synced from the origin");
+}
+
+test "the metrics section says where metrics are served" {
+    var diag: Diagnostic = .{};
+    const base = "upstream:\n  servers: [1.1.1.1]\n";
+    var config = try parse(testing.allocator, base ++ "metrics:\n  listen: [\"10.10.50.85:9153\", \"[::1]:9153\"]\n", &diag);
+    defer config.deinit();
+    try testing.expectEqual(2, config.metrics.?.listen.len);
+    try testing.expectEqual(9153, config.metrics.?.listen[1].getPort());
+
+    var without = try parse(testing.allocator, base, &diag);
+    defer without.deinit();
+    try testing.expectEqual(null, without.metrics);
+
+    // Not synced: a replica has its own.
+    var replica = try parse(testing.allocator, base ++ "sync:\n  origin: http://10.0.0.1:5380\n  secret: " ++ test_secret ++ "\nmetrics:\n  listen: [\"10.0.0.2:9153\"]\n", &diag);
+    defer replica.deinit();
+    try testing.expect(replica.metrics != null);
+}
+
+test "metrics configuration errors" {
+    const base = "upstream:\n  servers: [1.1.1.1]\n";
+    try expectConfigError(base ++ "metrics:\n  listen: [10.0.0.1]", 4, "needs a port");
+    try expectConfigError(base ++ "metrics:\n  listen: []", 4, "empty");
+    try expectConfigError(base ++ "metrics:\n  port: 9153", 4, "unknown key 'port'");
+    // The DNS server listens on 0.0.0.0:53 and [::]:53 by default.
+    try expectConfigError(base ++ "metrics:\n  listen: [\"10.0.0.1:53\"]", 3, "port 53 is already in use by server.listen");
+    try expectConfigError(base ++ "metrics:\n  listen: [\"10.0.0.1:5380\"]\nsync:\n  serve: [\"0.0.0.0:5380\"]\n  secret: " ++ test_secret, 3, "port 5380 is already in use by sync.serve");
+    // Different addresses may share a port.
+    var diag: Diagnostic = .{};
+    var config = try parse(testing.allocator, base ++ "server:\n  listen: [\"10.0.0.1:53\"]\nmetrics:\n  listen: [\"10.0.0.2:53\"]\n", &diag);
+    config.deinit();
 }
 
 test "the Policy settings text is the blocking and local sections, as written" {

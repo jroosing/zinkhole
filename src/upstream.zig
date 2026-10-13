@@ -17,6 +17,8 @@ const Allocator = std.mem.Allocator;
 const dns = @import("dns.zig");
 const dot = @import("dot.zig");
 const tcp = @import("tcp.zig");
+const metrics_mod = @import("metrics.zig");
+const Metrics = metrics_mod.Metrics;
 
 const log = std.log.scoped(.upstream);
 
@@ -120,6 +122,8 @@ pub const Upstream = struct {
     preferred: std.atomic.Value(usize) = .init(0),
     /// CA certificates; loaded only when a server uses DNS over TLS.
     trust: dot.Trust,
+    /// Counts every attempt per server, if set.
+    metrics: ?*Metrics = null,
 
     pub const Error = error{AllServersFailed} || Io.Cancelable;
 
@@ -174,20 +178,30 @@ pub const Upstream = struct {
         for (0..upstream.servers.len) |attempt| {
             const index = (first + attempt) % upstream.servers.len;
             const server = &upstream.servers[index];
+            const started = Io.Clock.Timestamp.now(io, .awake);
             const response = server.exchange(io, query, out, tcp.deadlineIn(io, upstream.timeout_ms)) catch |err| {
                 if (err == error.Canceled) return error.Canceled;
                 log.debug("{f}: {t}", .{ server.*, err });
+                upstream.count(io, index, .failure);
                 continue;
             };
             // A server that refuses us is misconfigured or rate limiting: try the next one.
             if (dns.readFlags(response).rcode == .refused) {
                 log.debug("{f}: refused", .{server.*});
+                upstream.count(io, index, .failure);
                 continue;
             }
+            const micros = @max(0, started.untilNow(io).raw.toMicroseconds());
+            upstream.count(io, index, .{ .answer = std.math.lossyCast(u32, @divTrunc(micros, 100)) });
             if (index != first) upstream.preferred.store(index, .monotonic);
             return response;
         }
         return error.AllServersFailed;
+    }
+
+    fn count(upstream: *Upstream, io: Io, server: usize, attempt: metrics_mod.Attempt) void {
+        const metrics = upstream.metrics orelse return;
+        metrics.countAttempt(server, attempt, Io.Clock.real.now(io).toSeconds());
     }
 };
 
@@ -484,6 +498,43 @@ test "when every server fails, forwarding fails" {
     var out: [512]u8 = undefined;
     var t: TestQuery = .{};
     try testing.expectError(error.AllServersFailed, t.forward(&upstream, 0x8888, &out));
+}
+
+test "each attempt counts against its server: answers with their time, failures and refusals" {
+    var silent: Stub = undefined;
+    try silent.start(.silent);
+    defer silent.stop();
+    var refusing: Stub = undefined;
+    try refusing.start(.refuse);
+    defer refusing.stop();
+    var slow: Stub = undefined;
+    try slow.start(.answer);
+    defer slow.stop();
+    slow.udp_delay_ms = 20;
+
+    const servers = [_]ServerAddress{ .{ .address = silent.address() }, .{ .address = refusing.address() }, .{ .address = slow.address() } };
+    var metrics: Metrics = try .init(testing.io, testing.allocator, .{ .zone = .{}, .started = 0, .upstream = &servers });
+    defer metrics.deinit();
+    var upstream: Upstream = undefined;
+    try upstream.init(testing.io, testing.allocator, &servers, 100);
+    defer upstream.deinit();
+    upstream.metrics = &metrics;
+
+    var out: [512]u8 = undefined;
+    var t: TestQuery = .{};
+    _ = try t.forward(&upstream, 0x7878, &out);
+    _ = try t.forward(&upstream, 0x7879, &out); // the slow server is asked first now
+
+    const now = Io.Clock.real.now(testing.io).toSeconds();
+    const failed = metrics.attempts(0, .today, now);
+    try testing.expectEqual(1, failed.failures);
+    try testing.expectEqual(0, failed.answers);
+    try testing.expectEqual(null, failed.averageMs());
+    try testing.expectEqual(1, metrics.attempts(1, .today, now).failures);
+    const answered = metrics.attempts(2, .last_24h, now);
+    try testing.expectEqual(2, answered.answers);
+    try testing.expectEqual(0, answered.failures);
+    try testing.expect(answered.averageMs().? >= 20);
 }
 
 test "client EDNS options never reach the upstream server" {

@@ -20,6 +20,8 @@
 #   ZINKHOLE_ROLE          standalone (default), origin or replica
 #   ZINKHOLE_ORIGIN        replica: the origin's URL, e.g. http://192.168.1.5:5380
 #   ZINKHOLE_SECRET        replica: the origin's secret (origin: generated)
+#   ZINKHOLE_METRICS       on (default) or off: serve metrics (docs/adr/0004)
+#   ZINKHOLE_METRICS_PORT  default 9153
 #   ZINKHOLE_BRIDGE        default vmbr0           ZINKHOLE_VLAN  optional tag
 #   ZINKHOLE_NAMESERVER    for the container itself; default: the gateway (static)
 #                          or what DHCP hands out
@@ -31,6 +33,7 @@
 set -Eeuo pipefail
 
 SYNC_PORT=5380
+DEFAULT_METRICS_PORT=9153
 WORK=""
 CREATED=0
 
@@ -104,6 +107,14 @@ check_host() {
 }
 
 default_storage() { pvesm status --content "$1" 2>/dev/null | awk 'NR > 1 && $3 == "active" {print $1; exit}'; }
+
+# This node's time zone name, such as Europe/Amsterdam; empty if unknown.
+host_timezone() {
+	local zone
+	zone=$(timedatectl show -p Timezone --value 2>/dev/null || true)
+	if [[ -z $zone ]]; then zone=$(readlink /etc/localtime 2>/dev/null | sed -n 's|.*/zoneinfo/||p'); fi
+	if [[ $zone =~ ^[A-Za-z0-9_+/-]+$ ]]; then echo "$zone"; fi
+}
 default_gateway() { ip -4 route show default 2>/dev/null | awk '{print $3; exit}'; }
 
 valid_ipv4() {
@@ -144,6 +155,11 @@ collect_settings() {
 	ZINKHOLE_DISK=${ZINKHOLE_DISK:-1}
 	ZINKHOLE_ORIGIN=${ZINKHOLE_ORIGIN:-}
 	ZINKHOLE_SECRET=${ZINKHOLE_SECRET:-}
+	ZINKHOLE_METRICS=${ZINKHOLE_METRICS:-on}
+	ZINKHOLE_METRICS=${ZINKHOLE_METRICS,,}
+	ZINKHOLE_METRICS_PORT=${ZINKHOLE_METRICS_PORT:-$DEFAULT_METRICS_PORT}
+	# The container follows this node's time zone (for the metrics' "today").
+	HOST_TZ=$(host_timezone)
 
 	case "$ZINKHOLE_ROLE" in
 	standalone) ;;
@@ -188,6 +204,13 @@ collect_settings() {
 	[[ -n $ZINKHOLE_STORAGE ]] || die "no storage for container disks found; set ZINKHOLE_STORAGE"
 	[[ -n $ZINKHOLE_TEMPLATE_STORAGE ]] || die "no storage for templates found; set ZINKHOLE_TEMPLATE_STORAGE"
 	[[ $ZINKHOLE_CORES =~ ^[0-9]+$ && $ZINKHOLE_MEMORY =~ ^[0-9]+$ && $ZINKHOLE_DISK =~ ^[0-9]+$ ]] || die "cores, memory and disk must be numbers"
+	[[ $ZINKHOLE_METRICS == on || $ZINKHOLE_METRICS == off ]] || die "ZINKHOLE_METRICS must be on or off"
+	if [[ ! $ZINKHOLE_METRICS_PORT =~ ^[0-9]{1,5}$ ]] || ((ZINKHOLE_METRICS_PORT < 1 || ZINKHOLE_METRICS_PORT > 65535)); then
+		die "invalid metrics port '$ZINKHOLE_METRICS_PORT'"
+	fi
+	if ((ZINKHOLE_METRICS_PORT == 53 || ZINKHOLE_METRICS_PORT == SYNC_PORT)); then
+		die "the metrics port cannot be 53 or $SYNC_PORT, which zinkhole uses already"
+	fi
 	ROOT_HASH=""
 	if [[ -n $ZINKHOLE_PASSWORD ]]; then
 		((${#ZINKHOLE_PASSWORD} >= 5)) || die "the root password needs at least 5 characters"
@@ -211,13 +234,15 @@ collect_settings() {
 }
 
 confirm() {
-	local password="none"
+	local password="none" metrics="off"
 	if [[ -n $ROOT_HASH ]]; then password="set"; fi
+	if [[ $ZINKHOLE_METRICS == on ]]; then metrics="port $ZINKHOLE_METRICS_PORT"; fi
 	cat <<EOF
 
   $OS_NAME container $ZINKHOLE_CTID "$ZINKHOLE_HOSTNAME", $ZINKHOLE_CORES core(s), $ZINKHOLE_MEMORY MB RAM, $ZINKHOLE_DISK GB on $ZINKHOLE_STORAGE
   IPv4 $ZINKHOLE_IP${ZINKHOLE_GATEWAY:+ via $ZINKHOLE_GATEWAY} on $ZINKHOLE_BRIDGE${ZINKHOLE_VLAN:+ (VLAN $ZINKHOLE_VLAN)}, IPv6 $ZINKHOLE_IP6
   role: $ZINKHOLE_ROLE${ZINKHOLE_ORIGIN:+ of $ZINKHOLE_ORIGIN}, root password: $password
+  metrics: $metrics, time zone: ${HOST_TZ:-UTC}
 
 EOF
 	if interactive && [[ -z ${ZINKHOLE_YES:-} ]]; then
@@ -270,7 +295,7 @@ create_container() {
 		--hostname "$ZINKHOLE_HOSTNAME" --unprivileged 1 "${features[@]}" \
 		--cores "$ZINKHOLE_CORES" --memory "$ZINKHOLE_MEMORY" --swap 0 \
 		--rootfs "$ZINKHOLE_STORAGE:$ZINKHOLE_DISK" --net0 "$net" \
-		"${nameserver[@]}" --onboot 1 --tags zinkhole \
+		"${nameserver[@]}" --timezone host --onboot 1 --tags zinkhole \
 		--description "zinkhole DNS blocker ($ZINKHOLE_ROLE), installed by the zinkhole Proxmox script"
 	CREATED=1
 	pct start "$ZINKHOLE_CTID"
@@ -293,6 +318,8 @@ install_in_container() {
 		if [[ $ZINKHOLE_IP6 == off ]]; then echo "ZINKHOLE_IPV6='off'"; else echo "ZINKHOLE_IPV6='on'"; fi
 		echo "ZINKHOLE_ORIGIN='$ZINKHOLE_ORIGIN'"
 		echo "ZINKHOLE_SECRET='$ZINKHOLE_SECRET'"
+		if [[ $ZINKHOLE_METRICS == on ]]; then echo "ZINKHOLE_METRICS_PORT='$ZINKHOLE_METRICS_PORT'"; fi
+		echo "ZINKHOLE_TZ='$HOST_TZ'"
 		# Only the hash ($6$salt$hash: letters, digits, . / and $) is sent.
 		echo "ZINKHOLE_ROOT_HASH='$ROOT_HASH'"
 		# Only a download location that is not the project's own is remembered.
@@ -337,6 +364,9 @@ zinkhole $VERSION runs in container $ZINKHOLE_CTID ($ZINKHOLE_HOSTNAME) at $ip${
                apply with: systemctl reload zinkhole   (Alpine: rc-service zinkhole reload)
   Update:      pct exec $ZINKHOLE_CTID -- update       (OS packages and zinkhole)
 EOF
+	if [[ $ZINKHOLE_METRICS == on ]]; then
+		echo "  Metrics:     curl http://$ip:$ZINKHOLE_METRICS_PORT/metrics"
+	fi
 	if [[ $ZINKHOLE_IP == dhcp ]]; then
 		cat <<EOF
 

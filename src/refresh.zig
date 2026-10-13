@@ -82,6 +82,15 @@ pub const Schedule = struct {
         }
     }
 
+    /// When the next load starts (in `next`'s seconds); null while one runs
+    /// or is about to start, and when no Refresh is configured.
+    pub fn nextLoad(s: *const Schedule, interval: ?i64) ?i64 {
+        if (s.running_since != null or s.sources_changed) return null;
+        if (s.failures > 0) return s.last_failure + retryDelay(s.failures, interval);
+        const last = s.last_complete orelse return null;
+        return last + (interval orelse return null);
+    }
+
     /// A reload changed the sources: load them at once, with a fresh retry delay.
     pub fn sourcesChanged(s: *Schedule) void {
         s.sources_changed = true;
@@ -123,6 +132,21 @@ test "a running load is left alone, and canceled after 10 minutes" {
     s.finished(100 + 601, false);
     try testing.expectEqual(.idle, s.next(100 + 601 + 59, hour));
     try testing.expectEqual(.start, s.next(100 + 601 + 60, hour));
+}
+
+test "the next load is one interval after a complete load, or the retry after a failed one" {
+    var s: Schedule = .{};
+    try testing.expectEqual(null, s.nextLoad(hour)); // the first is about to start
+    s.started(10);
+    try testing.expectEqual(null, s.nextLoad(hour));
+    s.finished(20, true);
+    try testing.expectEqual(20 + hour, s.nextLoad(hour));
+    try testing.expectEqual(null, s.nextLoad(null));
+    s.started(20 + hour);
+    s.finished(30 + hour, false);
+    try testing.expectEqual(30 + hour + 60, s.nextLoad(hour));
+    s.sourcesChanged();
+    try testing.expectEqual(null, s.nextLoad(hour));
 }
 
 test "after a complete load, the next starts one interval later" {

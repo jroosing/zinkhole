@@ -19,6 +19,7 @@ const local = @import("local.zig");
 const Cache = @import("cache.zig").Cache;
 const Upstream = @import("upstream.zig").Upstream;
 const Policy = @import("policy.zig").Policy;
+const Metrics = @import("metrics.zig").Metrics;
 
 const log = std.log.scoped(.query);
 
@@ -34,13 +35,15 @@ pub const Resolver = struct {
     allow_clients: []const ip.Cidr,
     log_queries: std.atomic.Value(bool),
     stats: Stats = .{},
+    /// Counts each Outcome per hour, if set.
+    metrics: ?*Metrics = null,
 
     /// Answers one query. Returns the response (a slice of `out`), or null if
     /// the message is not a query and must be dropped.
     pub fn handle(r: *Resolver, msg: []u8, out: []u8, client: net.IpAddress, transport: Transport) Io.Cancelable!?[]u8 {
         var name_buf: [dns.max_name_len]u8 = undefined;
         const q = dns.parseQuery(msg, &name_buf) catch |err| {
-            r.stats.count(.invalid);
+            r.countOutcome(.invalid);
             return switch (err) {
                 error.NotQuery => null,
                 error.NotImplemented => dns.writeHeaderOnly(out, msg, .notimp),
@@ -59,7 +62,7 @@ pub const Resolver = struct {
             response = r.respond(out, msg, &q, .{ .rcode = dns.readFlags(response).rcode, .truncated = true });
         }
 
-        r.stats.count(outcome);
+        r.countOutcome(outcome);
         if (log_query) {
             const micros: u64 = @intCast(@max(0, started.untilNow(r.io).raw.toMicroseconds()));
             log.info("{f} {f} {f} {t} {d}.{d}ms", .{
@@ -72,6 +75,11 @@ pub const Resolver = struct {
             });
         }
         return response;
+    }
+
+    fn countOutcome(r: *Resolver, outcome: Outcome) void {
+        r.stats.count(outcome);
+        if (r.metrics) |metrics| metrics.countQuery(outcome, Io.Clock.real.now(r.io).toSeconds());
     }
 
     fn resolve(r: *Resolver, msg: []u8, out: []u8, q: *const dns.Query, client: net.IpAddress) Io.Cancelable!struct { Outcome, []u8 } {
@@ -342,6 +350,25 @@ test "an answer too large for UDP is truncated, and complete over TCP" {
     const tcp = try t.askFrom("127.0.0.1", name, .aaaa, .tcp);
     try testing.expect(!dns.readFlags(tcp).tc);
     try testing.expectEqual(16, dns.readU16(tcp, 6));
+}
+
+test "with metrics, every query's Outcome is counted in the current hour" {
+    var t: TestResolver = undefined;
+    try t.init("blocking:\n  block: [ads.example.com]\n");
+    defer t.deinit();
+    var metrics: Metrics = try .init(testing.io, testing.allocator, .{ .zone = .{}, .started = 0 });
+    defer metrics.deinit();
+    t.resolver.metrics = &metrics;
+
+    _ = try t.ask("ads.example.com", .a);
+    _ = try t.ask("printer", .a);
+    var malformed = [_]u8{ 0x12, 0x34, 0x01, 0x00, 0, 1 };
+    _ = try t.resolver.handle(&malformed, &t.out, ip.parseSocketAddress("127.0.0.1", 5353).?, .udp);
+
+    const today = metrics.queries(.today, Io.Clock.real.now(testing.io).toSeconds());
+    try testing.expectEqual(1, today.get(.blocked));
+    try testing.expectEqual(1, today.get(.private));
+    try testing.expectEqual(1, today.get(.invalid));
 }
 
 test "a name left to the upstream servers fails with SERVFAIL when none answers" {

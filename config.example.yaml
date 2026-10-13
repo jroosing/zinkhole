@@ -33,19 +33,22 @@ server:
 
 upstream:
   # DNS servers that answer everything not handled locally. Tried in order;
-  # the one that answered last is tried first. (Required.)
+  # the one that answered last is tried first. (Required.) Servers further down
+  # are the fallbacks: they are used when the ones before them fail, so listing
+  # a second provider keeps DNS working when one provider is down.
   #
   # DNS over TLS (recommended): tls://<ip>[:port]#<name>, where <name> is the
   # name on the server's certificate. Queries are encrypted, so your ISP can
   # neither read nor alter them. The port defaults to 853.
   #   Quad9:      tls://9.9.9.9#dns.quad9.net       tls://149.112.112.112#dns.quad9.net
-  #   Cloudflare: tls://1.1.1.1#cloudflare-dns.com  tls://1.0.0.1#cloudflare-dns.com
+  #   Cloudflare: tls://1.1.1.1#one.one.one.one     tls://1.0.0.1#one.one.one.one
   #   Google:     tls://8.8.8.8#dns.google          tls://8.8.4.4#dns.google
   # Plain DNS: <ip>[:port], e.g. 192.168.1.1 (your router) or "[2620:fe::fe]:53".
   # Avoid mixing the two: whenever a plain server is used, queries are unencrypted.
   servers:
     - tls://9.9.9.9#dns.quad9.net                   # example
     - tls://149.112.112.112#dns.quad9.net           # example
+    - tls://1.0.0.1#one.one.one.one                 # example: Cloudflare as a fallback
     - "tls://[2620:fe::fe]#dns.quad9.net"           # example: IPv6 needs quotes
   # How long to wait for one server before trying the next.
   timeout_ms: 2000
@@ -131,3 +134,13 @@ log:
 #   secret: "at least 32 random characters, the same on every instance"
 #   interval: 60                  # seconds between syncs
 #   state_dir: /var/lib/zinkhole
+
+# Metrics as JSON at GET /metrics over plain HTTP (see README, "Metrics"):
+# queries per outcome today and in the last 24 hours, per hour, upstream
+# answer times, and the state of the lists and sync. Only clients in
+# server.allow_clients can read them. Leave this out to serve none. "Today"
+# follows the local time zone (TZ, else /etc/localtime, else UTC). Changes
+# need a restart.
+#
+# metrics:
+#   listen: ["192.168.1.5:9153"]

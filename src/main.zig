@@ -24,6 +24,9 @@ const Cache = @import("cache.zig").Cache;
 const Resolver = @import("resolver.zig").Resolver;
 const Server = @import("server.zig").Server;
 const Upstream = @import("upstream.zig").Upstream;
+const localtime = @import("localtime.zig");
+const metrics_mod = @import("metrics.zig");
+const Metrics = metrics_mod.Metrics;
 
 const log = std.log.scoped(.main);
 const testing = std.testing;
@@ -123,7 +126,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     defer cfg.deinit();
     if (test_only) return check(io, gpa, &cfg);
-    run(io, gpa, config_path, &cfg) catch |err| {
+    run(io, gpa, config_path, &cfg, init.environ.getPosix("TZ")) catch |err| {
         log.err("{t}", .{err});
         return 1;
     };
@@ -222,8 +225,9 @@ fn check(io: Io, gpa: Allocator, cfg: *const Config) !u8 {
     return 0;
 }
 
-/// Serves until SIGTERM/SIGINT. A reload replaces `cfg` in place.
-fn run(io: Io, gpa: Allocator, config_path: []const u8, cfg: *Config) !void {
+/// Serves until SIGTERM/SIGINT. A reload replaces `cfg` in place. `tz` is
+/// the TZ variable, for the metrics' local time.
+fn run(io: Io, gpa: Allocator, config_path: []const u8, cfg: *Config, tz: ?[]const u8) !void {
     // Long-lived copies of the settings that only apply at startup, so a
     // reload can free the config they came from.
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
@@ -262,6 +266,16 @@ fn run(io: Io, gpa: Allocator, config_path: []const u8, cfg: *Config) !void {
     const allow_clients = try arena.dupe(ip.Cidr, cfg.server.allow_clients);
     var policy: Policy = try .init(io, gpa, cfg);
     defer policy.deinit();
+
+    // Before anything is counted; everything that counts stops first.
+    var metrics: Metrics = undefined;
+    const measuring = cfg.metrics != null;
+    if (measuring) metrics = try startMetrics(io, gpa, cfg, tz);
+    defer if (measuring) metrics.deinit();
+    const metrics_ptr: ?*Metrics = if (measuring) &metrics else null;
+    upstream.metrics = metrics_ptr;
+    if (metrics_ptr) |m| m.setLocalRecords(cfg.local.records.len);
+
     var resolver: Resolver = .{
         .io = io,
         .policy = &policy,
@@ -269,6 +283,7 @@ fn run(io: Io, gpa: Allocator, config_path: []const u8, cfg: *Config) !void {
         .upstream = &upstream,
         .allow_clients = allow_clients,
         .log_queries = .init(cfg.log.queries),
+        .metrics = metrics_ptr,
     };
 
     var server: Server = .{ .io = io, .gpa = gpa, .resolver = &resolver };
@@ -278,13 +293,21 @@ fn run(io: Io, gpa: Allocator, config_path: []const u8, cfg: *Config) !void {
 
     var origin: sync.Origin = undefined;
     const serving = cfg.sync == .origin;
-    if (serving) try origin.init(io, gpa, cfg.sync.origin.serve, cfg.sync.origin.secret, allow_clients);
+    if (serving) try origin.init(io, gpa, cfg.sync.origin.serve, cfg.sync.origin.secret, allow_clients, metrics_ptr);
     // Right after init: its tasks point into `origin` and must stop before
     // this frame ends, whatever fails next.
     defer if (serving) origin.deinit();
     if (serving) {
         try origin.publish(cfg.policy_text);
-        for (origin.listeners.items) |listener| log.info("serving the Policy settings to replicas on {f}", .{listener.socket.address});
+        for (origin.service.listeners.items) |listener| log.info("serving the Policy settings to replicas on {f}", .{listener.socket.address});
+    }
+
+    var endpoint: metrics_mod.Endpoint = undefined;
+    if (measuring) try endpoint.init(io, gpa, cfg.metrics.?.listen, allow_clients, .{ .metrics = &metrics, .upstream = &upstream, .cache = &cache });
+    // Right after init, like the origin.
+    defer if (measuring) endpoint.deinit();
+    if (measuring) {
+        for (endpoint.service.listeners.items) |listener| log.info("serving metrics on http://{f}/metrics", .{listener.socket.address});
     }
 
     var app: App = .{
@@ -294,6 +317,7 @@ fn run(io: Io, gpa: Allocator, config_path: []const u8, cfg: *Config) !void {
         .config = cfg,
         .policy = &policy,
         .resolver = &resolver,
+        .metrics = metrics_ptr,
         .task_arena = .init(gpa),
         .origin = if (serving) &origin else null,
         .replica = replica,
@@ -307,6 +331,26 @@ fn run(io: Io, gpa: Allocator, config_path: []const u8, cfg: *Config) !void {
         version, upstream.servers.len, cfg.local.records.len,
     });
     app.supervise();
+}
+
+/// The metrics, in the local time zone.
+fn startMetrics(io: Io, gpa: Allocator, cfg: *const Config, tz: ?[]const u8) !Metrics {
+    var root = try Io.Dir.cwd().openDir(io, "/", .{});
+    defer root.close(io);
+    var zone = localtime.load(io, gpa, tz, root);
+    errdefer zone.deinit(gpa);
+    log.info("metrics use the time zone {s}", .{zone.name()});
+    return .init(io, gpa, .{
+        .zone = zone,
+        .role = switch (cfg.sync) {
+            .none => .standalone,
+            .origin => .origin,
+            .replica => .replica,
+        },
+        .origin = if (cfg.sync == .replica) cfg.sync.replica.origin else "",
+        .started = realSeconds(io),
+        .upstream = cfg.upstream.servers,
+    });
 }
 
 /// Loads a replica's state file and, if it holds valid settings, makes them
@@ -347,6 +391,8 @@ const App = struct {
     policy: *Policy,
     resolver: *Resolver,
     schedule: Schedule = .{},
+    /// Told what the supervisor sees, if metrics are served.
+    metrics: ?*Metrics,
 
     /// Origin only: serves the Policy settings to replicas.
     origin: ?*sync.Origin,
@@ -384,6 +430,7 @@ const App = struct {
             if (signals.stats.swap(false, .acq_rel)) app.logStats();
             app.scheduleLists();
             app.scheduleSync();
+            app.reportNextLoad();
         }
         log.info("shutting down", .{});
         if (app.task) |*task| {
@@ -405,13 +452,25 @@ const App = struct {
                 app.finishLoad(now, lists);
             }
         }
-        const refresh_hours = app.config.blocking.refresh_hours;
-        const interval: ?i64 = if (refresh_hours == 0) null else @as(i64, refresh_hours) * 3600;
-        switch (app.schedule.next(now, interval)) {
+        switch (app.schedule.next(now, app.refreshInterval())) {
             .idle => {},
             .start => app.startTask(now),
             .cancel => app.cancelTask(now),
         }
+    }
+
+    fn refreshInterval(app: *const App) ?i64 {
+        const refresh_hours = app.config.blocking.refresh_hours;
+        return if (refresh_hours == 0) null else @as(i64, refresh_hours) * 3600;
+    }
+
+    /// The schedule counts in boot-clock seconds; the metrics show real time.
+    fn reportNextLoad(app: *App) void {
+        const metrics = app.metrics orelse return;
+        const next = app.schedule.nextLoad(app.refreshInterval()) orelse return metrics.setNextLoad(null);
+        // In nanoseconds, so whole seconds do not flicker between ticks.
+        const real_minus_boot: i64 = @intCast(@divFloor(Io.Clock.real.now(app.io).toNanoseconds() - Io.Clock.boot.now(app.io).toNanoseconds(), std.time.ns_per_s));
+        metrics.setNextLoad(next + real_minus_boot);
     }
 
     fn startTask(app: *App, now: i64) void {
@@ -440,10 +499,25 @@ const App = struct {
     fn finishLoad(app: *App, now: i64, loaded: ?*Lists) void {
         const lists = loaded orelse return app.schedule.finished(now, false);
         const complete = lists.complete;
+        // Before `replaceLists`, which destroys lists it does not keep.
+        app.reportLoad(lists);
         if (app.policy.replaceLists(lists) == .kept) {
             log.warn("some lists failed to load, keeping the previous lists", .{});
         }
+        // Only the supervisor replaces the lists, so reading them is safe here.
+        if (app.metrics) |metrics| metrics.setDomains(app.policy.lists.block.count(), app.policy.lists.allow.count());
         app.schedule.finished(now, complete);
+    }
+
+    fn reportLoad(app: *App, lists: *const Lists) void {
+        const metrics = app.metrics orelse return;
+        const all = lists.sources.blocklists.len + lists.sources.allowlists.len;
+        const sources = app.gpa.alloc(metrics_mod.ListLoad.Source, all) catch return;
+        defer app.gpa.free(sources);
+        for (lists.sources.blocklists, sources[0..lists.sources.blocklists.len]) |source, *to| to.source = source;
+        for (lists.sources.allowlists, sources[lists.sources.blocklists.len..]) |source, *to| to.source = source;
+        for (lists.loaded, sources) |ok, *to| to.ok = ok;
+        metrics.setLists(.{ .sources = sources, .complete = lists.complete, .finished = realSeconds(app.io) }) catch {};
     }
 
     /// Runs as a background task: loads the lists, nothing else.
@@ -510,6 +584,7 @@ const App = struct {
         const replica = app.replica.?;
         app.next_sync = now + replica.interval;
         const result = fetched orelse {
+            if (app.metrics) |metrics| metrics.syncFailed();
             app.sync_failures +|= 1;
             if (app.sync_failures == sync_failures_before_warning) {
                 log.warn("cannot sync from {s} ({t}); keeping the current settings", .{ replica.origin, app.sync_error });
@@ -520,6 +595,7 @@ const App = struct {
         };
         if (app.sync_failures >= sync_failures_before_warning) log.info("syncing from {s} again", .{replica.origin});
         app.sync_failures = 0;
+        if (app.metrics) |metrics| metrics.synced(realSeconds(app.io));
         switch (result) {
             .unchanged => {},
             .changed => |synced| app.applySynced(synced),
@@ -547,6 +623,7 @@ const App = struct {
             return;
         };
         if (!Sources.fromConfig(&new_config).eql(.fromConfig(app.config))) app.schedule.sourcesChanged();
+        if (app.metrics) |metrics| metrics.setLocalRecords(new_config.local.records.len);
         app.config.deinit();
         app.config.* = new_config;
         if (app.synced.*) |old| app.gpa.free(old.text);
@@ -588,6 +665,7 @@ const App = struct {
         app.resolver.log_queries.store(new_config.log.queries, .monotonic);
 
         if (!Sources.fromConfig(&new_config).eql(.fromConfig(app.config))) app.schedule.sourcesChanged();
+        if (app.metrics) |metrics| metrics.setLocalRecords(new_config.local.records.len);
         app.config.deinit();
         app.config.* = new_config;
         log.info("configuration reloaded (server, upstream and cache settings apply after a restart)", .{});
@@ -649,6 +727,11 @@ fn eql(a: []const u8, b: []const u8) bool {
 
 fn nowSeconds(io: Io) i64 {
     return Io.Clock.boot.now(io).toSeconds();
+}
+
+/// Unix time, for what people read.
+fn realSeconds(io: Io) i64 {
+    return Io.Clock.real.now(io).toSeconds();
 }
 
 fn randomSeed(io: Io) u64 {
@@ -745,4 +828,7 @@ test {
     _ = @import("dot.zig");
     _ = @import("tcp.zig");
     _ = @import("server.zig");
+    _ = @import("localtime.zig");
+    _ = @import("metrics.zig");
+    _ = @import("http_service.zig");
 }

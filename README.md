@@ -25,8 +25,17 @@ No web UI, no database, no state on disk: one static binary and one YAML file
   alter your queries. Connections are reused, so after the first query it is
   as fast as plain DNS.
 - **Caching** of upstream answers (LRU, TTL-aware, bounded).
+- **DNSSEC** flags are passed through, so a validating upstream (Quad9 and
+  Cloudflare both validate) refuses forged data. zinkhole does not validate
+  signatures itself.
 - UDP and TCP, IPv4 and IPv6, upstream failover, TCP fallback for large
-  answers.
+  answers. Upstream servers are tried in the order listed, starting with the one
+  that answered last, so later ones act as fallbacks.
+- **Metrics** as JSON for `curl` or a browser: queries per outcome today
+  (since local midnight) and in the last 24 hours, hour by hour, upstream
+  answer times, and the state of the lists and sync (see [Metrics](#metrics)).
+- A per-query log (`log.queries`), statistics (`SIGUSR1`) and a container
+  health check.
 - Live reload with `SIGHUP`; local records apply instantly, and lists are
   re-downloaded only when their sources changed.
 - **Proxmox in one command**: a script creates the LXC container (static or
@@ -43,12 +52,14 @@ Requires Zig 0.17.
 zig build --release            # ReleaseSafe: optimized, bounds checks kept
 zig build test                 # unit tests (offline)
 zig build test -Dnetwork       # also DNS over TLS to a public server
+zig build test -Dtest-filter="name"   # only tests whose name contains this
 zig build --release -Dtarget=aarch64-linux-musl -Dstrip=true   # e.g. Raspberry Pi 64-bit
 zig build --release -Dtarget=arm-linux-musleabihf -Dstrip=true # Raspberry Pi 32-bit
 ```
 
 Linux builds are static binaries of about 1 MB (`-Dstrip=true` drops the
-debug info, which costs disk space only, not memory).
+debug info, which costs disk space only, not memory). Releases contain the
+`x86_64` and `aarch64` builds; for 32-bit ARM, build it yourself as above.
 
 ### Releasing
 
@@ -58,16 +69,17 @@ lives only in `build.zig.zon`: `zinkhole --version` is built from it.
 
 ```sh
 # 1. Bump `.version` in build.zig.zon (e.g. "0.2.0"), update docs if needed, commit.
-zig build test && zig fmt --check src build.zig   # what CI runs first
+zig build test && zig fmt --check src build.zig   # what CI runs first (it also runs shellcheck)
 # 2. Tag exactly v<version> and push the tag.
 git tag v0.2.0 && git push origin main v0.2.0
 ```
 
 On a `v*` tag the pipeline runs the tests, **fails if the tag does not match
 `build.zig.zon`**, builds static `x86_64-linux-musl` and `aarch64-linux-musl`
-binaries, packs the Proxmox scripts and `zinkhole-deploy.tar.gz` (the
-installer and service files), writes `SHA256SUMS`, and publishes everything as
-a public GitLab release. Downloads then work without a login, at stable links:
+binaries, packs the Proxmox scripts, `zinkhole-deploy.tar.gz` (the installer
+and service files) and the `LICENSE`, writes `SHA256SUMS`, and publishes
+everything as a public GitLab release. Downloads then work without a login,
+at stable links:
 
 ```
 https://gitlab.com/kyura4k/zinkhole/-/releases/permalink/latest/downloads/zinkhole-x86_64-linux-musl
@@ -95,6 +107,14 @@ cp config.example.yaml config.yaml     # then edit it
 ./zig-out/bin/zinkhole -c config.yaml
 ```
 
+| Option | Meaning |
+|--------|---------|
+| `-c`, `--config <path>` | config file (default `/etc/zinkhole/config.yaml`) |
+| `--check` | only validate the config, without network access, then exit |
+| `-t`, `--test` | validate the config and load all lists, then exit |
+| `--healthcheck [addr]` | ask a running server for `localhost`; exit 0 if it answers |
+| `-V`, `--version` / `-h`, `--help` | version / usage |
+
 For permanent use, pick the setup that fits. Each runs zinkhole as an
 unprivileged user that may only bind port 53; never run it as root.
 
@@ -105,6 +125,9 @@ unprivileged user that may only bind port 53; never run it as root.
 | Reload   | `systemctl reload zinkhole`    | `rc-service zinkhole reload` | `docker compose kill -s HUP zinkhole`  |
 | Logs     | `journalctl -u zinkhole -f`    | `tail -f /var/log/messages`  | `docker compose logs -f`               |
 | Tested on| Debian 13, systemd 257         | Alpine 3.24, OpenRC 0.63     | Docker 29, Compose 5.4                 |
+
+On Proxmox, one command creates the container for you: see
+[Proxmox LXC](#proxmox-lxc).
 
 ### Debian, Ubuntu or Alpine: as a system service
 
@@ -169,8 +192,12 @@ it is about to do, and then:
    with a **static or DHCP address** (your choice) and optional IPv6, starting
    at boot (`nesting` is enabled on Debian only: systemd's sandboxing needs it);
 2. upgrades the OS packages and installs zinkhole, writing a working
-   `/etc/zinkhole/config.yaml` (Quad9 over TLS, the StevenBlack blocklist);
+   `/etc/zinkhole/config.yaml` (Quad9 over TLS with Cloudflare as a fallback,
+   the StevenBlack blocklist, [metrics](#metrics) on port 9153);
 3. starts it, waits until it answers, and prints how to use and update it.
+
+The container takes the node's time zone (`--timezone host`), so the
+metrics' "today" starts at your midnight.
 
 The **role** question sets up [two instances](#running-two-instances) for
 you: *standalone* (the default), *origin* (a secret is generated and shown
@@ -188,6 +215,7 @@ also makes it non-interactive. All are optional except the IPv4 address:
 | `ZINKHOLE_PASSWORD` | root password of the container (none; see below) |
 | `ZINKHOLE_ROLE` | `standalone`, `origin` or `replica` |
 | `ZINKHOLE_ORIGIN`, `ZINKHOLE_SECRET` | replica: the origin's URL and secret |
+| `ZINKHOLE_METRICS`, `ZINKHOLE_METRICS_PORT` | serve [metrics](#metrics): `on` or `off` (`on`), on port `9153` |
 | `ZINKHOLE_CTID`, `ZINKHOLE_HOSTNAME` | next free ID, `zinkhole-<node>` |
 | `ZINKHOLE_BRIDGE`, `ZINKHOLE_VLAN` | `vmbr0`, none |
 | `ZINKHOLE_NAMESERVER` | what the container itself uses; the gateway (static) or what DHCP hands out |
@@ -195,6 +223,7 @@ also makes it non-interactive. All are optional except the IPv4 address:
 | `ZINKHOLE_CORES`, `ZINKHOLE_MEMORY`, `ZINKHOLE_DISK` | `1`, `128` (MB), `1` (GB) |
 | `ZINKHOLE_YES=1` | do not ask for confirmation |
 | `ZINKHOLE_KEEP_ON_FAIL=1` | keep the container if the installation fails |
+| `ZINKHOLE_BASE_URL` | where to download the release files from (this script's own release; for mirrors and testing) |
 
 ```sh
 # Unattended: a replica of the origin from the example above
@@ -230,7 +259,8 @@ settings), and never forward port 53 from the internet to it.
   network is not found (for example SLAAC is slow), the script says so; add
   your IPv6 prefix to `server.allow_clients` yourself. An address from SLAAC
   can change, so for a DNS server prefer a static or reserved one. Upstream
-  servers stay IPv4 (Quad9 over TLS); add IPv6 ones in the config if you want.
+  servers stay IPv4 (Quad9, then Cloudflare, over TLS); add IPv6 ones in the
+  config if you want.
 
 - **Everything downloaded is checked** against the release's `SHA256SUMS`
   before it is used (a download that does not match stops the script before
@@ -313,6 +343,14 @@ with public addresses and get `REFUSED`; for local testing there, add
   Zig, so no Zig is needed on the host). Without Compose:
   `docker build -t zinkhole . && docker run -d --name zinkhole -p 53:53/udp
   -p 53:53/tcp -v $PWD/config.yaml:/etc/zinkhole/config.yaml:ro zinkhole`.
+- **Time zone:** the image has no zone files, so [metrics](#metrics) count in
+  UTC unless you mount the host's: `-v /etc/localtime:/etc/localtime:ro`
+  (Compose: under `volumes:`). Or set `TZ` to a rule such as
+  `CET-1CEST,M3.5.0,M10.5.0/3`; a name like `Europe/Amsterdam` needs the zone
+  files, which the `alpine` target can get with `apk add tzdata`.
+- **Metrics:** listen on `0.0.0.0:9153` in the config and publish the port
+  (`-p 9153:9153`). Docker on Linux keeps the client's address, which must be
+  in `server.allow_clients`.
 - **Port 53 taken on the host** (for example by `systemd-resolved`)? Publish
   one address only, e.g. `"192.168.1.5:53:53/udp"` and `"192.168.1.5:53:53/tcp"`
   in `docker-compose.yml`.
@@ -348,10 +386,10 @@ sync:
 
 Answers are signed with the shared secret over a fresh challenge per
 request, so they cannot be forged or replayed on the LAN. A replica keeps the
-last settings it accepted in `/var/lib/zinkhole/synced.yaml` and starts from
-them if the origin is down. Reload the origin to publish a change; reload a
-replica to sync right away. Changing an instance's `sync` section needs a
-restart.
+last settings it accepted in `/var/lib/zinkhole/synced.yaml` (set another
+folder with `sync.state_dir`) and starts from them if the origin is down.
+Reload the origin to publish a change; reload a replica to sync right away.
+Changing an instance's `sync` section needs a restart.
 
 **Promoting a replica** if the origin is gone for good: append the state
 file to its config (`cat /var/lib/zinkhole/synced.yaml >>
@@ -362,24 +400,98 @@ restart. Make the old origin a replica before it comes back.
 an end-to-end test (`./deploy/sync/test.sh`). The design is in
 [docs/adr/0002](docs/adr/0002-sync-replicas-from-an-origin.md).
 
+### Metrics
+
+With a `metrics` section, zinkhole serves one JSON document over plain HTTP:
+
+```yaml
+metrics:
+  listen: ["192.168.1.5:9153"]
+```
+
+```sh
+curl http://192.168.1.5:9153/metrics
+```
+
+```json
+{
+  "format": 1, "version": "0.3.0", "role": "origin",
+  "now": "2026-10-13T14:05:00+02:00", "started": "…", "uptime_s": 103336,
+  "time_zone": "Europe/Amsterdam",
+  "queries": {
+    "today": {
+      "total": 5120, "blocked": 830, "blocked_pct": 16.2,
+      "cached": 1900, "cache_hit_pct": 47.3,
+      "local": 210, "private": 40, "forwarded": 2120,
+      "failed": 3, "refused": 0, "invalid": 17
+    },
+    "last_24h": { "…": "the same fields" }
+  },
+  "upstream": [
+    { "server": "tls://9.9.9.9:853#dns.quad9.net", "preferred": true,
+      "today": { "answers": 2100, "failures": 2, "avg_ms": 18.4 },
+      "last_24h": { "answers": 2950, "failures": 2, "avg_ms": 19.1 } }
+  ],
+  "lists": {
+    "blocked_domains": 194332, "allowed_domains": 0,
+    "sources": [ { "source": "https://…/pro.txt", "ok": true } ],
+    "last_complete_load": "…", "next_load": "…"
+  },
+  "cache": { "entries": 812, "capacity": 4096 },
+  "local_records": 4,
+  "sync": { "fetched_by": [ { "address": "192.168.1.6", "last_fetch": "…" } ] },
+  "hourly": [
+    { "hour": "2026-10-12T15:00+02:00", "total": 180, "blocked": 31, "…": "every outcome" }
+  ]
+}
+```
+
+- **today** counts from 00:00 local time; **last_24h** is the current hour
+  plus the 23 before it; **hourly** has those 24 hours, oldest first, one line
+  each. The queries are counted by [how they were answered](#how-a-query-is-answered).
+  `blocked_pct` is blocked / total; `cache_hit_pct` is the share of queries
+  needing an upstream answer that the cache had.
+- **upstream** counts every attempt: when the first server times out and the
+  second answers, each gets one. `avg_ms` covers answers only, including the
+  TLS handshake when a connection was new.
+- **sync** depends on the role: an origin lists the addresses that fetched its
+  settings in the last 24 hours (any allowed client that asks counts); a
+  replica shows `origin`, `last_sync` and `failures_in_a_row`.
+- Counts live in memory: a restart starts from zero, a reload keeps them.
+  Times are local, with their offset. New fields may be added; a breaking
+  change would raise `format`.
+- **Local time** comes from `TZ` (a zone name or a POSIX rule), else
+  `/etc/localtime`, else UTC (logged as a warning). It is read at startup.
+- Only clients in `server.allow_clients` can read it, without a password; it
+  holds no domain names and nothing per client. A list source's query string
+  (which may hold a token) is left out.
+
+**Adding it to a container installed before metrics existed** (`update` does
+not change the config): on the Proxmox node, for Alpine first
+`pct exec <id> -- apk add tzdata` (Debian has the zone files already), then
+`pct set <id> --timezone host`. Add the two lines above to
+`/etc/zinkhole/config.yaml`, with the container's address, and restart the
+container (`pct reboot <id>`).
+
 ### Signals
 
 | Signal    | Effect                                                      |
 |-----------|-------------------------------------------------------------|
-| `SIGHUP`  | Reload the config file (server/upstream/cache/sync need restart); on a replica, also sync now |
-| `SIGUSR1` | Log query statistics                                        |
+| `SIGHUP`  | Reload the config file (server/upstream/cache/sync/metrics need restart); on a replica, also sync now |
+| `SIGUSR1` | Log query statistics (totals since start)                   |
 | `SIGTERM` | Shut down cleanly                                           |
 
 ## Configuration
 
 See [config.example.yaml](config.example.yaml), which documents every
-setting. A minimal config only needs upstream servers:
+setting. Only the upstream servers are required; a small config looks like:
 
 ```yaml
 upstream:
   servers:
     - tls://9.9.9.9#dns.quad9.net          # DNS over TLS: address#certificate name
     - tls://149.112.112.112#dns.quad9.net
+    - tls://1.0.0.1#one.one.one.one        # a second provider as a fallback
 blocking:
   lists:
     - https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts
@@ -416,9 +528,12 @@ so clients cannot get around a block through HTTPS/SVCB records.
 | `config.zig`, `yaml.zig` | YAML subset parser and validated, typed config |
 | `server.zig`, `tcp.zig` | UDP/TCP listeners, fixed worker pool, TCP framing with deadlines |
 | `resolver.zig` | The query pipeline above, statistics, query log |
-| `policy.zig` | `Policy`: steps 2-4 of the pipeline, over the config's rules (rebuilt on reload) and `Lists` (downloaded) |
+| `policy.zig` | `Policy`: steps 2-4 of the pipeline (local, blocked, private), from the config (rebuilt on reload) and the downloaded `Lists` |
 | `refresh.zig` | When lists load: refresh interval, retry backoff, timeouts |
 | `sync.zig` | Sync: the origin's endpoint, signed fetches, the replica's state file |
+| `metrics.zig` | Counts per local hour, the JSON document and its endpoint |
+| `localtime.zig` | The UTC offset at a moment, from `TZ` or a zone file (TZif and POSIX rules) |
+| `http_service.zig` | The small HTTP server behind the sync and metrics endpoints |
 | `domain_set.zig` | Compact domain set with subdomain matching |
 | `blocklist.zig` | Line parser for all list formats, streaming loader (file/HTTPS) |
 | `local.zig` | Local records, wildcards, reverse lookups, private zones |
@@ -426,6 +541,11 @@ so clients cannot get around a block through HTTPS/SVCB records.
 | `upstream.zig` | Failover over upstream servers; plain DNS with TCP fallback |
 | `dot.zig` | DNS over TLS: pooled TLS connections, certificate checks (`dot.Tls`) |
 | `dns.zig` | DNS wire format: parsing, building, TTL handling |
+| `ip.zig` | IP addresses, networks (`allow_clients`) and parsing |
+| `log.zig` | Log output and the runtime log level |
+
+The reasoning behind the larger design decisions is in [docs/adr/](docs/adr/),
+and [CONTEXT.md](CONTEXT.md) defines the terms used in the code and docs.
 
 **Domain set.** Every domain is stored once in one byte array as
 `[length][name]`, and a hash table maps the 4-byte offset of each entry to
@@ -465,8 +585,9 @@ the lists, the new ones are used right away, even if some of them failed.
 - Built in ReleaseSafe: bounds and integer overflow checks stay on. Every
   length read from a DNS message is checked before use; malformed packets get
   `FORMERR` or are dropped. The parsers are tested against random and mutated
-  input, and the server has been run under ThreadSanitizer with concurrent
-  queries and reloads. Pointer-stability locks make safe builds panic if a
+  input, and an earlier version of the server (before the Policy, refresh and
+  sync code) was run under ThreadSanitizer with concurrent queries and
+  reloads. Pointer-stability locks make safe builds panic if a
   buffer that other code points into (the listener sockets workers use, the
   domain bytes a hash table reads) could be reallocated.
 - Upstream queries can use DNS over TLS with certificate verification. For
@@ -474,23 +595,42 @@ the lists, the new ones are used right away, even if some of them failed.
   query ID per exchange, and only answers from the right address with the
   same ID and question are accepted.
 - Only allowed client networks are answered (default: private ranges), so an
-  accidentally exposed port is not an open resolver. Zone transfers and
-  non-IN classes are refused.
+  accidentally exposed port is not an open resolver. TCP connections from
+  other networks are closed on arrival, so they cannot occupy a worker. Zone
+  transfers and non-IN classes are refused. The TCP ports are not shared
+  with other processes (no `SO_REUSEPORT`).
 - Lists are fetched over TLS with system CA verification (plain `http://`
-  sources produce a warning), with size limits. TCP clients have idle
-  deadlines and a per-connection query limit.
+  sources produce a warning, and an `https://` list that redirects to `http://`
+  is refused), with size limits. TCP clients have idle deadlines and a
+  per-connection query limit. Query names are escaped in the query log, so a
+  crafted name cannot forge log lines.
 - The config parser rejects YAML anchors/aliases (no "billion laughs") and
   duplicate keys; the file is limited to 1 MiB.
 - Sync answers are signed (HMAC-SHA256) over a random challenge from the
   replica, and the state file is checked against the same signature. The sync
-  endpoint is read-only and serves only `blocking` and `local`, never the
-  secret; anyone on the LAN can read it, but those clients can already query
-  the local records.
+  endpoint is read-only, answers only `server.allow_clients` (other
+  connections are closed before anything is read), and serves only `blocking`
+  and `local`, never the secret. It is plain HTTP, so the settings are not
+  encrypted: anyone on the LAN can read them, but those clients can already
+  query the local records. The state file is flushed to disk before it
+  replaces the old one.
+- The metrics endpoint is read-only and answers only `server.allow_clients`,
+  in the same way; it holds counts and settings, no domain names or client
+  addresses (an origin lists the addresses that fetched its settings), and
+  list sources without their query strings.
 
 ## Limitations
 
-- No DNS over HTTPS upstream, and zinkhole itself answers plain DNS only
-  (inside a LAN, encrypting the client side adds little).
+- No DNS over HTTPS upstream (some providers, such as Quad9, require
+  HTTP/2, which Zig's standard library does not have), and zinkhole itself
+  answers plain DNS only (inside a LAN, encrypting the client side adds
+  little). Zig has no TLS server either, so the sync endpoint is signed but
+  not encrypted.
+- No DNSSEC validation in zinkhole itself: it relies on a validating upstream
+  (Quad9 and Cloudflare both validate). Blocked and local answers are
+  unsigned, which only matters to clients that validate on their own.
+- Upstream servers are tried starting with the one that answered last; there
+  is no mode that always prefers the first one.
 - Regular-expression rules and per-client blocking groups are not supported.
 - Lists are downloaded again on every start (nothing is stored on disk).
 
