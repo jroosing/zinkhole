@@ -1,4 +1,4 @@
-# dnsblock
+# zinkhole
 
 A minimal DNS blocker and local DNS server for home networks, in the spirit of
 [blocky](https://github.com/0xERR0R/blocky), written in Zig with no
@@ -50,19 +50,19 @@ port in `server.listen` for a quick test):
 
 ```sh
 cp config.example.yaml config.yaml     # then edit it
-./zig-out/bin/dnsblock --test -c config.yaml   # validate and load all lists
-./zig-out/bin/dnsblock -c config.yaml
+./zig-out/bin/zinkhole --test -c config.yaml   # validate and load all lists
+./zig-out/bin/zinkhole -c config.yaml
 ```
 
-For permanent use, pick the setup that fits. Each runs dnsblock as an
+For permanent use, pick the setup that fits. Each runs zinkhole as an
 unprivileged user that may only bind port 53; never run it as root.
 
 |          | Debian, Ubuntu (systemd)       | Alpine (OpenRC)              | Docker                                 |
 |----------|--------------------------------|------------------------------|----------------------------------------|
 | Install  | `./deploy/install.sh`          | `./deploy/install.sh`        | `docker compose up -d --build`         |
-| Config   | `/etc/dnsblock/config.yaml`    | `/etc/dnsblock/config.yaml`  | `./config.yaml`                        |
-| Reload   | `systemctl reload dnsblock`    | `rc-service dnsblock reload` | `docker compose kill -s HUP dnsblock`  |
-| Logs     | `journalctl -u dnsblock -f`    | `tail -f /var/log/messages`  | `docker compose logs -f`               |
+| Config   | `/etc/zinkhole/config.yaml`    | `/etc/zinkhole/config.yaml`  | `./config.yaml`                        |
+| Reload   | `systemctl reload zinkhole`    | `rc-service zinkhole reload` | `docker compose kill -s HUP zinkhole`  |
+| Logs     | `journalctl -u zinkhole -f`    | `tail -f /var/log/messages`  | `docker compose logs -f`               |
 | Tested on| Debian 13, systemd 257         | Alpine 3.24, OpenRC 0.63     | Docker 29, Compose 5.4                 |
 
 ### Debian, Ubuntu or Alpine: as a system service
@@ -78,18 +78,18 @@ zig build --release -Dstrip=true -Dtarget=x86_64-linux-musl   # or aarch64-linux
 ```
 
 The installer copies the binary to `/usr/local/bin`, installs the CA
-certificates package if it is missing, creates `/etc/dnsblock/config.yaml`
+certificates package if it is missing, creates `/etc/zinkhole/config.yaml`
 from the example (an existing config is never overwritten), and enables the
 service. Edit the config, then start the service. Running the installer
 again upgrades and restarts; `./deploy/install.sh --uninstall` removes the
 service and binary but keeps the config.
 
-- **systemd** ([deploy/dnsblock.service](deploy/dnsblock.service)): a
+- **systemd** ([deploy/zinkhole.service](deploy/zinkhole.service)): a
   throwaway dynamic user, read-only file system, syscall filter and other
-  sandboxing (`systemd-analyze security dnsblock` rates it 1.6, "OK").
-- **OpenRC** ([deploy/openrc/dnsblock](deploy/openrc/dnsblock)): a `dnsblock`
+  sandboxing (`systemd-analyze security zinkhole` rates it 1.6, "OK").
+- **OpenRC** ([deploy/openrc/zinkhole](deploy/openrc/zinkhole)): a `zinkhole`
   user created on first start, restarted by supervise-daemon if it crashes,
-  logs to syslog; `rc-service dnsblock stats` logs statistics.
+  logs to syslog; `rc-service zinkhole stats` logs statistics.
 - **Port 53 already in use?** `systemd-resolved` (default on Ubuntu, optional
   on Debian) listens on 127.0.0.53:53. Set `DNSStubListener=no` in
   `/etc/systemd/resolved.conf`, or listen on the LAN address only, e.g.
@@ -102,9 +102,9 @@ No Zig on the build machine? Docker can build the binary (use
 `linux/arm64` for 64-bit ARM):
 
 ```sh
-docker buildx build --platform linux/amd64 -t dnsblock --load .
-mkdir -p zig-out/bin && docker create --name dnsblock-tmp dnsblock
-docker cp dnsblock-tmp:/usr/local/bin/dnsblock zig-out/bin/ && docker rm dnsblock-tmp
+docker buildx build --platform linux/amd64 -t zinkhole --load .
+mkdir -p zig-out/bin && docker create --name zinkhole-tmp zinkhole
+docker cp zinkhole-tmp:/usr/local/bin/zinkhole zig-out/bin/ && docker rm zinkhole-tmp
 ```
 
 ### Docker
@@ -115,10 +115,10 @@ and a config (about 2 MB). `--target alpine` builds a variant with a shell.
 ```sh
 cp config.example.yaml config.yaml     # then edit it
 docker compose up -d --build           # hardened: read-only, no capabilities
-docker compose kill -s HUP dnsblock    # reload config.yaml
+docker compose kill -s HUP zinkhole    # reload config.yaml
 ```
 
-The image has a healthcheck (`dnsblock --healthcheck`, which asks the server
+The image has a healthcheck (`zinkhole --healthcheck`, which asks the server
 for `localhost`). On Docker Desktop for macOS or Windows, UDP clients appear
 with public addresses and get `REFUSED`; for local testing there, add
 `0.0.0.0/0` to `server.allow_clients`. Docker on Linux keeps real addresses.
@@ -177,7 +177,7 @@ so clients cannot get around a block through HTTPS/SVCB records.
 | `config.zig`, `yaml.zig` | YAML subset parser and validated, typed config |
 | `server.zig`, `tcp.zig` | UDP/TCP listeners, fixed worker pool, TCP framing with deadlines |
 | `resolver.zig` | The query pipeline above, statistics, query log |
-| `rules.zig` | `Rules` (from config, rebuilt on reload) and `Lists` (downloaded) |
+| `rules.zig` | `ConfigPolicy` (from config, rebuilt on reload) and `Lists` (downloaded) |
 | `domain_set.zig` | Compact domain set with subdomain matching |
 | `blocklist.zig` | Line parser for all list formats, streaming loader (file/HTTPS) |
 | `local.zig` | Local records, wildcards, reverse lookups, private zones |
@@ -196,10 +196,10 @@ uses a random hash seed, so list content cannot be crafted to degrade it.
 
 **Threads and memory.** Each worker thread owns one fixed query buffer and
 one fixed response buffer, so answering a query allocates nothing; only cache
-insertions do, and the cache has a fixed capacity. Rules and lists are
-immutable once built; a reload builds new ones on the side and swaps a
-pointer under a read-write lock that queries hold only for the in-memory
-lookup, never during network I/O.
+insertions do, and the cache has a fixed capacity. The config policy and
+lists are immutable once built; a reload builds new ones on the side and
+swaps a pointer under a read-write lock that queries hold only for the
+in-memory lookup, never during network I/O.
 
 **DNS over TLS.** A TLS handshake costs several round trips, so each
 upstream server keeps up to 4 idle connections open (about 52 KB each). A
@@ -213,7 +213,7 @@ certificate, which must chain to the system's CA certificates.
 
 **List loading.** The server starts answering immediately with local records
 and inline rules while lists download in the background. This also lets the
-host resolve the list servers' names through dnsblock itself. Lists are
+host resolve the list servers' names through zinkhole itself. Lists are
 streamed line by line, never held in memory as a whole, and capped at 64 MiB
 each. If a refresh fails partway, the previous complete lists stay in use and
 the refresh is retried with exponential backoff.
@@ -242,7 +242,7 @@ the refresh is retried with exponential backoff.
 
 ## Limitations
 
-- No DNS over HTTPS upstream, and dnsblock itself answers plain DNS only
+- No DNS over HTTPS upstream, and zinkhole itself answers plain DNS only
   (inside a LAN, encrypting the client side adds little).
 - Regular-expression rules and per-client blocking groups are not supported.
 - Lists are downloaded again on every start (nothing is stored on disk).

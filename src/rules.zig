@@ -1,11 +1,11 @@
 //! Everything that decides how a name is answered, in two parts:
 //!
-//!   Rules  built from the config file alone: local records, inline
-//!          block/allow rules and response settings. Cheap to build, so a
-//!          reload (SIGHUP) applies them instantly.
-//!   Lists  built from downloaded or local list files. Loaded in the
-//!          background at start, on every refresh, and when a reload
-//!          changes the configured sources.
+//!   ConfigPolicy  built from the config file alone: local records, inline
+//!                 block/allow rules and response settings. Cheap to build,
+//!                 so a reload (SIGHUP) applies it instantly.
+//!   Lists         built from downloaded or local list files. Loaded in the
+//!                 background at start, on every refresh, and when a reload
+//!                 changes the configured sources.
 //!
 //! Both are immutable once built; the resolver swaps in new ones atomically.
 
@@ -23,7 +23,7 @@ const log = std.log.scoped(.lists);
 /// A single list may not exceed this much (decompressed) data.
 const max_list_bytes = 64 * 1024 * 1024;
 
-pub const Rules = struct {
+pub const ConfigPolicy = struct {
     gpa: Allocator,
     local: LocalZone,
     /// Inline rules from the config file.
@@ -34,10 +34,10 @@ pub const Rules = struct {
     local_ttl: u32,
     forward_private: bool,
 
-    pub fn create(io: Io, gpa: Allocator, config: *const Config) Allocator.Error!*Rules {
-        const rules = try gpa.create(Rules);
-        errdefer gpa.destroy(rules);
-        rules.* = .{
+    pub fn create(io: Io, gpa: Allocator, config: *const Config) Allocator.Error!*ConfigPolicy {
+        const policy = try gpa.create(ConfigPolicy);
+        errdefer gpa.destroy(policy);
+        policy.* = .{
             .gpa = gpa,
             .local = try .init(gpa, config.local.records, randomSeed(io)),
             .block = .init(randomSeed(io)),
@@ -47,26 +47,26 @@ pub const Rules = struct {
             .local_ttl = config.local.ttl,
             .forward_private = config.local.private_names == .forward,
         };
-        errdefer rules.deinit();
+        errdefer policy.deinit();
 
         // The config loader already checked that every inline rule parses.
-        var block_sink: blocklist.Sink = .{ .gpa = gpa, .block = &rules.block, .allow = &rules.allow, .is_allowlist = false };
+        var block_sink: blocklist.Sink = .{ .gpa = gpa, .block = &policy.block, .allow = &policy.allow, .is_allowlist = false };
         for (config.blocking.block) |rule| try addInline(rule, &block_sink);
-        var allow_sink: blocklist.Sink = .{ .gpa = gpa, .block = &rules.block, .allow = &rules.allow, .is_allowlist = true };
+        var allow_sink: blocklist.Sink = .{ .gpa = gpa, .block = &policy.block, .allow = &policy.allow, .is_allowlist = true };
         for (config.blocking.allow) |rule| try addInline(rule, &allow_sink);
-        return rules;
+        return policy;
     }
 
-    pub fn destroy(rules: *Rules) void {
-        const gpa = rules.gpa;
-        rules.deinit();
-        gpa.destroy(rules);
+    pub fn destroy(policy: *ConfigPolicy) void {
+        const gpa = policy.gpa;
+        policy.deinit();
+        gpa.destroy(policy);
     }
 
-    fn deinit(rules: *Rules) void {
-        rules.local.deinit();
-        rules.block.deinit(rules.gpa);
-        rules.allow.deinit(rules.gpa);
+    fn deinit(policy: *ConfigPolicy) void {
+        policy.local.deinit();
+        policy.block.deinit(policy.gpa);
+        policy.allow.deinit(policy.gpa);
     }
 
     fn addInline(rule: []const u8, sink: *blocklist.Sink) Allocator.Error!void {

@@ -1,17 +1,17 @@
-# dnsblock container image.
+# zinkhole container image.
 #
-#   docker build -t dnsblock .                    # FROM scratch (default, ~1.5 MB)
-#   docker build -t dnsblock:alpine --target alpine .   # with a shell, for debugging
-#   docker run -d --name dnsblock -p 53:53/udp -p 53:53/tcp dnsblock
+#   docker build -t zinkhole .                    # FROM scratch (default, ~2 MB)
+#   docker build -t zinkhole:alpine --target alpine .   # with a shell, for debugging
+#   docker run -d --name zinkhole -p 53:53/udp -p 53:53/tcp zinkhole
 #
 # Use your own config by mounting it over the default:
-#   -v /path/to/config.yaml:/etc/dnsblock/config.yaml:ro
-# Reload it with `docker kill -s HUP dnsblock`, log statistics with
-# `docker kill -s USR1 dnsblock`. See docker-compose.yml for a hardened setup.
+#   -v /path/to/config.yaml:/etc/zinkhole/config.yaml:ro
+# Reload it with `docker kill -s HUP zinkhole`, log statistics with
+# `docker kill -s USR1 zinkhole`. See docker-compose.yml for a hardened setup.
 #
 # The build cross-compiles with Zig on the build machine's architecture, so
 # images for other architectures build without emulation:
-#   docker buildx build --platform linux/amd64,linux/arm64 -t dnsblock .
+#   docker buildx build --platform linux/amd64,linux/arm64 -t zinkhole .
 
 ARG ALPINE_VERSION=3.24.2
 
@@ -55,24 +55,24 @@ RUN set -eu; \
 # --- Alpine runtime (docker build --target alpine): has a shell -------------
 FROM alpine:${ALPINE_VERSION} AS alpine
 RUN apk add --no-cache ca-certificates \
-    && addgroup -S dnsblock \
-    && adduser -S -D -H -h /var/empty -s /sbin/nologin -G dnsblock dnsblock
-COPY --from=build /out/bin/dnsblock /usr/local/bin/dnsblock
-COPY config.example.yaml /etc/dnsblock/config.yaml
-USER dnsblock
+    && addgroup -S zinkhole \
+    && adduser -S -D -H -h /var/empty -s /sbin/nologin -G zinkhole zinkhole
+COPY --from=build /out/bin/zinkhole /usr/local/bin/zinkhole
+COPY config.example.yaml /etc/zinkhole/config.yaml
+USER zinkhole
 EXPOSE 53/udp 53/tcp
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \
-    CMD ["/usr/local/bin/dnsblock", "--healthcheck"]
-ENTRYPOINT ["/usr/local/bin/dnsblock"]
-CMD ["--config", "/etc/dnsblock/config.yaml"]
+    CMD ["/usr/local/bin/zinkhole", "--healthcheck"]
+ENTRYPOINT ["/usr/local/bin/zinkhole"]
+CMD ["--config", "/etc/zinkhole/config.yaml"]
 
 # --- Default runtime: nothing but the binary, CA certificates and config ----
 FROM scratch
 # For DNS over TLS and https:// blocklists. Docker provides /etc/resolv.conf
 # and /etc/hosts, which list downloads use to resolve names.
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY --from=build /out/bin/dnsblock /usr/local/bin/dnsblock
-COPY config.example.yaml /etc/dnsblock/config.yaml
+COPY --from=build /out/bin/zinkhole /usr/local/bin/zinkhole
+COPY config.example.yaml /etc/zinkhole/config.yaml
 
 # Unprivileged (there is no /etc/passwd, so a numeric user). Docker lets
 # containers bind ports below 1024 without privileges
@@ -83,8 +83,8 @@ EXPOSE 53/udp 53/tcp
 # Asks the server for "localhost", which it answers itself, so the check does
 # not depend on upstream servers.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \
-    CMD ["/usr/local/bin/dnsblock", "--healthcheck"]
+    CMD ["/usr/local/bin/zinkhole", "--healthcheck"]
 
-# dnsblock handles SIGTERM itself, so no init process is needed.
-ENTRYPOINT ["/usr/local/bin/dnsblock"]
-CMD ["--config", "/etc/dnsblock/config.yaml"]
+# zinkhole handles SIGTERM itself, so no init process is needed.
+ENTRYPOINT ["/usr/local/bin/zinkhole"]
+CMD ["--config", "/etc/zinkhole/config.yaml"]

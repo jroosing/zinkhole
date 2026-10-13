@@ -1,0 +1,72 @@
+#!/sbin/openrc-run
+# OpenRC service for zinkhole (Alpine Linux, e.g. inside an LXC container).
+#
+# Install with `./deploy/install.sh`, or by hand:
+#   apk add ca-certificates
+#   install -m 755 zinkhole /usr/local/bin/zinkhole
+#   install -m 755 deploy/openrc/zinkhole /etc/init.d/zinkhole
+#   install -m 644 -D config.yaml /etc/zinkhole/config.yaml
+#   rc-update add zinkhole default
+#   rc-service zinkhole start
+#
+#   rc-service zinkhole reload   # reload the config file (SIGHUP)
+#   rc-service zinkhole stats    # log query statistics (SIGUSR1)
+#
+# Runs as the unprivileged user "zinkhole" (created on first start) with only
+# the capability to bind port 53, and is restarted if it crashes. Logs go to
+# syslog (`tail -f /var/log/messages`). Settings can be overridden in
+# /etc/conf.d/zinkhole: zinkhole_config, zinkhole_user.
+
+name="zinkhole"
+description="Minimal DNS blocker and local DNS server"
+
+: "${zinkhole_config:=/etc/zinkhole/config.yaml}"
+: "${zinkhole_user:=zinkhole}"
+
+command="/usr/local/bin/zinkhole"
+command_args="--config $zinkhole_config"
+command_user="$zinkhole_user:$zinkhole_user"
+supervisor="supervise-daemon"
+respawn_delay=2
+respawn_max=10
+respawn_period=60
+# Ambient capability, so the unprivileged process may bind port 53.
+capabilities="^cap_net_bind_service"
+no_new_privs="yes"
+error_logger="logger -t zinkhole -p daemon.info"
+
+extra_started_commands="reload stats"
+description_reload="Reload the configuration file"
+description_stats="Log query statistics"
+
+depend() {
+	need net
+	use logger
+	after firewall
+	provide dns
+}
+
+start_pre() {
+	if ! id "$zinkhole_user" >/dev/null 2>&1; then
+		ebegin "Creating user $zinkhole_user"
+		addgroup -S "$zinkhole_user" &&
+			adduser -S -D -H -h /var/empty -s /sbin/nologin -G "$zinkhole_user" "$zinkhole_user"
+		eend $? || return 1
+	fi
+	if [ ! -r "$zinkhole_config" ]; then
+		eerror "$zinkhole_config is missing (start from config.example.yaml)"
+		return 1
+	fi
+}
+
+reload() {
+	ebegin "Reloading $name configuration"
+	supervise-daemon "$RC_SVCNAME" --signal HUP
+	eend $?
+}
+
+stats() {
+	ebegin "Logging $name statistics"
+	supervise-daemon "$RC_SVCNAME" --signal USR1
+	eend $?
+}

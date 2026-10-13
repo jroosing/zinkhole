@@ -212,7 +212,7 @@ fn loadUrl(gpa: Allocator, client: *std.http.Client, url: []const u8, sink: *Sin
     const uri = std.Uri.parse(url) catch return error.InvalidUrl;
     var request = try client.request(.GET, uri, .{
         .keep_alive = false,
-        .headers = .{ .user_agent = .{ .override = "dnsblock" } },
+        .headers = .{ .user_agent = .{ .override = "zinkhole" } },
     });
     defer request.deinit();
     try request.sendBodiless();

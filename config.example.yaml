@@ -1,9 +1,9 @@
-# dnsblock configuration
+# zinkhole configuration
 #
 # Every setting except `upstream.servers` is optional; the values shown are the
 # defaults unless marked "example". Unknown keys are errors, so typos are caught.
-# Check a config without starting the server:  dnsblock --test -c config.yaml
-# Apply changes to a running server:            kill -HUP $(pidof dnsblock)
+# Check a config without starting the server:  zinkhole --test -c config.yaml
+# Apply changes to a running server:            kill -HUP $(pidof zinkhole)
 #   (server, upstream and cache changes need a restart)
 
 server:
@@ -73,11 +73,11 @@ blocking:
   lists:
     - https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts                      # example
     - https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/multi.txt       # example
-    # - /etc/dnsblock/my-blocklist.txt
+    # - /etc/zinkhole/my-blocklist.txt
 
   # Allowlists, same formats. An allowed name is never blocked.
   allowlists: []
-    # - /etc/dnsblock/my-allowlist.txt
+    # - /etc/zinkhole/my-allowlist.txt
 
   # Inline rules, in any list syntax.
   block: []

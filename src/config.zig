@@ -525,7 +525,7 @@ test "full configuration" {
         \\  refresh_hours: 12
         \\  lists:
         \\    - https://example.com/hosts.txt
-        \\    - /etc/dnsblock/local.txt
+        \\    - /etc/zinkhole/local.txt
         \\  block: ["ads.example.com", "||tracker.example^", "*.wild.example"]
         \\  allow: [ok.example.com]
         \\local:

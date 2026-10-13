@@ -1,25 +1,25 @@
-# Hardened systemd unit for dnsblock (tested on Debian 13 with systemd 257).
+# Hardened systemd unit for zinkhole (tested on Debian 13 with systemd 257).
 #
 # Install with `./deploy/install.sh`, or by hand:
-#   install -m 755 zig-out/bin/dnsblock /usr/local/bin/dnsblock
-#   install -m 644 -D config.example.yaml /etc/dnsblock/config.yaml
-#   install -m 644 deploy/dnsblock.service /etc/systemd/system/
-#   systemctl daemon-reload && systemctl enable --now dnsblock
+#   install -m 755 zig-out/bin/zinkhole /usr/local/bin/zinkhole
+#   install -m 644 -D config.example.yaml /etc/zinkhole/config.yaml
+#   install -m 644 deploy/zinkhole.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now zinkhole
 #
 # The service runs as a throwaway unprivileged user and may only bind port 53
 # (CAP_NET_BIND_SERVICE); the file system is read-only to it. The config file
 # must be readable by others (mode 644), as must any local list files.
-# `systemctl reload dnsblock` reloads the config; logs: journalctl -u dnsblock
+# `systemctl reload zinkhole` reloads the config; logs: journalctl -u zinkhole
 
 [Unit]
-Description=dnsblock DNS blocker and local DNS server
+Description=zinkhole DNS blocker and local DNS server
 After=network-online.target
 Wants=network-online.target
 Before=nss-lookup.target
 Wants=nss-lookup.target
 
 [Service]
-ExecStart=/usr/local/bin/dnsblock --config /etc/dnsblock/config.yaml
+ExecStart=/usr/local/bin/zinkhole --config /etc/zinkhole/config.yaml
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2

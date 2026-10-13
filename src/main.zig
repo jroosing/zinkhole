@@ -1,4 +1,4 @@
-//! dnsblock: a minimal DNS blocker and local DNS server for home networks.
+//! zinkhole: a minimal DNS blocker and local DNS server for home networks.
 //!
 //! Threads: worker threads answer queries (server.zig). The main thread loads
 //! the config, starts the server, then supervises: it reacts to signals and
@@ -32,7 +32,7 @@ pub const std_options: std.Options = .{
 };
 
 const version = "0.1.0";
-const default_config_path = "/etc/dnsblock/config.yaml";
+const default_config_path = "/etc/zinkhole/config.yaml";
 
 /// Answering queries needs little stack; TLS handshakes during list
 /// downloads need the most (measured: 256 KiB overflows in debug builds,
@@ -44,12 +44,12 @@ const list_load_timeout_s = 10 * 60;
 const min_retry_delay_s = 60;
 
 const usage =
-    \\Usage: dnsblock [options]
+    \\Usage: zinkhole [options]
     \\
     \\A minimal DNS blocker and local DNS server.
     \\
     \\Options:
-    \\  -c, --config <path>  configuration file (default: /etc/dnsblock/config.yaml)
+    \\  -c, --config <path>  configuration file (default: /etc/zinkhole/config.yaml)
     \\  -t, --test           check the configuration, load all lists, then exit
     \\  --healthcheck [addr] ask a running server (default 127.0.0.1:53) for
     \\                       "localhost"; exit 0 if it answers (for containers)
@@ -98,7 +98,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             printTo(io, .stdout(), usage, .{});
             return 0;
         } else if (eql(arg, "-V") or eql(arg, "--version")) {
-            printTo(io, .stdout(), "dnsblock {s}\n", .{version});
+            printTo(io, .stdout(), "zinkhole {s}\n", .{version});
             return 0;
         } else {
             printTo(io, .stderr(), "error: unknown option '{s}'\n\n" ++ usage, .{arg});
@@ -172,8 +172,8 @@ fn healthcheck(io: Io, target: []const u8) u8 {
 
 /// `--test`: validates the config and loads every list once.
 fn check(io: Io, gpa: Allocator, cfg: *const Config) !u8 {
-    const config_rules = try rules.Rules.create(io, gpa, cfg);
-    defer config_rules.destroy();
+    const config_policy = try rules.ConfigPolicy.create(io, gpa, cfg);
+    defer config_policy.destroy();
     const lists = rules.Lists.load(io, gpa, .fromConfig(cfg)) catch |err| switch (err) {
         error.OutOfMemory => |e| return e,
         error.Canceled => unreachable, // nothing cancels the main thread
@@ -215,14 +215,14 @@ fn run(io: Io, gpa: Allocator, config_path: []const u8, cfg: *Config) !void {
     // the background. This also lets this host resolve the list servers'
     // names through us while starting.
     const allow_clients = try arena.dupe(ip.Cidr, cfg.server.allow_clients);
-    const initial_rules = try rules.Rules.create(io, gpa, cfg);
+    const initial_policy = try rules.ConfigPolicy.create(io, gpa, cfg);
     const initial_lists = rules.Lists.createEmpty(io, gpa) catch |err| {
-        initial_rules.destroy();
+        initial_policy.destroy();
         return err;
     };
     var resolver: Resolver = .{
         .io = io,
-        .rules = initial_rules,
+        .policy = initial_policy,
         .lists = initial_lists,
         .cache = &cache,
         .upstream = &upstream,
@@ -231,7 +231,7 @@ fn run(io: Io, gpa: Allocator, config_path: []const u8, cfg: *Config) !void {
     };
     // Reloads swap these; destroy whatever is current at the end.
     defer {
-        resolver.rules.destroy();
+        resolver.policy.destroy();
         resolver.lists.destroy();
     }
 
@@ -251,7 +251,7 @@ fn run(io: Io, gpa: Allocator, config_path: []const u8, cfg: *Config) !void {
     defer app.deinit();
 
     signals.install();
-    log.info("dnsblock {s} ready ({d} upstream servers, {d} local records)", .{
+    log.info("zinkhole {s} ready ({d} upstream servers, {d} local records)", .{
         version, upstream.endpoints.len, cfg.local.records.len,
     });
     app.supervise();
@@ -381,12 +381,12 @@ const App = struct {
             }
             return;
         };
-        const new_rules = rules.Rules.create(app.io, app.gpa, &new_config) catch {
+        const new_policy = rules.ConfigPolicy.create(app.io, app.gpa, &new_config) catch {
             log.err("reload failed: out of memory", .{});
             new_config.deinit();
             return;
         };
-        app.resolver.swapRules(new_rules).destroy();
+        app.resolver.swapPolicy(new_policy).destroy();
         log_output.setLevel(new_config.log.level);
         app.resolver.log_queries.store(new_config.log.queries, .monotonic);
 

@@ -19,7 +19,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const exe = b.addExecutable(.{
-        .name = "dnsblock",
+        .name = "zinkhole",
         .root_module = root_module,
     });
     b.installArtifact(exe);
@@ -27,7 +27,7 @@ pub fn build(b: *std.Build) void {
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     run_cmd.addPassthruArgs();
-    const run_step = b.step("run", "Run dnsblock");
+    const run_step = b.step("run", "Run zinkhole");
     run_step.dependOn(&run_cmd.step);
 
     const tests = b.addTest(.{ .root_module = root_module });

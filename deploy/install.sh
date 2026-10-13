@@ -1,5 +1,5 @@
 #!/bin/sh
-# Installs dnsblock as a system service, using systemd (Debian, Ubuntu, ...)
+# Installs zinkhole as a system service, using systemd (Debian, Ubuntu, ...)
 # or OpenRC (Alpine). Run as root from the repository or release directory:
 #
 #   ./deploy/install.sh                  # detect the init system
@@ -7,16 +7,16 @@
 #   ./deploy/install.sh --uninstall      # remove service and binary, keep the config
 #
 # Options:
-#   --binary PATH   the dnsblock binary (default: zig-out/bin/dnsblock)
+#   --binary PATH   the zinkhole binary (default: zig-out/bin/zinkhole)
 #   --init NAME     systemd or openrc (default: detected)
 #
 # Running it again upgrades the binary and service file and restarts the
-# service. An existing /etc/dnsblock/config.yaml is never overwritten.
+# service. An existing /etc/zinkhole/config.yaml is never overwritten.
 
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-binary="$root/zig-out/bin/dnsblock"
+binary="$root/zig-out/bin/zinkhole"
 init=""
 action=install
 
@@ -63,14 +63,14 @@ fi
 case "$init" in
 systemd)
 	init_name=systemd
-	start="systemctl start dnsblock"
-	restart="systemctl restart dnsblock"
-	logs="journalctl -u dnsblock -f"
+	start="systemctl start zinkhole"
+	restart="systemctl restart zinkhole"
+	logs="journalctl -u zinkhole -f"
 	;;
 openrc)
 	init_name=OpenRC
-	start="rc-service dnsblock start"
-	restart="rc-service dnsblock restart"
+	start="rc-service zinkhole start"
+	restart="rc-service zinkhole restart"
 	logs="tail -f /var/log/messages"
 	;;
 *) die "--init must be systemd or openrc" ;;
@@ -91,63 +91,63 @@ install_ca_certificates() {
 	fi
 }
 
-install_dnsblock() {
+install_zinkhole() {
 	[ -x "$binary" ] || die "$binary not found; build it first: zig build --release -Dstrip=true"
 	install_ca_certificates
-	install -m 755 "$binary" /usr/local/bin/dnsblock
+	install -m 755 "$binary" /usr/local/bin/zinkhole
 
 	fresh_config=no
-	if [ ! -e /etc/dnsblock/config.yaml ]; then
-		install -d -m 755 /etc/dnsblock
-		install -m 644 "$root/config.example.yaml" /etc/dnsblock/config.yaml
+	if [ ! -e /etc/zinkhole/config.yaml ]; then
+		install -d -m 755 /etc/zinkhole
+		install -m 644 "$root/config.example.yaml" /etc/zinkhole/config.yaml
 		fresh_config=yes
 	fi
 
 	case "$init" in
 	systemd)
-		install -m 644 "$root/deploy/dnsblock.service" /etc/systemd/system/dnsblock.service
+		install -m 644 "$root/deploy/zinkhole.service" /etc/systemd/system/zinkhole.service
 		systemctl daemon-reload
-		systemctl enable dnsblock
+		systemctl enable zinkhole
 		;;
 	openrc)
-		install -m 755 "$root/deploy/openrc/dnsblock" /etc/init.d/dnsblock
-		rc-update add dnsblock default
+		install -m 755 "$root/deploy/openrc/zinkhole" /etc/init.d/zinkhole
+		rc-update add zinkhole default
 		;;
 	esac
 
 	if [ "$fresh_config" = yes ]; then
 		cat <<EOF
 
-dnsblock is installed as a service ($init_name) and starts at boot. Next:
-  1. Edit /etc/dnsblock/config.yaml: upstream servers, lists, local hostnames.
-  2. Check it:  dnsblock --test -c /etc/dnsblock/config.yaml
+zinkhole is installed as a service ($init_name) and starts at boot. Next:
+  1. Edit /etc/zinkhole/config.yaml: upstream servers, lists, local hostnames.
+  2. Check it:  zinkhole --test -c /etc/zinkhole/config.yaml
   3. Start it:  $start
   Logs:         $logs
 EOF
 	else
-		echo "Kept the existing /etc/dnsblock/config.yaml; restarting with the new binary."
+		echo "Kept the existing /etc/zinkhole/config.yaml; restarting with the new binary."
 		$restart
 	fi
 }
 
-uninstall_dnsblock() {
+uninstall_zinkhole() {
 	case "$init" in
 	systemd)
-		systemctl disable --now dnsblock 2>/dev/null || true
-		rm -f /etc/systemd/system/dnsblock.service
+		systemctl disable --now zinkhole 2>/dev/null || true
+		rm -f /etc/systemd/system/zinkhole.service
 		systemctl daemon-reload
 		;;
 	openrc)
-		rc-service dnsblock stop 2>/dev/null || true
-		rc-update del dnsblock default 2>/dev/null || true
-		rm -f /etc/init.d/dnsblock
+		rc-service zinkhole stop 2>/dev/null || true
+		rc-update del zinkhole default 2>/dev/null || true
+		rm -f /etc/init.d/zinkhole
 		;;
 	esac
-	rm -f /usr/local/bin/dnsblock
-	echo "Removed the dnsblock service and binary. Your configuration in /etc/dnsblock was kept."
+	rm -f /usr/local/bin/zinkhole
+	echo "Removed the zinkhole service and binary. Your configuration in /etc/zinkhole was kept."
 }
 
 case "$action" in
-install) install_dnsblock ;;
-uninstall) uninstall_dnsblock ;;
+install) install_zinkhole ;;
+uninstall) uninstall_zinkhole ;;
 esac

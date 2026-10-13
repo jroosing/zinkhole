@@ -7,7 +7,7 @@
 //!   5. cached answer                       -> cached answer
 //!   6. upstream servers                    -> forwarded answer (then cached)
 //!
-//! Steps 2-4 read the current `Rules` and `Lists` under a shared lock. A
+//! Steps 2-4 read the current `ConfigPolicy` and `Lists` under a shared lock. A
 //! reload or refresh takes the exclusive lock only to swap a pointer.
 
 const std = @import("std");
@@ -19,7 +19,7 @@ const ip = @import("ip.zig");
 const local = @import("local.zig");
 const Cache = @import("cache.zig").Cache;
 const Upstream = @import("upstream.zig").Upstream;
-const Rules = @import("rules.zig").Rules;
+const ConfigPolicy = @import("rules.zig").ConfigPolicy;
 const Lists = @import("rules.zig").Lists;
 
 const log = std.log.scoped(.query);
@@ -35,7 +35,7 @@ const firefox_doh_canary = "use-application-dns.net";
 pub const Resolver = struct {
     io: Io,
     lock: Io.RwLock = .init,
-    rules: *Rules,
+    policy: *ConfigPolicy,
     lists: *Lists,
     cache: *Cache,
     upstream: *Upstream,
@@ -93,27 +93,27 @@ pub const Resolver = struct {
         policy: {
             r.lock.lockSharedUncancelable(r.io);
             defer r.lock.unlockShared(r.io);
-            const rules = r.rules;
+            const policy = r.policy;
 
-            if (rules.local.lookup(q.name)) |addresses| {
-                return .{ .local, r.addressAnswer(out, msg, q, addresses, rules.local_ttl, true) };
+            if (policy.local.lookup(q.name)) |addresses| {
+                return .{ .local, r.addressAnswer(out, msg, q, addresses, policy.local_ttl, true) };
             }
             if (q.qtype == .ptr) {
-                if (rules.local.reverseLookup(q.name)) |host| {
-                    return .{ .local, r.respond(out, msg, q, .{ .answers = &.{.{ .ptr = host }}, .ttl = rules.local_ttl, .authoritative = true }) };
+                if (policy.local.reverseLookup(q.name)) |host| {
+                    return .{ .local, r.respond(out, msg, q, .{ .answers = &.{.{ .ptr = host }}, .ttl = policy.local_ttl, .authoritative = true }) };
                 }
             }
             if (std.mem.eql(u8, q.name, firefox_doh_canary)) {
                 return .{ .blocked, r.respond(out, msg, q, .{ .rcode = .nxdomain }) };
             }
             if (r.isBlocked(q.name)) {
-                const response = switch (rules.block_response) {
+                const response = switch (policy.block_response) {
                     .nxdomain => r.respond(out, msg, q, .{ .rcode = .nxdomain }),
-                    .zero => r.addressAnswer(out, msg, q, .{ .v4 = &.{@splat(0)}, .v6 = &.{@splat(0)} }, rules.block_ttl, false),
+                    .zero => r.addressAnswer(out, msg, q, .{ .v4 = &.{@splat(0)}, .v6 = &.{@splat(0)} }, policy.block_ttl, false),
                 };
                 return .{ .blocked, response };
             }
-            if (!rules.forward_private and rules.local.isPrivate(q.name)) {
+            if (!policy.forward_private and policy.local.isPrivate(q.name)) {
                 return .{ .private, r.respond(out, msg, q, .{ .rcode = .nxdomain }) };
             }
             break :policy;
@@ -132,8 +132,8 @@ pub const Resolver = struct {
     /// Blocked unless an allow rule (inline or from a list) also matches.
     /// Caller holds the lock.
     fn isBlocked(r: *const Resolver, name: []const u8) bool {
-        const blocked = r.rules.block.matches(name) or r.lists.block.matches(name);
-        return blocked and !(r.rules.allow.matches(name) or r.lists.allow.matches(name));
+        const blocked = r.policy.block.matches(name) or r.lists.block.matches(name);
+        return blocked and !(r.policy.allow.matches(name) or r.lists.allow.matches(name));
     }
 
     /// A/AAAA records of `addresses` that match the question type; other
@@ -162,11 +162,11 @@ pub const Resolver = struct {
             dns.writeHeaderOnly(out, msg, .servfail).?;
     }
 
-    pub fn swapRules(r: *Resolver, rules: *Rules) *Rules {
+    pub fn swapPolicy(r: *Resolver, policy: *ConfigPolicy) *ConfigPolicy {
         r.lock.lockUncancelable(r.io);
         defer r.lock.unlock(r.io);
-        const old = r.rules;
-        r.rules = rules;
+        const old = r.policy;
+        r.policy = policy;
         return old;
     }
 

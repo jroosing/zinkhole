@@ -1,21 +1,21 @@
-# dnsblock with Docker Compose.
+# zinkhole with Docker Compose.
 #
 #   cp config.example.yaml config.yaml      # then edit it
 #   docker compose up -d --build
 #   dig @127.0.0.1 example.com
 #
-#   docker compose kill -s HUP dnsblock     # reload config.yaml
-#   docker compose kill -s USR1 dnsblock    # log statistics (see `docker compose logs`)
+#   docker compose kill -s HUP zinkhole     # reload config.yaml
+#   docker compose kill -s USR1 zinkhole    # log statistics (see `docker compose logs`)
 #
 # With these port mappings Docker keeps the address of clients on your LAN,
 # so `server.allow_clients` and the query log see real addresses (queries from
 # the Docker host itself show up from Docker's bridge address).
 
 services:
-  dnsblock:
+  zinkhole:
     build: .
-    image: dnsblock:latest
-    container_name: dnsblock
+    image: zinkhole:latest
+    container_name: zinkhole
     restart: unless-stopped
     ports:
       # Port 53 may already be taken on the host (e.g. by systemd-resolved);
@@ -23,10 +23,10 @@ services:
       - "53:53/udp"
       - "53:53/tcp"
     volumes:
-      - ./config.yaml:/etc/dnsblock/config.yaml:ro
-    # The healthcheck comes from the image (dnsblock --healthcheck).
+      - ./config.yaml:/etc/zinkhole/config.yaml:ro
+    # The healthcheck comes from the image (zinkhole --healthcheck).
 
-    # Hardening: dnsblock writes nothing, needs no capabilities and runs as
+    # Hardening: zinkhole writes nothing, needs no capabilities and runs as
     # an unprivileged user.
     read_only: true
     cap_drop: [ALL]
