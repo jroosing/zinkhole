@@ -173,11 +173,12 @@ so clients cannot get around a block through HTTPS/SVCB records.
 
 | File | Responsibility |
 |------|----------------|
-| `main.zig` | CLI, startup, signals, background list refresh scheduling |
+| `main.zig` | CLI, startup, signals, running list loads in the background |
 | `config.zig`, `yaml.zig` | YAML subset parser and validated, typed config |
 | `server.zig`, `tcp.zig` | UDP/TCP listeners, fixed worker pool, TCP framing with deadlines |
 | `resolver.zig` | The query pipeline above, statistics, query log |
 | `policy.zig` | `Policy`: steps 2-4 of the pipeline, over the config's rules (rebuilt on reload) and `Lists` (downloaded) |
+| `refresh.zig` | When lists load: refresh interval, retry backoff, timeouts |
 | `domain_set.zig` | Compact domain set with subdomain matching |
 | `blocklist.zig` | Line parser for all list formats, streaming loader (file/HTTPS) |
 | `local.zig` | Local records, wildcards, reverse lookups, private zones |
@@ -216,7 +217,8 @@ and inline rules while lists download in the background. This also lets the
 host resolve the list servers' names through zinkhole itself. Lists are
 streamed line by line, never held in memory as a whole, and capped at 64 MiB
 each. If a refresh fails partway, the previous complete lists stay in use and
-the refresh is retried with exponential backoff.
+the refresh is retried with exponential backoff. After a reload that changes
+the lists, the new ones are used right away, even if some of them failed.
 
 ## Security
 

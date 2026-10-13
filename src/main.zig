@@ -18,6 +18,7 @@ const log_output = @import("log.zig");
 const Policy = @import("policy.zig").Policy;
 const Lists = @import("policy.zig").Lists;
 const Sources = @import("policy.zig").Sources;
+const Schedule = @import("refresh.zig").Schedule;
 const Cache = @import("cache.zig").Cache;
 const Resolver = @import("resolver.zig").Resolver;
 const Server = @import("server.zig").Server;
@@ -40,10 +41,6 @@ const default_config_path = "/etc/zinkhole/config.yaml";
 /// downloads need the most (measured: 256 KiB overflows in debug builds,
 /// 512 KiB suffices). Only touched pages consume memory.
 const thread_stack_size = 1024 * 1024;
-/// A list download running longer than this is canceled and retried.
-const list_load_timeout_s = 10 * 60;
-/// First retry after a failed list download; doubles up to the refresh interval.
-const min_retry_delay_s = 60;
 
 const usage =
     \\Usage: zinkhole [options]
@@ -251,9 +248,8 @@ fn run(io: Io, gpa: Allocator, config_path: []const u8, cfg: *Config) !void {
     app.supervise();
 }
 
-const LoadResult = enum { complete, partial, failed };
-
-/// State of the supervising main thread.
+/// State of the supervising main thread. It runs the list loads; the
+/// Refresh schedule decides when.
 const App = struct {
     io: Io,
     gpa: Allocator,
@@ -262,18 +258,14 @@ const App = struct {
     config: *Config,
     policy: *Policy,
     resolver: *Resolver,
+    schedule: Schedule = .{},
 
-    /// The running list download, if any.
-    task: ?Io.Future(Io.Cancelable!LoadResult) = null,
+    /// The running list load, if any. It returns the lists (null when it ran
+    /// out of memory); the supervisor decides whether they are used.
+    task: ?Io.Future(Io.Cancelable!?*Lists) = null,
     task_done: std.atomic.Value(bool) = .init(false),
-    task_started: i64 = 0,
     /// Holds the running task's copy of the list sources.
     task_arena: std.heap.ArenaAllocator,
-    /// A reload changed the sources while a task was running.
-    sources_changed: bool = false,
-    /// When to load the lists next (boot-clock seconds); 0 means now.
-    next_load: i64 = 0,
-    retry_delay: i64 = min_retry_delay_s,
 
     fn deinit(app: *App) void {
         app.task_arena.deinit();
@@ -288,7 +280,7 @@ const App = struct {
         }
         log.info("shutting down", .{});
         if (app.task) |*task| {
-            _ = task.cancel(app.io) catch {};
+            discardLoad(task.cancel(app.io));
             app.task = null;
         }
     }
@@ -297,14 +289,17 @@ const App = struct {
         const now = nowSeconds(app.io);
         if (app.task) |*task| {
             if (app.task_done.load(.acquire)) {
-                app.finishTask(task.await(app.io) catch .failed, now);
-            } else if (now - app.task_started > list_load_timeout_s) {
-                log.err("loading lists took longer than {d} minutes, canceled", .{list_load_timeout_s / 60});
-                _ = task.cancel(app.io) catch {};
-                app.finishTask(.failed, now);
+                const lists = task.await(app.io) catch null; // only `cancel` cancels it
+                app.task = null;
+                app.finishLoad(now, lists);
             }
-        } else if (now >= app.next_load) {
-            app.startTask(now);
+        }
+        const refresh_hours = app.config.blocking.refresh_hours;
+        const interval: ?i64 = if (refresh_hours == 0) null else @as(i64, refresh_hours) * 3600;
+        switch (app.schedule.next(now, interval)) {
+            .idle => {},
+            .start => app.startTask(now),
+            .cancel => app.cancelTask(now),
         }
     }
 
@@ -312,57 +307,49 @@ const App = struct {
         _ = app.task_arena.reset(.retain_capacity);
         const sources = Sources.fromConfig(app.config).dupe(app.task_arena.allocator()) catch {
             log.err("out of memory, cannot load lists", .{});
-            app.next_load = now + min_retry_delay_s;
-            return;
+            return app.schedule.finished(now, false);
         };
         app.task_done.store(false, .release);
         app.task = app.io.concurrent(loadLists, .{ app, sources }) catch |err| {
             log.err("cannot start loading lists: {t}", .{err});
-            app.next_load = now + min_retry_delay_s;
-            return;
+            return app.schedule.finished(now, false);
         };
-        app.task_started = now;
-        app.sources_changed = false;
+        app.schedule.started(now);
     }
 
-    fn finishTask(app: *App, result: LoadResult, now: i64) void {
-        app.task = null;
-        if (app.sources_changed) {
-            app.next_load = now;
-            return;
+    /// Lists the canceled task may already have loaded are not used.
+    fn cancelTask(app: *App, now: i64) void {
+        if (app.task) |*task| {
+            discardLoad(task.cancel(app.io));
+            app.task = null;
         }
-        const refresh_s: ?i64 = if (app.config.blocking.refresh_hours == 0) null else @as(i64, app.config.blocking.refresh_hours) * 3600;
-        switch (result) {
-            .complete => {
-                app.retry_delay = min_retry_delay_s;
-                app.next_load = if (refresh_s) |s| now + s else std.math.maxInt(i64);
-            },
-            .partial, .failed => {
-                log.info("retrying the lists in {d} minutes", .{@divTrunc(app.retry_delay + 59, 60)});
-                app.next_load = now + app.retry_delay;
-                app.retry_delay = @min(app.retry_delay * 2, refresh_s orelse 24 * 3600);
-            },
-        }
+        app.schedule.finished(now, false);
     }
 
-    /// Runs as a background task: loads the lists and swaps them in.
-    fn loadLists(app: *App, sources: Sources) Io.Cancelable!LoadResult {
+    fn finishLoad(app: *App, now: i64, loaded: ?*Lists) void {
+        const lists = loaded orelse return app.schedule.finished(now, false);
+        const complete = lists.complete;
+        if (app.policy.replaceLists(lists) == .kept) {
+            log.warn("some lists failed to load, keeping the previous lists", .{});
+        }
+        app.schedule.finished(now, complete);
+    }
+
+    /// Runs as a background task: loads the lists, nothing else.
+    fn loadLists(app: *App, sources: Sources) Io.Cancelable!?*Lists {
         defer app.task_done.store(true, .release);
-        const lists = Lists.load(app.io, app.gpa, sources) catch |err| switch (err) {
+        return Lists.load(app.io, app.gpa, sources) catch |err| switch (err) {
             error.Canceled => |e| return e,
             error.OutOfMemory => {
                 log.err("out of memory while loading lists, keeping the previous lists", .{});
-                return .failed;
+                return null;
             },
         };
-        const complete = lists.complete;
-        switch (app.policy.replaceLists(lists)) {
-            .kept => {
-                log.warn("some lists failed to load, keeping the previous lists", .{});
-                return .partial;
-            },
-            .replaced => return if (complete) .complete else .partial,
-        }
+    }
+
+    fn discardLoad(result: Io.Cancelable!?*Lists) void {
+        const loaded = result catch return;
+        if (loaded) |lists| lists.destroy();
     }
 
     fn reload(app: *App) void {
@@ -384,10 +371,7 @@ const App = struct {
         log_output.setLevel(new_config.log.level);
         app.resolver.log_queries.store(new_config.log.queries, .monotonic);
 
-        if (!Sources.fromConfig(&new_config).eql(.fromConfig(app.config))) {
-            app.sources_changed = true;
-            if (app.task == null) app.next_load = 0;
-        }
+        if (!Sources.fromConfig(&new_config).eql(.fromConfig(app.config))) app.schedule.sourcesChanged();
         app.config.deinit();
         app.config.* = new_config;
         log.info("configuration reloaded (server, upstream and cache settings apply after a restart)", .{});
@@ -456,6 +440,7 @@ test {
     _ = @import("cache.zig");
     _ = @import("config.zig");
     _ = @import("policy.zig");
+    _ = @import("refresh.zig");
     _ = @import("resolver.zig");
     _ = @import("upstream.zig");
     _ = @import("dot.zig");

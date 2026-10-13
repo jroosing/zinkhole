@@ -58,7 +58,8 @@ pub const Config = struct {
     pub const Blocking = struct {
         response: BlockResponse = .zero,
         ttl: u32 = 300,
-        /// Reload lists this often; 0 loads them only at start and on SIGHUP.
+        /// Download the lists again this often; 0 means only at start, and when a
+        /// reload changes the lists.
         refresh_hours: u32 = 24,
         /// Blocklist URLs or file paths.
         lists: []const []const u8 = &.{},

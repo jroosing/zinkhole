@@ -64,7 +64,8 @@ blocking:
   response: zero
   # TTL of blocked answers (seconds).
   ttl: 300
-  # Download the lists again this often; 0 means only at start and on reload.
+  # Download the lists again this often; 0 means only at start, and when a
+  # reload changes the lists.
   refresh_hours: 24
 
   # Blocklists: http(s) URLs or file paths. Formats are detected per line:
