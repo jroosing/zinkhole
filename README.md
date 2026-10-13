@@ -47,6 +47,38 @@ zig build --release -Dtarget=arm-linux-musleabihf -Dstrip=true # Raspberry Pi 32
 Linux builds are static binaries of about 1 MB (`-Dstrip=true` drops the
 debug info, which costs disk space only, not memory).
 
+### Releasing
+
+A release is a tag; GitLab CI does the rest (see [.gitlab-ci.yml](.gitlab-ci.yml)
+and [docs/adr/0003](docs/adr/0003-proxmox-install-and-update.md)). The version
+lives only in `build.zig.zon`: `zinkhole --version` is built from it.
+
+```sh
+# 1. Bump `.version` in build.zig.zon (e.g. "0.2.0"), update docs if needed, commit.
+zig build test && zig fmt --check src build.zig   # what CI runs first
+# 2. Tag exactly v<version> and push the tag.
+git tag v0.2.0 && git push origin main v0.2.0
+```
+
+On a `v*` tag the pipeline runs the tests, **fails if the tag does not match
+`build.zig.zon`**, builds static `x86_64-linux-musl` and `aarch64-linux-musl`
+binaries, writes `SHA256SUMS`, and publishes everything as a public GitLab
+release. Downloads then work without a login, at stable links:
+
+```
+https://gitlab.com/kyura4k/zinkhole/-/releases/permalink/latest/downloads/zinkhole-x86_64-linux-musl
+https://gitlab.com/kyura4k/zinkhole/-/releases/permalink/latest/downloads/SHA256SUMS
+```
+
+- The project and its releases must be **public**, or the installers and the
+  `update` command cannot download them.
+- A tag that went wrong cannot be fixed in place: delete the release and the
+  tag on GitLab, correct the problem, and tag again.
+- To try the release steps without GitLab, run `sh deploy/ci/release.sh build`
+  (needs Zig) and `sh deploy/ci/release.sh publish --dry-run`; the files land
+  in `dist/`. `deploy/ci/install-zig.sh` installs the pinned Zig in an Alpine
+  container, so the whole pipeline can be rehearsed there.
+
 ## Run
 
 Try it in the foreground first (port 53 needs privileges, so pick another
