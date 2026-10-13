@@ -184,64 +184,6 @@ fn parseOctet(text: []const u8) ?u8 {
 
 const testing = std.testing;
 
-fn testZone(records: []const Record) !LocalZone {
-    return LocalZone.init(testing.allocator, records, 99);
-}
-
-test "exact, wildcard and reverse lookups" {
-    var zone = try testZone(&.{
-        .{ .name = "nas.lan", .wildcard = false, .addresses = &.{ Ip.parse("192.168.1.10").?, Ip.parse("fd00::10").? } },
-        .{ .name = "media.lan", .wildcard = false, .addresses = &.{Ip.parse("192.168.1.10").?} },
-        .{ .name = "apps.lan", .wildcard = true, .addresses = &.{Ip.parse("192.168.1.20").?} },
-        .{ .name = "special.apps.lan", .wildcard = false, .addresses = &.{Ip.parse("192.168.1.30").?} },
-    });
-    defer zone.deinit();
-
-    const nas = zone.lookup("nas.lan").?;
-    try testing.expectEqual(1, nas.v4.len);
-    try testing.expectEqual(1, nas.v6.len);
-    try testing.expectEqualSlices(u8, &.{ 192, 168, 1, 10 }, &nas.v4[0]);
-
-    try testing.expectEqualSlices(u8, &.{ 192, 168, 1, 20 }, &zone.lookup("grafana.apps.lan").?.v4[0]);
-    try testing.expectEqualSlices(u8, &.{ 192, 168, 1, 20 }, &zone.lookup("a.b.apps.lan").?.v4[0]);
-    try testing.expectEqualSlices(u8, &.{ 192, 168, 1, 30 }, &zone.lookup("special.apps.lan").?.v4[0]);
-    try testing.expectEqual(null, zone.lookup("apps.lan"));
-    try testing.expectEqual(null, zone.lookup("other.lan"));
-
-    // The first name configured for an address wins.
-    try testing.expectEqualStrings("nas.lan", zone.reverseLookup("10.1.168.192.in-addr.arpa").?);
-    try testing.expectEqualStrings("nas.lan", zone.reverseLookup("0.1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.d.f.ip6.arpa").?);
-    try testing.expectEqual(null, zone.reverseLookup("11.1.168.192.in-addr.arpa"));
-}
-
-test "localhost is built in but can be overridden" {
-    var zone = try testZone(&.{});
-    defer zone.deinit();
-    try testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &zone.lookup("localhost").?.v4[0]);
-    try testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &zone.lookup("app.localhost").?.v4[0]);
-    try testing.expectEqualStrings("localhost", zone.reverseLookup("1.0.0.127.in-addr.arpa").?);
-
-    var custom = try testZone(&.{.{ .name = "localhost", .wildcard = false, .addresses = &.{Ip.parse("127.0.0.2").?} }});
-    defer custom.deinit();
-    try testing.expectEqualSlices(u8, &.{ 127, 0, 0, 2 }, &custom.lookup("localhost").?.v4[0]);
-}
-
-test "private names" {
-    var zone = try testZone(&.{});
-    defer zone.deinit();
-    try testing.expect(zone.isPrivate("printer"));
-    try testing.expect(zone.isPrivate("nas.lan"));
-    try testing.expect(zone.isPrivate("router.home.arpa"));
-    try testing.expect(zone.isPrivate("1.1.168.192.in-addr.arpa"));
-    try testing.expect(zone.isPrivate("1.0.20.172.in-addr.arpa"));
-    try testing.expect(zone.isPrivate("1.0.100.100.in-addr.arpa"));
-    try testing.expect(!zone.isPrivate("1.0.32.172.in-addr.arpa"));
-    try testing.expect(!zone.isPrivate("8.8.8.8.in-addr.arpa"));
-    try testing.expect(!zone.isPrivate("example.com"));
-    try testing.expect(!zone.isPrivate("planet.com"));
-    try testing.expect(!zone.isPrivate(""));
-}
-
 test "parseReverseName" {
     try testing.expectEqual(Ip{ .v4 = .{ 192, 168, 1, 10 } }, parseReverseName("10.1.168.192.in-addr.arpa").?);
     try testing.expectEqual(null, parseReverseName("1.168.192.in-addr.arpa"));

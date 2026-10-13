@@ -565,7 +565,7 @@ fn repeat(comptime c: u8, comptime n: usize) [n]u8 {
 }
 
 /// Builds a query for tests: header, one question, optional OPT record.
-fn testQuery(buf: []u8, id: u16, name: []const u8, qtype: Type, edns_size: ?u16) []u8 {
+pub fn testQuery(buf: []u8, id: u16, name: []const u8, qtype: Type, edns_size: ?u16) []u8 {
     var b: Builder = .{ .buf = buf };
     b.int(u16, id) catch unreachable;
     b.int(u16, 0x0100) catch unreachable; // RD

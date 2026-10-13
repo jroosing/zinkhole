@@ -177,7 +177,7 @@ so clients cannot get around a block through HTTPS/SVCB records.
 | `config.zig`, `yaml.zig` | YAML subset parser and validated, typed config |
 | `server.zig`, `tcp.zig` | UDP/TCP listeners, fixed worker pool, TCP framing with deadlines |
 | `resolver.zig` | The query pipeline above, statistics, query log |
-| `rules.zig` | `ConfigPolicy` (from config, rebuilt on reload) and `Lists` (downloaded) |
+| `policy.zig` | `Policy`: steps 2-4 of the pipeline, over the config's rules (rebuilt on reload) and `Lists` (downloaded) |
 | `domain_set.zig` | Compact domain set with subdomain matching |
 | `blocklist.zig` | Line parser for all list formats, streaming loader (file/HTTPS) |
 | `local.zig` | Local records, wildcards, reverse lookups, private zones |

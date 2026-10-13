@@ -15,7 +15,9 @@ const dns = @import("dns.zig");
 const ip = @import("ip.zig");
 const tcp = @import("tcp.zig");
 const log_output = @import("log.zig");
-const rules = @import("rules.zig");
+const Policy = @import("policy.zig").Policy;
+const Lists = @import("policy.zig").Lists;
+const Sources = @import("policy.zig").Sources;
 const Cache = @import("cache.zig").Cache;
 const Resolver = @import("resolver.zig").Resolver;
 const Server = @import("server.zig").Server;
@@ -172,9 +174,9 @@ fn healthcheck(io: Io, target: []const u8) u8 {
 
 /// `--test`: validates the config and loads every list once.
 fn check(io: Io, gpa: Allocator, cfg: *const Config) !u8 {
-    const config_policy = try rules.ConfigPolicy.create(io, gpa, cfg);
-    defer config_policy.destroy();
-    const lists = rules.Lists.load(io, gpa, .fromConfig(cfg)) catch |err| switch (err) {
+    var policy: Policy = try .init(io, gpa, cfg);
+    defer policy.deinit();
+    const lists = Lists.load(io, gpa, .fromConfig(cfg)) catch |err| switch (err) {
         error.OutOfMemory => |e| return e,
         error.Canceled => unreachable, // nothing cancels the main thread
     };
@@ -215,25 +217,16 @@ fn run(io: Io, gpa: Allocator, config_path: []const u8, cfg: *Config) !void {
     // the background. This also lets this host resolve the list servers'
     // names through us while starting.
     const allow_clients = try arena.dupe(ip.Cidr, cfg.server.allow_clients);
-    const initial_policy = try rules.ConfigPolicy.create(io, gpa, cfg);
-    const initial_lists = rules.Lists.createEmpty(io, gpa) catch |err| {
-        initial_policy.destroy();
-        return err;
-    };
+    var policy: Policy = try .init(io, gpa, cfg);
+    defer policy.deinit();
     var resolver: Resolver = .{
         .io = io,
-        .policy = initial_policy,
-        .lists = initial_lists,
+        .policy = &policy,
         .cache = &cache,
         .upstream = &upstream,
         .allow_clients = allow_clients,
         .log_queries = .init(cfg.log.queries),
     };
-    // Reloads swap these; destroy whatever is current at the end.
-    defer {
-        resolver.policy.destroy();
-        resolver.lists.destroy();
-    }
 
     var server: Server = .{ .io = io, .gpa = gpa, .resolver = &resolver };
     defer server.deinit();
@@ -245,6 +238,7 @@ fn run(io: Io, gpa: Allocator, config_path: []const u8, cfg: *Config) !void {
         .gpa = gpa,
         .config_path = config_path,
         .config = cfg,
+        .policy = &policy,
         .resolver = &resolver,
         .task_arena = .init(gpa),
     };
@@ -266,6 +260,7 @@ const App = struct {
     config_path: []const u8,
     /// The configuration as last loaded; a reload replaces it in place.
     config: *Config,
+    policy: *Policy,
     resolver: *Resolver,
 
     /// The running list download, if any.
@@ -315,7 +310,7 @@ const App = struct {
 
     fn startTask(app: *App, now: i64) void {
         _ = app.task_arena.reset(.retain_capacity);
-        const sources = rules.Sources.fromConfig(app.config).dupe(app.task_arena.allocator()) catch {
+        const sources = Sources.fromConfig(app.config).dupe(app.task_arena.allocator()) catch {
             log.err("out of memory, cannot load lists", .{});
             app.next_load = now + min_retry_delay_s;
             return;
@@ -351,23 +346,23 @@ const App = struct {
     }
 
     /// Runs as a background task: loads the lists and swaps them in.
-    fn loadLists(app: *App, sources: rules.Sources) Io.Cancelable!LoadResult {
+    fn loadLists(app: *App, sources: Sources) Io.Cancelable!LoadResult {
         defer app.task_done.store(true, .release);
-        const lists = rules.Lists.load(app.io, app.gpa, sources) catch |err| switch (err) {
+        const lists = Lists.load(app.io, app.gpa, sources) catch |err| switch (err) {
             error.Canceled => |e| return e,
             error.OutOfMemory => {
                 log.err("out of memory while loading lists, keeping the previous lists", .{});
                 return .failed;
             },
         };
-        // Never replace complete lists with partial ones.
-        if (!lists.complete and app.resolver.listsComplete()) {
-            log.warn("some lists failed to load, keeping the previous lists", .{});
-            lists.destroy();
-            return .partial;
+        const complete = lists.complete;
+        switch (app.policy.replaceLists(lists)) {
+            .kept => {
+                log.warn("some lists failed to load, keeping the previous lists", .{});
+                return .partial;
+            },
+            .replaced => return if (complete) .complete else .partial,
         }
-        app.resolver.swapLists(lists).destroy();
-        return if (lists.complete) .complete else .partial;
     }
 
     fn reload(app: *App) void {
@@ -381,16 +376,15 @@ const App = struct {
             }
             return;
         };
-        const new_policy = rules.ConfigPolicy.create(app.io, app.gpa, &new_config) catch {
+        app.policy.applyConfig(&new_config) catch {
             log.err("reload failed: out of memory", .{});
             new_config.deinit();
             return;
         };
-        app.resolver.swapPolicy(new_policy).destroy();
         log_output.setLevel(new_config.log.level);
         app.resolver.log_queries.store(new_config.log.queries, .monotonic);
 
-        if (!rules.Sources.fromConfig(&new_config).eql(.fromConfig(app.config))) {
+        if (!Sources.fromConfig(&new_config).eql(.fromConfig(app.config))) {
             app.sources_changed = true;
             if (app.task == null) app.next_load = 0;
         }
@@ -461,7 +455,7 @@ test {
     _ = @import("local.zig");
     _ = @import("cache.zig");
     _ = @import("config.zig");
-    _ = @import("rules.zig");
+    _ = @import("policy.zig");
     _ = @import("resolver.zig");
     _ = @import("upstream.zig");
     _ = @import("dot.zig");
