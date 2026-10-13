@@ -314,24 +314,7 @@ const testing = std.testing;
 
 const test_secret = "0123456789abcdef0123456789abcdef";
 
-/// Turns a test that hangs into one that fails: panics if still running
-/// after `seconds`, unless stopped first.
-const Watchdog = struct {
-    future: Io.Future(void),
-
-    fn start(seconds: i64) !Watchdog {
-        return .{ .future = try testing.io.concurrent(bark, .{seconds}) };
-    }
-
-    fn stop(watchdog: *Watchdog) void {
-        watchdog.future.cancel(testing.io);
-    }
-
-    fn bark(seconds: i64) void {
-        testing.io.sleep(.fromSeconds(seconds), .awake) catch return; // stopped in time
-        @panic("test timed out (watchdog)");
-    }
-};
+const Watchdog = @import("test_watchdog.zig").Watchdog;
 const loopback_clients = [_]ip.Cidr{ip.Cidr.parse("127.0.0.0/8").?};
 
 /// `fetch` with a client of its own.

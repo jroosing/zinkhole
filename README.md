@@ -527,6 +527,7 @@ so clients cannot get around a block through HTTPS/SVCB records.
 | `main.zig` | CLI, startup, signals, running list loads in the background |
 | `config.zig`, `yaml.zig` | YAML subset parser and validated, typed config |
 | `server.zig`, `tcp.zig` | UDP/TCP listeners, fixed worker pool, TCP framing with deadlines |
+| `forwarder.zig` | The forwarding slots: cache misses go to upstream servers without holding up a worker |
 | `resolver.zig` | The query pipeline above, statistics, query log |
 | `policy.zig` | `Policy`: steps 2-4 of the pipeline (local, blocked, private), from the config (rebuilt on reload) and the downloaded `Lists` |
 | `refresh.zig` | When lists load: refresh interval, retry backoff, timeouts |
@@ -555,9 +556,17 @@ query name and walks up its parent domains (`a.b.example.com`,
 with no allocation. 255,000 domains take about 8 MB (~31 bytes each). Each set
 uses a random hash seed, so list content cannot be crafted to degrade it.
 
-**Threads and memory.** Each worker thread owns one fixed query buffer and
-one fixed response buffer, so answering a query allocates nothing; only cache
-insertions do, and the cache has a fixed capacity. The config policy and
+**Threads and memory.** A UDP worker answers refusals, local records, blocked
+and private names, and cache hits itself. A cache miss goes to one of a fixed
+pool of forwarding slots (`upstream.max_in_flight`, 64 by default), and the
+worker goes back to receiving at once, so a slow upstream server never holds
+up an answer that needs none. When every slot is busy, workers wait for one.
+Each worker and slot owns one fixed query buffer and one fixed response
+buffer, so answering a query allocates nothing; only cache insertions do, and
+the cache has a fixed capacity. On one CPU this answers about 340,000
+blocked or cached queries a second, and 50 new names at once in the time of
+one upstream round trip (measured with a 20 ms upstream; see
+[docs/adr/0005](docs/adr/0005-forward-from-a-pool-of-slots.md)). The config policy and
 lists are immutable once built; a reload builds new ones on the side and
 swaps a pointer under a read-write lock that queries hold only for the
 in-memory lookup, never during network I/O.
@@ -585,9 +594,9 @@ the lists, the new ones are used right away, even if some of them failed.
 - Built in ReleaseSafe: bounds and integer overflow checks stay on. Every
   length read from a DNS message is checked before use; malformed packets get
   `FORMERR` or are dropped. The parsers are tested against random and mutated
-  input, and an earlier version of the server (before the Policy, refresh and
-  sync code) was run under ThreadSanitizer with concurrent queries and
-  reloads. Pointer-stability locks make safe builds panic if a
+  input. The tests, including concurrent forwarding, shutdown in the middle of
+  exchanges, reloads and syncs, pass under ThreadSanitizer
+  (`zig build test -Dsanitize-thread`). Pointer-stability locks make safe builds panic if a
   buffer that other code points into (the listener sockets workers use, the
   domain bytes a hash table reads) could be reallocated.
 - Upstream queries can use DNS over TLS with certificate verification. For

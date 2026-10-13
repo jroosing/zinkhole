@@ -48,6 +48,8 @@ pub const Config = struct {
     pub const Upstream = struct {
         servers: []const upstream_mod.ServerAddress = &.{},
         timeout_ms: u32 = 2000,
+        /// Upstream queries in flight at once (the forwarding slots, ADR-0005).
+        max_in_flight: u16 = 64,
     };
 
     pub const Cache = struct {
@@ -337,6 +339,8 @@ const Decoder = struct {
                 upstream.servers = try d.upstreamServers(pair);
             } else if (is(pair, "timeout_ms")) {
                 upstream.timeout_ms = try d.integer(u32, pair, 100, 30_000);
+            } else if (is(pair, "max_in_flight")) {
+                upstream.max_in_flight = try d.integer(u16, pair, 1, 1024);
             } else {
                 return d.unknownKey(pair, "upstream");
             }
@@ -849,6 +853,20 @@ test "sync configuration errors" {
     try expectConfigError(base ++ "sync:\n  origin: ftp://10.0.0.1\n  secret: " ++ test_secret, 4, "http:// or https://");
     try expectConfigError(base ++ "sync:\n  secret: " ++ test_secret, 3, "either 'serve' (origin) or 'origin' (replica)");
     try expectConfigError(base ++ "blocking:\n  block: [ads.example]\nsync:\n  origin: http://10.0.0.1:5380\n  secret: " ++ test_secret, 3, "synced from the origin");
+}
+
+test "upstream.max_in_flight limits the upstream queries at once" {
+    var diag: Diagnostic = .{};
+    var config = try parse(testing.allocator, "upstream:\n  servers: [1.1.1.1]\n  max_in_flight: 16\n", &diag);
+    defer config.deinit();
+    try testing.expectEqual(16, config.upstream.max_in_flight);
+
+    var defaults = try parse(testing.allocator, "upstream:\n  servers: [1.1.1.1]\n", &diag);
+    defer defaults.deinit();
+    try testing.expectEqual(64, defaults.upstream.max_in_flight);
+
+    try expectConfigError("upstream:\n  servers: [1.1.1.1]\n  max_in_flight: 0", 3, "between 1 and 1024");
+    try expectConfigError("upstream:\n  servers: [1.1.1.1]\n  max_in_flight: 5000", 3, "between 1 and 1024");
 }
 
 test "the metrics section says where metrics are served" {

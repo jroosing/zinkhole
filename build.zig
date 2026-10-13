@@ -15,6 +15,9 @@ pub fn build(b: *std.Build) void {
     // it makes panic messages useful, so it is kept unless asked otherwise.
     const strip = b.option(bool, "strip", "Omit debug info from the binary") orelse false;
     const network = b.option(bool, "network", "Also run the tests that need the internet") orelse false;
+    // For checking the threads (workers, forwarding slots, list loads) for
+    // data races: `zig build test -Dsanitize-thread`.
+    const sanitize_thread = b.option(bool, "sanitize-thread", "Build with ThreadSanitizer") orelse false;
     const options = b.addOptions();
     options.addOption(bool, "network_tests", network);
     options.addOption([]const u8, "version", manifest.version);
@@ -24,6 +27,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .strip = strip,
+        .sanitize_thread = sanitize_thread,
     });
     root_module.addOptions("build_options", options);
 

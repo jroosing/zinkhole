@@ -38,32 +38,73 @@ pub const Resolver = struct {
     /// Counts each Outcome per hour, if set.
     metrics: ?*Metrics = null,
 
-    /// Answers one query. Returns the response (a slice of `out`), or null if
-    /// the message is not a query and must be dropped.
+    /// What `answerLocally` did with a query.
+    pub const Answer = union(enum) {
+        /// Not a query: send nothing.
+        drop,
+        /// The response, a slice of `out`.
+        response: []u8,
+        /// A cache miss: `forward` answers the same message.
+        upstream,
+    };
+
+    /// Answers one query, from start to finish. Returns the response (a slice
+    /// of `out`), or null if the message is not a query and must be dropped.
     pub fn handle(r: *Resolver, msg: []u8, out: []u8, client: net.IpAddress, transport: Transport) Io.Cancelable!?[]u8 {
+        const arrived = r.arrival();
+        return switch (r.answerLocally(msg, out, client, transport, arrived)) {
+            .drop => null,
+            .response => |response| response,
+            .upstream => try r.forward(msg, out, client, transport, arrived),
+        };
+    }
+
+    /// When a query arrived, for the query log; null while it is off.
+    pub fn arrival(r: *Resolver) ?Io.Clock.Timestamp {
+        return if (r.log_queries.load(.monotonic)) Io.Clock.Timestamp.now(r.io, .awake) else null;
+    }
+
+    /// Answers everything that needs no upstream server, which is all but
+    /// cache misses. Never waits for the network.
+    pub fn answerLocally(r: *Resolver, msg: []u8, out: []u8, client: net.IpAddress, transport: Transport, arrived: ?Io.Clock.Timestamp) Answer {
         var name_buf: [dns.max_name_len]u8 = undefined;
         const q = dns.parseQuery(msg, &name_buf) catch |err| {
             r.countOutcome(.invalid);
-            return switch (err) {
+            const response = switch (err) {
                 error.NotQuery => null,
                 error.NotImplemented => dns.writeHeaderOnly(out, msg, .notimp),
                 error.FormatError => dns.writeHeaderOnly(out, msg, .formerr),
                 error.Refused => dns.writeHeaderOnly(out, msg, .refused),
             };
+            return if (response) |bytes| .{ .response = bytes } else .drop;
         };
+        const outcome, const response = r.resolveLocally(msg, out, &q, client) orelse return .upstream;
+        return .{ .response = r.finish(msg, out, &q, client, transport, outcome, response, arrived) };
+    }
 
-        const log_query = r.log_queries.load(.monotonic);
-        const started = if (log_query) Io.Clock.Timestamp.now(r.io, .awake) else undefined;
+    /// Answers `msg`, for which `answerLocally` returned `.upstream`, from
+    /// the upstream servers. Rewrites `msg` (see `Upstream.forward`). Null
+    /// only if `msg` is no longer the query `answerLocally` saw.
+    pub fn forward(r: *Resolver, msg: []u8, out: []u8, client: net.IpAddress, transport: Transport, arrived: ?Io.Clock.Timestamp) Io.Cancelable!?[]u8 {
+        var name_buf: [dns.max_name_len]u8 = undefined;
+        // `answerLocally` parsed the same bytes, so this cannot fail; if it
+        // does anyway, the query is dropped rather than trusted.
+        const q = dns.parseQuery(msg, &name_buf) catch return null;
+        const outcome, const response = try r.resolveUpstream(msg, out, &q);
+        return r.finish(msg, out, &q, client, transport, outcome, response, arrived);
+    }
 
-        const outcome, var response = try r.resolve(msg, out, &q, client);
+    /// Truncates for UDP clients, counts the Outcome and logs the query.
+    fn finish(r: *Resolver, msg: []const u8, out: []u8, q: *const dns.Query, client: net.IpAddress, transport: Transport, outcome: Outcome, answer: []u8, arrived: ?Io.Clock.Timestamp) []u8 {
+        var response = answer;
         if (transport == .udp and response.len > q.maxUdpSize()) {
             // Too large for this client over UDP: send just the header with
             // TC set, and the client retries over TCP.
-            response = r.respond(out, msg, &q, .{ .rcode = dns.readFlags(response).rcode, .truncated = true });
+            response = r.respond(out, msg, q, .{ .rcode = dns.readFlags(response).rcode, .truncated = true });
         }
 
         r.countOutcome(outcome);
-        if (log_query) {
+        if (arrived) |started| {
             const micros: u64 = @intCast(@max(0, started.untilNow(r.io).raw.toMicroseconds()));
             log.info("{f} {f} {f} {t} {d}.{d}ms", .{
                 ip.Ip.fromAddress(client),
@@ -82,7 +123,8 @@ pub const Resolver = struct {
         if (r.metrics) |metrics| metrics.countQuery(outcome, Io.Clock.real.now(r.io).toSeconds());
     }
 
-    fn resolve(r: *Resolver, msg: []u8, out: []u8, q: *const dns.Query, client: net.IpAddress) Io.Cancelable!struct { Outcome, []u8 } {
+    /// Null when only an upstream server can answer.
+    fn resolveLocally(r: *Resolver, msg: []const u8, out: []u8, q: *const dns.Query, client: net.IpAddress) ?struct { Outcome, []u8 } {
         if (!ip.isAllowed(r.allow_clients, client)) {
             return .{ .refused, r.respond(out, msg, q, .{ .rcode = .refused }) };
         }
@@ -111,7 +153,10 @@ pub const Resolver = struct {
         }
 
         if (r.cache.lookup(r.io, msg, q, out)) |response| return .{ .cached, response };
+        return null;
+    }
 
+    fn resolveUpstream(r: *Resolver, msg: []u8, out: []u8, q: *const dns.Query) Io.Cancelable!struct { Outcome, []u8 } {
         const response = r.upstream.forward(r.io, msg, q, out) catch |err| switch (err) {
             error.Canceled => |e| return e,
             error.AllServersFailed => return .{ .failed, r.respond(out, msg, q, .{ .rcode = .servfail }) },

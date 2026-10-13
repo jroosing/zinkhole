@@ -3,7 +3,8 @@
 //! A TLS handshake costs several round trips, so connections are kept open
 //! and reused: each server has a small pool of idle connections. A connection
 //! carries one query at a time and is discarded after any error, so a pooled
-//! connection never has a stray answer waiting in it.
+//! connection never has a stray answer waiting in it. At most
+//! `max_connections` are in use per server at once.
 //!
 //! The server's certificate is verified against the system's CA certificates
 //! and the configured TLS name (e.g. dns.quad9.net). The server is reached by
@@ -20,8 +21,12 @@ const tcp = @import("tcp.zig");
 
 const log = std.log.scoped(.upstream);
 
-/// Idle connections kept open per server.
-const max_idle_connections = 4;
+/// Connections in use per server at once; an exchange beyond this waits
+/// for one, within its deadline (ADR-0005).
+const max_connections = 16;
+/// Idle connections kept open per server, so a burst of queries needs few
+/// new handshakes.
+const max_idle_connections = 8;
 /// Idle connections older than this are closed instead of reused. Servers
 /// close idle connections themselves; measured: Cloudflare after 10 s, Quad9
 /// after about 11 s, Google after more than 40 s.
@@ -52,6 +57,8 @@ pub const Tls = struct {
     name: []const u8,
     trust: *Trust,
     pool: Pool = .{},
+    /// One permit per connection that may be in use (`max_connections`).
+    in_use: Io.Semaphore = .{ .permits = max_connections },
 
     /// `name` and `trust` must outlive the adapter.
     pub fn init(address: net.IpAddress, name: []const u8, trust: *Trust) Tls {
@@ -63,8 +70,14 @@ pub const Tls = struct {
     }
 
     /// Sends `query` and reads the answer into `out`, reusing a pooled
-    /// connection when possible.
+    /// connection when possible. Waits, within `deadline`, while
+    /// `max_connections` exchanges with this server are running.
     pub fn exchange(tls: *Tls, io: Io, query: dns.UpstreamQuery, out: []u8, deadline: Io.Timeout) ![]u8 {
+        tls.in_use.waitTimeout(io, deadline) catch |err| switch (err) {
+            error.Canceled => |e| return e,
+            error.Timeout => return error.Timeout,
+        };
+        defer tls.in_use.post(io);
         if (tls.pool.take(io, nowSeconds(io))) |connection| {
             if (connection.exchange(query, out, deadline)) |response| {
                 tls.pool.put(io, connection, nowSeconds(io));
@@ -225,4 +238,75 @@ const Connection = struct {
 
 fn nowSeconds(io: Io) i64 {
     return Io.Clock.boot.now(io).toSeconds();
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+
+const testing = std.testing;
+
+/// Accepts TCP connections and never answers: a TLS handshake with it waits
+/// until its deadline.
+const SilentServer = struct {
+    listener: net.Server,
+    accepted: std.atomic.Value(usize) = .init(0),
+    streams: [64]net.Stream = undefined,
+    group: Io.Group = .init,
+
+    fn start(s: *SilentServer) !void {
+        const loopback: net.IpAddress = .{ .ip4 = .loopback(0) };
+        s.* = .{ .listener = try loopback.listen(testing.io, .{}) };
+        errdefer s.listener.deinit(testing.io);
+        try s.group.concurrent(testing.io, acceptAll, .{s});
+    }
+
+    fn stop(s: *SilentServer) void {
+        s.group.cancel(testing.io);
+        for (s.streams[0..s.accepted.load(.acquire)]) |stream| stream.close(testing.io);
+        s.listener.deinit(testing.io);
+    }
+
+    fn acceptAll(s: *SilentServer) Io.Cancelable!void {
+        while (s.accepted.load(.monotonic) < s.streams.len) {
+            const stream = s.listener.accept(testing.io) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                else => continue,
+            };
+            s.streams[s.accepted.load(.monotonic)] = stream;
+            _ = s.accepted.fetchAdd(1, .release);
+        }
+    }
+};
+
+fn exchangeUntilDeadline(tls: *Tls, timeouts: *std.atomic.Value(usize)) Io.Cancelable!void {
+    var buf: [512]u8 = undefined;
+    const query_bytes = dns.testQuery(&buf, 1, "example.com", .a, null);
+    const query: dns.UpstreamQuery = .{ .bytes = query_bytes, .question_end = query_bytes.len };
+    var out: [512]u8 = undefined;
+    if (tls.exchange(testing.io, query, &out, tcp.deadlineIn(testing.io, 300))) |_| {} else |err| switch (err) {
+        error.Canceled => |e| return e,
+        error.Timeout => _ = timeouts.fetchAdd(1, .monotonic),
+        else => {},
+    }
+}
+
+test "at most max_connections exchanges with one server at once; the others wait within their deadline" {
+    var server: SilentServer = undefined;
+    try server.start();
+    defer server.stop();
+    var trust: Trust = .{ .gpa = testing.allocator };
+    defer trust.deinit();
+    var tls: Tls = .init(server.listener.socket.address, "dns.example.com", &trust);
+    defer tls.deinit();
+
+    var timeouts: std.atomic.Value(usize) = .init(0);
+    var group: Io.Group = .init;
+    defer group.cancel(testing.io);
+    for (0..20) |_| try group.concurrent(testing.io, exchangeUntilDeadline, .{ &tls, &timeouts });
+
+    try testing.io.sleep(.fromMilliseconds(150), .awake);
+    try testing.expectEqual(max_connections, server.accepted.load(.acquire));
+    try group.await(testing.io);
+    // Waiting for a connection counts against the same deadline.
+    try testing.expectEqual(20, timeouts.load(.acquire));
 }

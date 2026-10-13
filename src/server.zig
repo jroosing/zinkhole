@@ -1,7 +1,9 @@
 //! Network front end: UDP and TCP listeners served by a fixed pool of worker
-//! threads. Memory is fixed at startup: each worker owns one query and one
-//! response buffer, and answering a query allocates nothing (only cache
-//! insertions do).
+//! threads. A UDP worker answers what needs no upstream server and hands
+//! cache misses to the forwarding stage (forwarder.zig, ADR-0005), so it
+//! never waits for one. Memory is fixed at startup: each worker and each
+//! forwarding slot owns one query and one response buffer, and answering a
+//! query allocates nothing (only cache insertions do).
 
 const std = @import("std");
 const Io = std.Io;
@@ -12,11 +14,13 @@ const dns = @import("dns.zig");
 const ip = @import("ip.zig");
 const tcp = @import("tcp.zig");
 const Resolver = @import("resolver.zig").Resolver;
+const forwarder_mod = @import("forwarder.zig");
+const Forwarder = forwarder_mod.Forwarder;
 
 const log = std.log.scoped(.server);
 
 /// Larger queries are dropped; real queries are well under 512 bytes.
-const max_query_len = 4096;
+const max_query_len = forwarder_mod.max_query_len;
 /// TCP is only used for truncated answers, so few workers suffice.
 const tcp_workers_per_listener = 2;
 /// An idle TCP connection is closed after this long (RFC 7766 suggests seconds).
@@ -32,6 +36,9 @@ pub const Server = struct {
     tcp_listeners: std.ArrayList(net.Server) = .empty,
     workers: []Worker = &.{},
     group: Io.Group = .init,
+    /// Valid once `start` has started it.
+    forwarder: Forwarder = undefined,
+    forwarding: bool = false,
     /// Set once workers hold pointers into the socket lists.
     pointers_locked: bool = false,
 
@@ -77,8 +84,19 @@ pub const Server = struct {
         if (server.udp_sockets.items.len == 0) return error.NoListenAddress;
     }
 
-    /// Starts the workers: `udp_workers` per UDP socket plus a few per TCP listener.
-    pub fn start(server: *Server, udp_workers: u16) !void {
+    pub const Options = struct {
+        /// Per UDP socket.
+        udp_workers: u16,
+        /// Upstream queries in flight at once (`upstream.max_in_flight`).
+        forward_slots: u16,
+    };
+
+    /// Starts the forwarding slots and the workers: `udp_workers` per UDP
+    /// socket plus a few per TCP listener. `server` must not move afterwards.
+    pub fn start(server: *Server, options: Options) !void {
+        try server.forwarder.init(server.io, server.gpa, server.resolver, options.forward_slots);
+        server.forwarding = true;
+        const udp_workers = options.udp_workers;
         const udp_count = server.udp_sockets.items.len * udp_workers;
         const tcp_count = server.tcp_listeners.items.len * tcp_workers_per_listener;
         server.workers = try server.gpa.alloc(Worker, udp_count + tcp_count);
@@ -106,9 +124,11 @@ pub const Server = struct {
         }
     }
 
-    /// Stops all workers and closes the sockets.
+    /// Stops all workers and forwarding slots, then closes the sockets.
     pub fn deinit(server: *Server) void {
         server.group.cancel(server.io);
+        // Slots answer on the UDP sockets: they stop before those close.
+        if (server.forwarding) server.forwarder.deinit();
         if (server.pointers_locked) {
             server.udp_sockets.unlockPointers();
             server.tcp_listeners.unlockPointers();
@@ -134,7 +154,16 @@ pub const Server = struct {
             };
             if (message.flags.trunc) continue; // larger than any real query
 
-            const response = try worker.server.resolver.handle(message.data, &worker.response, message.from, .udp) orelse continue;
+            const resolver = worker.server.resolver;
+            const arrived = resolver.arrival();
+            const response = switch (resolver.answerLocally(message.data, &worker.response, message.from, .udp, arrived)) {
+                .drop => continue,
+                .response => |response| response,
+                .upstream => {
+                    try worker.server.forwarder.submit(socket, message.from, message.data, arrived);
+                    continue;
+                },
+            };
             socket.send(io, &message.from, response) catch |err| switch (err) {
                 error.Canceled => |e| return e,
                 else => log.debug("udp send to {f}: {t}", .{ message.from, err }),
@@ -192,9 +221,12 @@ const testing = std.testing;
 const config_mod = @import("config.zig");
 const Policy = @import("policy.zig").Policy;
 const Cache = @import("cache.zig").Cache;
-const Upstream = @import("upstream.zig").Upstream;
+const upstream_mod = @import("upstream.zig");
+const Upstream = upstream_mod.Upstream;
+const Watchdog = @import("test_watchdog.zig").Watchdog;
 
-/// A server on loopback with one local record and no upstream servers.
+/// A server on loopback with one local record and, unless given, no
+/// upstream servers.
 const TestServer = struct {
     config: config_mod.Config,
     policy: Policy,
@@ -204,6 +236,10 @@ const TestServer = struct {
     server: Server,
 
     fn init(t: *TestServer, allow_clients: []const ip.Cidr) !void {
+        return t.initWith(allow_clients, &.{});
+    }
+
+    fn initWith(t: *TestServer, allow_clients: []const ip.Cidr, upstream_servers: []const upstream_mod.ServerAddress) !void {
         const io = testing.io;
         const gpa = testing.allocator;
         var diag: config_mod.Diagnostic = .{};
@@ -213,7 +249,7 @@ const TestServer = struct {
         errdefer t.policy.deinit();
         t.cache = try .init(gpa, .{ .capacity = 4, .min_ttl = 0, .max_ttl = 60, .seed = 1 });
         errdefer t.cache.deinit();
-        try t.upstream.init(io, gpa, &.{}, 100);
+        try t.upstream.init(io, gpa, upstream_servers, 2000);
         errdefer t.upstream.deinit();
         t.resolver = .{
             .io = io,
@@ -226,7 +262,7 @@ const TestServer = struct {
         t.server = .{ .io = io, .gpa = gpa, .resolver = &t.resolver };
         errdefer t.server.deinit();
         try t.server.listen(&.{.{ .ip4 = .loopback(0) }});
-        try t.server.start(1);
+        try t.server.start(.{ .udp_workers = 1, .forward_slots = 4 });
     }
 
     fn deinit(t: *TestServer) void {
@@ -304,4 +340,98 @@ test "no other socket can take over the DNS port" {
         listener.deinit(testing.io);
         return error.TestUnexpectedResult;
     } else |err| try testing.expectEqual(error.AddressInUse, err);
+}
+
+/// A UDP client on loopback for `t`.
+const TestClient = struct {
+    socket: net.Socket,
+    server: net.IpAddress,
+
+    fn open(t: *const TestServer) !TestClient {
+        const loopback: net.IpAddress = .{ .ip4 = .loopback(0) };
+        return .{ .socket = try loopback.bind(testing.io, .{ .mode = .dgram, .protocol = .udp }), .server = t.server.udp_sockets.items[0].address };
+    }
+
+    fn close(c: *TestClient) void {
+        c.socket.close(testing.io);
+    }
+
+    fn send(c: *TestClient, id: u16, name: []const u8) !void {
+        var buf: [512]u8 = undefined;
+        try c.socket.send(testing.io, &c.server, dns.testQuery(&buf, id, name, .a, null));
+    }
+
+    /// The ID of the next answer, if one comes within `ms`.
+    fn receiveId(c: *TestClient, ms: u32) !u16 {
+        var buf: [512]u8 = undefined;
+        const message = try c.socket.receiveTimeout(testing.io, &buf, tcp.deadlineIn(testing.io, ms));
+        return dns.readId(message.data);
+    }
+};
+
+test "local answers are not held up by queries waiting on an upstream server" {
+    var slow: upstream_mod.Stub = undefined;
+    try slow.start(.answer);
+    defer slow.stop();
+    slow.udp_delay_ms = 500;
+    var t: TestServer = undefined;
+    try t.initWith(&.{ip.Cidr.parse("127.0.0.0/8").?}, &.{.{ .address = slow.address() }});
+    defer t.deinit();
+    var client: TestClient = try .open(&t);
+    defer client.close();
+
+    for ([_][]const u8{ "one.example.com", "two.example.com", "three.example.com" }, 1..) |name, id| try client.send(@intCast(id), name);
+    try client.send(10, "nas.lan");
+
+    // Only one worker: the local answer comes first, long before the others.
+    try testing.expectEqual(10, try client.receiveId(250));
+    var answered: [3]bool = @splat(false);
+    for (0..3) |_| answered[(try client.receiveId(1500)) - 1] = true;
+    try testing.expectEqual([3]bool{ true, true, true }, answered);
+}
+
+test "uncached queries are forwarded in parallel, never more than the slots at once" {
+    var slow: upstream_mod.Stub = undefined;
+    try slow.start(.answer);
+    defer slow.stop();
+    slow.udp_delay_ms = 300;
+    var t: TestServer = undefined;
+    try t.initWith(&.{ip.Cidr.parse("127.0.0.0/8").?}, &.{.{ .address = slow.address() }});
+    defer t.deinit();
+    var client: TestClient = try .open(&t);
+    defer client.close();
+
+    const started = Io.Clock.Timestamp.now(testing.io, .awake);
+    var name_buf: [32]u8 = undefined;
+    for (1..9) |id| try client.send(@intCast(id), try std.fmt.bufPrint(&name_buf, "name{d}.example.com", .{id}));
+    var answered: [8]bool = @splat(false);
+    for (0..8) |_| answered[(try client.receiveId(2000)) - 1] = true;
+    const elapsed = started.untilNow(testing.io).raw.toMilliseconds();
+
+    try testing.expectEqual([8]bool{ true, true, true, true, true, true, true, true }, answered);
+    // 4 slots: two rounds of 300 ms. One at a time would take 2.4 s.
+    try testing.expect(elapsed >= 550 and elapsed < 1500);
+    try testing.expectEqual(8, t.resolver.stats.get(.forwarded));
+}
+
+test "stopping the server does not wait for queries at an upstream server" {
+    var watchdog: Watchdog = try .start(10);
+    defer watchdog.stop();
+    var silent: upstream_mod.Stub = undefined;
+    try silent.start(.silent);
+    defer silent.stop();
+    var t: TestServer = undefined;
+    try t.initWith(&.{ip.Cidr.parse("127.0.0.0/8").?}, &.{.{ .address = silent.address() }});
+    var client: TestClient = try .open(&t);
+    defer client.close();
+
+    // 4 slots wait for an answer that never comes (2 s timeout), and the
+    // worker waits for a free slot.
+    var name_buf: [32]u8 = undefined;
+    for (1..7) |id| try client.send(@intCast(id), try std.fmt.bufPrint(&name_buf, "name{d}.example.com", .{id}));
+    try testing.io.sleep(.fromMilliseconds(200), .awake);
+
+    const started = Io.Clock.Timestamp.now(testing.io, .awake);
+    t.deinit();
+    try testing.expect(started.untilNow(testing.io).raw.toMilliseconds() < 1000);
 }

@@ -28,7 +28,9 @@ server:
     - fc00::/7
     - fe80::/10
 
-  # UDP worker threads per listen address (TCP gets 2 per address).
+  # UDP worker threads per listen address (TCP gets 2 per address). They
+  # answer local records, blocked names and cache hits themselves, and hand
+  # everything else to upstream.max_in_flight, so a few are enough.
   workers: 4
 
 upstream:
@@ -52,6 +54,9 @@ upstream:
     - "tls://[2620:fe::fe]#dns.quad9.net"           # example: IPv6 needs quotes
   # How long to wait for one server before trying the next.
   timeout_ms: 2000
+  # Queries with upstream servers at once (1-1024). More wait for a free slot.
+  # Each slot is a thread with buffers that cost memory only when used.
+  max_in_flight: 64
 
 cache:
   # Maximum number of cached upstream answers; 0 disables the cache.

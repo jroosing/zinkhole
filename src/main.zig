@@ -37,6 +37,12 @@ pub const std_options: std.Options = .{
     .logFn = log_output.logFn,
     // Never write TLS session keys to $SSLKEYLOGFILE, not even in debug builds.
     .http_enable_ssl_key_log_file = false,
+    // No alternate signal stack per thread. It only lets a stack overflow
+    // print a stack trace instead of just ending the process (the guard page
+    // still stops it, and the service manager restarts it), and it costs
+    // 256 KiB of resident memory per thread: about 18 MB with the
+    // forwarding slots (ADR-0005).
+    .signal_stack_size = null,
 };
 
 /// From build.zig.zon (see build.zig).
@@ -289,7 +295,7 @@ fn run(io: Io, gpa: Allocator, config_path: []const u8, cfg: *Config, tz: ?[]con
     var server: Server = .{ .io = io, .gpa = gpa, .resolver = &resolver };
     defer server.deinit();
     try server.listen(cfg.server.listen);
-    try server.start(cfg.server.workers);
+    try server.start(.{ .udp_workers = cfg.server.workers, .forward_slots = cfg.upstream.max_in_flight });
 
     var origin: sync.Origin = undefined;
     const serving = cfg.sync == .origin;
@@ -831,4 +837,5 @@ test {
     _ = @import("localtime.zig");
     _ = @import("metrics.zig");
     _ = @import("http_service.zig");
+    _ = @import("forwarder.zig");
 }

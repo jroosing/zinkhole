@@ -211,8 +211,9 @@ pub const Upstream = struct {
 const testing = std.testing;
 
 /// A DNS server on loopback (UDP and TCP on one ephemeral port) that answers
-/// as scripted, for testing exchanges without a network.
-const Stub = struct {
+/// as scripted, for testing exchanges without a network. Also used by the
+/// server's tests.
+pub const Stub = struct {
     udp: net.Socket,
     tcp: net.Server,
     behavior: Behavior,
@@ -221,7 +222,8 @@ const Stub = struct {
     received: std.atomic.Value(u32) = .init(0),
     last_buf: [512]u8 = undefined,
     last_len: usize = 0,
-    /// Waits before answering, for testing deadlines.
+    /// Waits before answering, for testing deadlines. Each UDP query waits on
+    /// its own, like a real server's queries do.
     udp_delay_ms: u32 = 0,
     tcp_delay_ms: u32 = 0,
 
@@ -236,7 +238,7 @@ const Stub = struct {
         truncate,
     };
 
-    fn start(stub: *Stub, behavior: Behavior) !void {
+    pub fn start(stub: *Stub, behavior: Behavior) !void {
         const io = testing.io;
         const loopback: net.IpAddress = .{ .ip4 = .loopback(0) };
         stub.* = .{ .behavior = behavior, .udp = try loopback.bind(io, .{ .mode = .dgram, .protocol = .udp }), .tcp = undefined };
@@ -247,14 +249,14 @@ const Stub = struct {
         try stub.group.concurrent(io, serveTcp, .{stub});
     }
 
-    fn stop(stub: *Stub) void {
+    pub fn stop(stub: *Stub) void {
         const io = testing.io;
         stub.group.cancel(io);
         stub.tcp.deinit(io);
         stub.udp.close(io);
     }
 
-    fn address(stub: *const Stub) net.IpAddress {
+    pub fn address(stub: *const Stub) net.IpAddress {
         return stub.udp.address;
     }
 
@@ -272,7 +274,11 @@ const Stub = struct {
                 else => continue,
             };
             const response = stub.respond(message.data, &out, .udp) orelse continue;
-            if (stub.udp_delay_ms > 0) try io.sleep(.fromMilliseconds(stub.udp_delay_ms), .awake);
+            if (stub.udp_delay_ms > 0) {
+                const copy = testing.allocator.dupe(u8, response) catch continue;
+                stub.group.concurrent(io, sendLater, .{ stub, message.from, copy }) catch testing.allocator.free(copy);
+                continue;
+            }
             if (stub.behavior == .spoof_first) {
                 var spoofed_buf: [512]u8 = undefined;
                 const spoofed = spoofed_buf[0..response.len];
@@ -286,6 +292,12 @@ const Stub = struct {
             }
             stub.udp.send(io, &message.from, response) catch {};
         }
+    }
+
+    fn sendLater(stub: *Stub, to: net.IpAddress, response: []u8) Io.Cancelable!void {
+        defer testing.allocator.free(response);
+        try testing.io.sleep(.fromMilliseconds(stub.udp_delay_ms), .awake);
+        stub.udp.send(testing.io, &to, response) catch {};
     }
 
     fn serveTcp(stub: *Stub) Io.Cancelable!void {
