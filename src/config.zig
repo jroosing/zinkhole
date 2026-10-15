@@ -238,6 +238,8 @@ pub fn parseReplica(gpa: Allocator, source: []const u8, synced: []const u8, diag
             try decoder.decodeBlocking(pair.value, &config.blocking);
         } else if (is(pair, "local")) {
             try decoder.decodeLocal(pair.value, &config.local);
+            // Checked against this replica's own listen addresses.
+            try decoder.checkForwards(pair.line, &config);
         } else {
             return diag.fail(pair.line, "the origin may only send 'blocking' and 'local', not '{s}'", .{pair.key});
         }
@@ -289,18 +291,22 @@ const Decoder = struct {
         // Lines of the sections a replica takes from its origin instead.
         var policy_line: ?u32 = null;
         var metrics_line: u32 = 0;
+        var upstream_line: u32 = 0;
+        var local_line: u32 = 0;
         for (try d.mapping(root, "top level")) |pair| {
             if (is(pair, "blocking") or is(pair, "local")) policy_line = policy_line orelse pair.line;
             if (is(pair, "server")) {
                 try d.decodeServer(pair.value, &config.server);
             } else if (is(pair, "upstream")) {
                 try d.decodeUpstream(pair.value, &config.upstream);
+                upstream_line = pair.line;
             } else if (is(pair, "cache")) {
                 try d.decodeCache(pair.value, &config.cache);
             } else if (is(pair, "blocking")) {
                 try d.decodeBlocking(pair.value, &config.blocking);
             } else if (is(pair, "local")) {
                 try d.decodeLocal(pair.value, &config.local);
+                local_line = pair.line;
             } else if (is(pair, "log")) {
                 try d.decodeLog(pair.value, &config.log);
             } else if (is(pair, "sync")) {
@@ -323,6 +329,21 @@ const Decoder = struct {
         }
         if (config.upstream.servers.len == 0) {
             return d.fail(0, "upstream.servers: at least one upstream DNS server is required", .{});
+        }
+        for (config.upstream.servers) |server| {
+            if (isThisServer(server.address, config.server.listen)) {
+                return d.fail(upstream_line, "upstream.servers: {f} is this server itself (server.listen); every query would come back here", .{server.address});
+            }
+        }
+        try d.checkForwards(local_line, config);
+    }
+
+    /// A forwarded zone must not send its names back to this server.
+    fn checkForwards(d: *Decoder, line: u32, config: *const Config) Error!void {
+        for (config.local.forward) |forward| {
+            if (isThisServer(forward.server, config.server.listen)) {
+                return d.fail(line, "local.forward: {f} is this server itself (server.listen); every query for '{s}' would come back here", .{ forward.server, forward.zone });
+            }
         }
     }
 
@@ -711,6 +732,26 @@ const Decoder = struct {
     }
 };
 
+/// True if queries sent to `target` would reach this server: the port of a
+/// listen address, and that address itself, or a loopback or unspecified
+/// address while listening on every address. (The host's other addresses
+/// behind an unspecified listen address cannot be known here.)
+fn isThisServer(target: net.IpAddress, listen: []const net.IpAddress) bool {
+    for (listen) |address| {
+        if (address.getPort() != target.getPort()) continue;
+        if (address.eql(&target)) return true;
+        if (isUnspecified(address) and (isLoopback(target) or isUnspecified(target))) return true;
+    }
+    return false;
+}
+
+fn isLoopback(address: net.IpAddress) bool {
+    return switch (address) {
+        .ip4 => |a| a.bytes[0] == 127,
+        .ip6 => |a| std.mem.eql(u8, &a.bytes, &(@as([15]u8, @splat(0)) ++ [_]u8{1})),
+    };
+}
+
 fn isUnspecified(address: net.IpAddress) bool {
     return switch (address) {
         .ip4 => |a| std.mem.allEqual(u8, &a.bytes, 0),
@@ -791,7 +832,12 @@ fn fuzzConfig(_: void, smith: *testing.Smith) !void {
         },
     };
     defer config.deinit();
-    // What this config would serve as an origin, a replica accepts.
+    // What this config would serve as an origin, a replica accepts, unless
+    // a forwarded zone points at the replica itself.
+    const replica_listen = [_]net.IpAddress{.{ .ip4 = .unspecified(53) }};
+    for (config.local.forward) |forward| {
+        if (isThisServer(forward.server, &replica_listen)) return;
+    }
     var replica = parseReplica(testing.allocator, fuzz_replica, config.policy_text, &diag) catch |err| {
         std.debug.print("a replica rejects:\n{s}\nline {d}: {s}\n", .{ config.policy_text, diag.line, diag.message() });
         return err;
@@ -800,6 +846,8 @@ fn fuzzConfig(_: void, smith: *testing.Smith) !void {
 }
 
 const fuzz_replica =
+    \\server:
+    \\  listen: ["0.0.0.0:53"]
     \\upstream:
     \\  servers: [1.1.1.1]
     \\sync:
@@ -1004,6 +1052,21 @@ test "local.forward sends the names of a zone to a plain DNS server" {
     try expectConfigError(base ++ "    lan: router", 5, "not an IP address");
     try expectConfigError(base ++ "    \"*.lan\": 192.168.1.1", 5, "invalid zone");
     try expectConfigError(base ++ "    lan: 192.168.1.1\n    LAN: 192.168.1.2", 6, "twice");
+}
+
+test "upstream servers and forwarded zones may not point back at this server" {
+    // Listening on every address (the default): loopback on port 53 is us.
+    try expectConfigError("upstream:\n  servers: [127.0.0.1]\n", 1, "this server");
+    try expectConfigError("upstream:\n  servers: [1.1.1.1]\nlocal:\n  forward:\n    lan: \"[::1]\"\n", 3, "this server");
+    // Listening on one address: that address is us.
+    try expectConfigError("server:\n  listen: [\"192.168.1.5:53\"]\nupstream:\n  servers: [192.168.1.5]\n", 3, "this server");
+
+    // Another port, or loopback next to a single LAN address, is another server.
+    var diag: Diagnostic = .{};
+    var other_port = try parse(testing.allocator, "upstream:\n  servers: [\"127.0.0.1:5353\"]\n", &diag);
+    other_port.deinit();
+    var other_address = try parse(testing.allocator, "server:\n  listen: [\"192.168.1.5:53\"]\nupstream:\n  servers: [127.0.0.1]\n", &diag);
+    other_address.deinit();
 }
 
 test "the metrics section says where metrics are served" {

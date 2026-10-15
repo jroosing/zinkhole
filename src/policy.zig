@@ -368,14 +368,12 @@ pub const Lists = struct {
         if (sources.isEmpty()) return lists;
 
         const started = Io.Clock.awake.now(io);
-        var client: std.http.Client = .{ .allocator = gpa, .io = io };
-        defer client.deinit();
         const loaded = try lists.arena.allocator().alloc(bool, sources.blocklists.len + sources.allowlists.len);
         for (sources.blocklists, loaded[0..sources.blocklists.len]) |source, *ok| {
-            ok.* = try lists.loadSourceWithin(io, &client, source, false, options.source_timeout_ms);
+            ok.* = try lists.loadSourceWithin(io, source, false, options.source_timeout_ms);
         }
         for (sources.allowlists, loaded[sources.blocklists.len..]) |source, *ok| {
-            ok.* = try lists.loadSourceWithin(io, &client, source, true, options.source_timeout_ms);
+            ok.* = try lists.loadSourceWithin(io, source, true, options.source_timeout_ms);
         }
         lists.loaded = loaded;
         const failed = std.mem.count(bool, loaded, &.{false});
@@ -404,24 +402,42 @@ pub const Lists = struct {
 
     /// `loadSource`, as a task that is canceled after `timeout_ms`: a server
     /// that stops sending would otherwise hold up every later source.
-    fn loadSourceWithin(lists: *Lists, io: Io, client: *std.http.Client, source: []const u8, is_allowlist: bool, timeout_ms: u32) (Allocator.Error || Io.Cancelable)!bool {
+    fn loadSourceWithin(lists: *Lists, io: Io, source: []const u8, is_allowlist: bool, timeout_ms: u32) (Allocator.Error || Io.Cancelable)!bool {
         var done: Io.Event = .unset;
-        var task = io.concurrent(loadSourceAndSignal, .{ lists, io, client, source, is_allowlist, &done }) catch {
-            return lists.loadSource(io, client, source, is_allowlist); // no thread to spare: no deadline
+        var task = io.concurrent(loadSourceAndSignal, .{ lists, io, source, is_allowlist, &done }) catch |err| {
+            log.warn("{s}: loading without a deadline ({t})", .{ source, err });
+            return lists.loadSourceAlone(io, source, is_allowlist);
         };
-        tcp.waitUntil(io, &done, tcp.deadlineIn(io, timeout_ms)) catch |err| {
+        tcp.waitUntil(io, &done, tcp.deadlineIn(io, timeout_ms)) catch |wait_err| {
             // `cancel` waits for the task to finish, so `done` outlives it.
-            _ = task.cancel(io) catch |task_err| if (task_err == error.OutOfMemory) return error.OutOfMemory;
-            if (err == error.Canceled) return error.Canceled;
-            log.warn("{s}: not loaded within {d} s, skipped", .{ source, timeout_ms / 1000 });
-            return false;
+            const result = task.cancel(io);
+            if (wait_err == error.Canceled) {
+                _ = result catch |err| if (err == error.OutOfMemory) return err;
+                return error.Canceled;
+            }
+            // It may have finished just as the deadline passed.
+            return result catch |err| switch (err) {
+                error.OutOfMemory => |e| return e,
+                error.Canceled => {
+                    log.warn("{s}: not loaded within {d} s, skipped", .{ source, timeout_ms / 1000 });
+                    return false;
+                },
+            };
         };
         return task.await(io);
     }
 
-    fn loadSourceAndSignal(lists: *Lists, io: Io, client: *std.http.Client, source: []const u8, is_allowlist: bool, done: *Io.Event) (Allocator.Error || Io.Cancelable)!bool {
+    fn loadSourceAndSignal(lists: *Lists, io: Io, source: []const u8, is_allowlist: bool, done: *Io.Event) (Allocator.Error || Io.Cancelable)!bool {
         defer done.set(io);
-        return lists.loadSource(io, client, source, is_allowlist);
+        return lists.loadSourceAlone(io, source, is_allowlist);
+    }
+
+    /// `loadSource` with an HTTP client of its own, so a load that is
+    /// canceled halfway leaves nothing behind that the next source uses.
+    fn loadSourceAlone(lists: *Lists, io: Io, source: []const u8, is_allowlist: bool) (Allocator.Error || Io.Cancelable)!bool {
+        var client: std.http.Client = .{ .allocator = lists.gpa, .io = io };
+        defer client.deinit();
+        return lists.loadSource(io, &client, source, is_allowlist);
     }
 
     /// Returns false if the source could not be loaded.

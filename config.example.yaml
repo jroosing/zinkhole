@@ -38,7 +38,8 @@ upstream:
   # the one that answered last is tried first. (Required.) Servers further down
   # are the fallbacks: they are used when the ones before them fail, so listing
   # a second provider keeps DNS working when one provider is down. After a
-  # failover, one query a minute tries the first server again.
+  # failover, one query a minute tries the first server again. A server that
+  # is zinkhole itself (a listen address, or loopback on its port) is refused.
   #
   # DNS over TLS (recommended): tls://<ip>[:port]#<name>, where <name> is the
   # name on the server's certificate. Queries are encrypted, so your ISP can
@@ -128,7 +129,7 @@ local:
   # servers (plain DNS, ip[:port]), e.g. your router for its DHCP clients'
   # names and reverse lookups. The longest matching zone wins; local records
   # and blocking still apply first. Private names in these zones are not
-  # answered NXDOMAIN.
+  # answered NXDOMAIN. As for upstream servers, zinkhole itself is refused.
   # forward:
   #   lan: 192.168.1.1                          # example
   #   1.168.192.in-addr.arpa: 192.168.1.1       # example
