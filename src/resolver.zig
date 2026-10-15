@@ -3,11 +3,13 @@
 //!   1. client not allowed                  -> REFUSED
 //!   2. local record, or PTR for one        -> local answer
 //!   3. blocked (allow rules win)           -> 0.0.0.0 / :: or NXDOMAIN
-//!   4. private or special-use name         -> NXDOMAIN
-//!   5. cached answer                       -> cached answer
-//!   6. upstream servers                    -> forwarded answer (then cached)
+//!   4. forwarded zone                      -> as 6-7, with the zone's server
+//!   5. private or special-use name         -> NXDOMAIN
+//!   6. cached answer                       -> cached answer
+//!   7. upstream servers                    -> forwarded answer (then cached),
+//!                                             or a stale cached one if none answers
 //!
-//! Steps 2-4 are the `Policy`'s decision; this module turns it into a response.
+//! Steps 2-5 are the `Policy`'s decision; this module turns it into a response.
 
 const std = @import("std");
 const Io = std.Io;
@@ -150,28 +152,55 @@ pub const Resolver = struct {
             .reverse => |*answer| {
                 return .{ .local, r.respond(out, msg, q, .{ .answers = &.{.{ .ptr = answer.host() }}, .ttl = answer.ttl, .authoritative = true }) };
             },
-            .blocked => |blocked| {
-                const response = switch (blocked.response) {
-                    .nxdomain => r.respond(out, msg, q, .{ .rcode = .nxdomain }),
-                    .zero => r.addressAnswer(out, msg, q, .{ .v4 = &.{@splat(0)}, .v6 = &.{@splat(0)} }, blocked.ttl, false),
-                };
-                return .{ .blocked, response };
-            },
-            .private => return .{ .private, r.respond(out, msg, q, .{ .rcode = .nxdomain }) },
-            .upstream => {},
+            .blocked => |blocked| return .{ .blocked, r.blockedAnswer(out, msg, q, blocked) },
+            .private => |private| return .{ .private, r.respond(out, msg, q, .{ .rcode = .nxdomain, .negative_ttl = private.ttl }) },
+            .upstream, .forward => {},
         }
 
-        if (r.cache.lookup(r.io, msg, q, out)) |response| return .{ .cached, response };
+        if (r.cache.lookup(r.io, msg, q, out)) |response| return r.aliasChecked(out, msg, q, .cached, response);
         return null;
     }
 
     fn resolveUpstream(r: *Resolver, msg: []u8, out: []u8, q: *const dns.Query) Io.Cancelable!struct { Outcome, []u8 } {
-        const response = r.upstream.forward(r.io, msg, q, out) catch |err| switch (err) {
-            error.Canceled => |e| return e,
-            error.AllServersFailed => return .{ .failed, r.respond(out, msg, q, .{ .rcode = .servfail }) },
+        // Decided again rather than handed along: the server of a forwarded
+        // zone, as the current Policy says.
+        const sent = switch (r.policy.decide(q.name, q.qtype)) {
+            .forward => |zone| r.upstream.forwardTo(r.io, zone.server, msg, q, out),
+            else => r.upstream.forward(r.io, msg, q, out),
         };
+        const response = sent catch |err| switch (err) {
+            error.Canceled => |e| return e,
+            error.AllServersFailed => {
+                // `forward` kept the ID and question that `lookupStale` reads.
+                if (r.cache.lookupStale(r.io, msg, q, out)) |stale| return r.aliasChecked(out, msg, q, .cached, stale);
+                return .{ .failed, r.respond(out, msg, q, .{ .rcode = .servfail }) };
+            },
+        };
+        // Cached as it came: the aliases are checked again on every hit, so
+        // a reload that changes the rules applies at once.
         r.cache.store(r.io, q, response);
-        return .{ .forwarded, response };
+        return r.aliasChecked(out, msg, q, .forwarded, response);
+    }
+
+    /// `response` (in `out`), unless one of its CNAME records makes the
+    /// queried name an alias of a blocked name: then the block response.
+    fn aliasChecked(r: *Resolver, out: []u8, msg: []const u8, q: *const dns.Query, outcome: Outcome, response: []u8) struct { Outcome, []u8 } {
+        var records: dns.RecordIterator = .init(response, q.question_end);
+        while (records.next() catch null) |record| {
+            if (record.section != .answer or record.type != .cname) continue;
+            var target_buf: [dns.max_name_len]u8 = undefined;
+            const target = dns.readName(response, record.rdata_offset, &target_buf) catch continue;
+            // `target` is a copy, so the block response may overwrite `out`.
+            if (r.policy.blockAlias(q.name, target)) |blocked| return .{ .blocked, r.blockedAnswer(out, msg, q, blocked) };
+        }
+        return .{ outcome, response };
+    }
+
+    fn blockedAnswer(r: *Resolver, out: []u8, msg: []const u8, q: *const dns.Query, blocked: Policy.Decision.Blocked) []u8 {
+        return switch (blocked.response) {
+            .nxdomain => r.respond(out, msg, q, .{ .rcode = .nxdomain, .negative_ttl = blocked.ttl }),
+            .zero => r.addressAnswer(out, msg, q, .{ .v4 = &.{@splat(0)}, .v6 = &.{@splat(0)} }, blocked.ttl, false),
+        };
     }
 
     /// A/AAAA records of `addresses` that match the question type; other
@@ -191,7 +220,7 @@ pub const Resolver = struct {
                 count += 1;
             }
         }
-        return r.respond(out, msg, q, .{ .answers = answers[0..count], .ttl = ttl, .authoritative = authoritative });
+        return r.respond(out, msg, q, .{ .answers = answers[0..count], .ttl = ttl, .authoritative = authoritative, .negative_ttl = ttl });
     }
 
     fn respond(_: *Resolver, out: []u8, msg: []const u8, q: *const dns.Query, options: dns.ResponseOptions) []u8 {
@@ -240,7 +269,16 @@ const TestResolver = struct {
     /// Where the last response's records start.
     question_end: usize = 0,
 
+    const Options = struct {
+        serve_stale_s: u32 = 0,
+        upstream: []const @import("upstream.zig").ServerAddress = &.{},
+    };
+
     fn init(t: *TestResolver, source: []const u8) !void {
+        return t.initWith(source, .{});
+    }
+
+    fn initWith(t: *TestResolver, source: []const u8, options: Options) !void {
         var buf: [4096]u8 = undefined;
         const full = try std.fmt.bufPrint(&buf, "upstream:\n  servers: [9.9.9.9]\n{s}", .{source});
         var diag: config_mod.Diagnostic = .{};
@@ -248,9 +286,9 @@ const TestResolver = struct {
         errdefer t.config.deinit();
         t.policy = try .init(testing.io, testing.allocator, &t.config);
         errdefer t.policy.deinit();
-        t.cache = try .init(testing.allocator, .{ .capacity = 16, .min_ttl = 0, .max_ttl = 3600, .seed = 1 });
+        t.cache = try .init(testing.allocator, .{ .capacity = 16, .min_ttl = 0, .max_ttl = 3600, .seed = 1, .serve_stale_s = options.serve_stale_s });
         errdefer t.cache.deinit();
-        try t.upstream.init(testing.io, testing.allocator, &.{}, 100);
+        try t.upstream.init(testing.io, testing.allocator, options.upstream, 500);
         t.resolver = .{
             .io = testing.io,
             .policy = &t.policy,
@@ -282,10 +320,15 @@ const TestResolver = struct {
 
     /// The answer section's records, as (type, ttl, rdata).
     fn answers(t: *const TestResolver, response: []const u8, buf: []TestAnswer) ![]TestAnswer {
-        var records: dns.RecordIterator = .init(response, t.question_end);
+        return t.records(response, .answer, buf);
+    }
+
+    /// The records of one section, as (type, ttl, rdata).
+    fn records(t: *const TestResolver, response: []const u8, section: dns.Section, buf: []TestAnswer) ![]TestAnswer {
+        var records_it: dns.RecordIterator = .init(response, t.question_end);
         var count: usize = 0;
-        while (try records.next()) |record| {
-            if (record.section != .answer) continue;
+        while (try records_it.next()) |record| {
+            if (record.section != section) continue;
             buf[count] = .{ .type = record.type, .ttl = record.ttl, .data = response[record.rdata_offset..][0..record.rdata_len] };
             count += 1;
         }
@@ -365,6 +408,59 @@ test "private names, the Firefox canary and nxdomain blocking answer NXDOMAIN" {
     }
 }
 
+/// The SOA in the authority section of `response`, which must be the only
+/// record there: its TTL and its MINIMUM field (the negative TTL).
+fn expectSoa(t: *const TestResolver, response: []const u8, ttl: u32) !void {
+    var buf: [4]TestAnswer = undefined;
+    const authority = try t.records(response, .authority, &buf);
+    try testing.expectEqual(1, authority.len);
+    try testing.expectEqual(.soa, authority[0].type);
+    try testing.expectEqual(ttl, authority[0].ttl);
+    const data = authority[0].data;
+    try testing.expectEqual(ttl, std.mem.readInt(u32, data[data.len - 4 ..][0..4], .big));
+}
+
+test "negative answers carry an SOA, so clients can cache them for the TTL" {
+    var t: TestResolver = undefined;
+    try t.init(
+        \\blocking:
+        \\  ttl: 30
+        \\  block: [ads.example.com]
+        \\local:
+        \\  ttl: 120
+        \\  records:
+        \\    nas.lan: 192.168.1.10
+    );
+    defer t.deinit();
+    var buf: [4]TestAnswer = undefined;
+
+    // An empty answer for a blocked name, and for a local name.
+    try expectSoa(&t, try t.ask("ads.example.com", .https), 30);
+    try expectSoa(&t, try t.ask("nas.lan", .aaaa), 120);
+    // NXDOMAIN for a private name.
+    const private = try t.ask("printer", .a);
+    try testing.expectEqual(.nxdomain, dns.readFlags(private).rcode);
+    try expectSoa(&t, private, 120);
+
+    // Answers with records need none.
+    try testing.expectEqual(0, (try t.records(try t.ask("nas.lan", .a), .authority, &buf)).len);
+    try testing.expectEqual(0, (try t.records(try t.ask("ads.example.com", .a), .authority, &buf)).len);
+}
+
+test "an NXDOMAIN block carries an SOA with the block TTL" {
+    var t: TestResolver = undefined;
+    try t.init(
+        \\blocking:
+        \\  ttl: 45
+        \\  response: nxdomain
+        \\  block: [ads.example.com]
+    );
+    defer t.deinit();
+    const response = try t.ask("ads.example.com", .a);
+    try testing.expectEqual(.nxdomain, dns.readFlags(response).rcode);
+    try expectSoa(&t, response, 45);
+}
+
 test "clients outside the allowed networks and zone transfers are refused" {
     var t: TestResolver = undefined;
     try t.init(
@@ -423,6 +519,108 @@ test "with metrics, every query's Outcome is counted in the current hour" {
     try testing.expectEqual(1, today.get(.blocked));
     try testing.expectEqual(1, today.get(.private));
     try testing.expectEqual(1, today.get(.invalid));
+}
+
+/// Caches an upstream-style answer for `name`: one A record with `ttl`.
+fn cacheAnswer(t: *TestResolver, name: []const u8, ttl: u32) !void {
+    var query_buf: [512]u8 = undefined;
+    var name_buf: [dns.max_name_len]u8 = undefined;
+    const query = dns.testQuery(&query_buf, 1, name, .a, null);
+    const q = try dns.parseQuery(query, &name_buf);
+    var response_buf: [512]u8 = undefined;
+    t.cache.store(testing.io, &q, try dns.writeResponse(&response_buf, query, &q, .{ .answers = &.{.{ .a = .{ 1, 2, 3, 4 } }}, .ttl = ttl }));
+}
+
+test "when no upstream server answers, an expired cached answer is served with TTL 30" {
+    var t: TestResolver = undefined;
+    try t.initWith("", .{ .serve_stale_s = 3600 });
+    defer t.deinit();
+    try cacheAnswer(&t, "example.com", 1);
+    try testing.io.sleep(.fromMilliseconds(1100), .awake); // expired
+
+    const response = try t.ask("example.com", .a);
+    try testing.expectEqual(.noerror, dns.readFlags(response).rcode);
+    var buf: [4]TestAnswer = undefined;
+    const answers = try t.answers(response, &buf);
+    try testing.expectEqual(1, answers.len);
+    try testing.expectEqual(30, answers[0].ttl);
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, answers[0].data);
+    try testing.expectEqual(1, t.resolver.stats.get(.cached));
+    try testing.expectEqual(0, t.resolver.stats.get(.failed));
+}
+
+test "with serving stale answers off, an expired cached answer is not served" {
+    var t: TestResolver = undefined;
+    try t.initWith("", .{});
+    defer t.deinit();
+    try cacheAnswer(&t, "example.com", 1);
+    try testing.io.sleep(.fromMilliseconds(1100), .awake);
+
+    try testing.expectEqual(.servfail, dns.readFlags(try t.ask("example.com", .a)).rcode);
+}
+
+test "a name in a forwarded zone is answered by the zone's server, then from the cache" {
+    var router: @import("upstream.zig").Stub = undefined;
+    try router.start(.answer);
+    defer router.stop();
+    var source_buf: [128]u8 = undefined;
+    const source = try std.fmt.bufPrint(&source_buf, "local:\n  forward:\n    lan: \"{f}\"\n", .{router.address()});
+    var t: TestResolver = undefined;
+    try t.init(source); // and no upstream servers
+    defer t.deinit();
+
+    const response = try t.ask("printer.lan", .a);
+    try testing.expectEqual(.noerror, dns.readFlags(response).rcode);
+    var buf: [4]TestAnswer = undefined;
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, (try t.answers(response, &buf))[0].data);
+    try testing.expectEqual(1, t.resolver.stats.get(.forwarded));
+    try testing.expectEqual(1, router.received.load(.acquire));
+
+    _ = try t.ask("printer.lan", .a);
+    try testing.expectEqual(1, t.resolver.stats.get(.cached));
+    try testing.expectEqual(1, router.received.load(.acquire));
+}
+
+test "an answer whose CNAME points at a blocked name is blocked, also from the cache" {
+    var upstream: @import("upstream.zig").Stub = undefined;
+    try upstream.start(.alias);
+    defer upstream.stop();
+    var t: TestResolver = undefined;
+    try t.initWith(
+        \\blocking:
+        \\  ttl: 30
+        \\  block: [example.net]
+    , .{ .upstream = &.{.{ .address = upstream.address() }} });
+    defer t.deinit();
+    var buf: [4]TestAnswer = undefined;
+
+    for (0..2) |_| {
+        const response = try t.ask("metrics.shop.example", .a);
+        const answers = try t.answers(response, &buf);
+        try testing.expectEqual(1, answers.len);
+        try testing.expectEqual(30, answers[0].ttl);
+        try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, answers[0].data);
+    }
+    try testing.expectEqual(2, t.resolver.stats.get(.blocked));
+    try testing.expectEqual(1, upstream.received.load(.acquire)); // the second from the cache
+}
+
+test "an allow rule for the queried name wins over a blocked CNAME" {
+    var upstream: @import("upstream.zig").Stub = undefined;
+    try upstream.start(.alias);
+    defer upstream.stop();
+    var t: TestResolver = undefined;
+    try t.initWith(
+        \\blocking:
+        \\  block: [example.net]
+        \\  allow: [metrics.shop.example]
+    , .{ .upstream = &.{.{ .address = upstream.address() }} });
+    defer t.deinit();
+
+    const response = try t.ask("metrics.shop.example", .a);
+    var buf: [4]TestAnswer = undefined;
+    try testing.expectEqual(2, (try t.answers(response, &buf)).len);
+    try testing.expectEqual(1, t.resolver.stats.get(.forwarded));
 }
 
 test "a name left to the upstream servers fails with SERVFAIL when none answers" {

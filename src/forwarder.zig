@@ -50,8 +50,8 @@ pub const Forwarder = struct {
     /// Starts `slot_count` tasks. `forwarder` must not move afterwards.
     pub fn init(forwarder: *Forwarder, io: Io, gpa: Allocator, resolver: *Resolver, slot_count: u16) !void {
         std.debug.assert(slot_count > 0);
-        const slots = try allocSlots(gpa, slot_count);
-        errdefer freeSlots(gpa, slots);
+        const slots = try allocUnfilled(Slot, gpa, slot_count);
+        errdefer freeUnfilled(Slot, gpa, slots);
         const queue_buffer = try gpa.alloc(*Slot, 2 * @as(usize, slot_count));
         errdefer gpa.free(queue_buffer);
         forwarder.* = .{
@@ -73,24 +73,8 @@ pub const Forwarder = struct {
     pub fn deinit(forwarder: *Forwarder) void {
         forwarder.group.cancel(forwarder.io);
         forwarder.gpa.free(forwarder.queue_buffer);
-        freeSlots(forwarder.gpa, forwarder.slots);
+        freeUnfilled(Slot, forwarder.gpa, forwarder.slots);
         forwarder.* = undefined;
-    }
-
-    /// Without the 0xAA fill that `alloc` does in safe builds: it would make
-    /// all of the slots' memory resident at once (4.4 MB for 64), although
-    /// most answers use a few hundred bytes. A slot's bytes are always
-    /// written before they are read: `submit` fills a slot before a task
-    /// sees it, and only the query and answer it wrote are used.
-    fn allocSlots(gpa: Allocator, count: usize) Allocator.Error![]Slot {
-        const len = std.math.mul(usize, @sizeOf(Slot), count) catch return error.OutOfMemory;
-        const bytes = gpa.rawAlloc(len, .of(Slot), @returnAddress()) orelse return error.OutOfMemory;
-        const slots: [*]Slot = @ptrCast(@alignCast(bytes));
-        return slots[0..count];
-    }
-
-    fn freeSlots(gpa: Allocator, slots: []Slot) void {
-        gpa.rawFree(std.mem.sliceAsBytes(slots), .of(Slot), @returnAddress());
     }
 
     /// Answers `query`, which came from `client` on `socket`, once an upstream
@@ -149,3 +133,20 @@ pub const Forwarder = struct {
         forwarder.free.putOneUncancelable(forwarder.io, slot) catch unreachable;
     }
 };
+
+/// Slots with buffers, without the 0xAA fill that `alloc` does in safe
+/// builds: it would make all of their memory resident at once (4.4 MB for
+/// 64 forwarding slots), although most answers use a few hundred bytes. The
+/// caller writes a slot's bytes before reading them: a slot is filled before
+/// a task sees it, and only the query and answer it wrote are used.
+pub fn allocUnfilled(comptime T: type, gpa: Allocator, count: usize) Allocator.Error![]T {
+    const len = std.math.mul(usize, @sizeOf(T), count) catch return error.OutOfMemory;
+    const bytes = gpa.rawAlloc(len, .of(T), @returnAddress()) orelse return error.OutOfMemory;
+    const items: [*]T = @ptrCast(@alignCast(bytes));
+    return items[0..count];
+}
+
+pub fn freeUnfilled(comptime T: type, gpa: Allocator, items: []T) void {
+    if (items.len == 0) return;
+    gpa.rawFree(std.mem.sliceAsBytes(items), .of(T), @returnAddress());
+}

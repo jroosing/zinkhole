@@ -4,6 +4,9 @@
 //! (name, type) and the client's DNSSEC flags. On a hit the bytes are copied
 //! out and adjusted for the new client: its message ID, its spelling of the
 //! name, and record TTLs lowered by the time spent in the cache.
+//!
+//! An expired entry is kept for `serve_stale_s` more, for when no upstream
+//! server answers (RFC 8767): `lookupStale` then serves it with a short TTL.
 
 const std = @import("std");
 const Io = std.Io;
@@ -23,9 +26,14 @@ pub const Cache = struct {
     capacity: u32,
     min_ttl: u32,
     max_ttl: u32,
+    /// How long an expired entry is kept for `lookupStale`.
+    serve_stale_s: u32,
 
     /// Larger responses are not cached.
     pub const max_response_len = 4096;
+    /// TTL of stale answers, as RFC 8767 recommends: clients ask again soon,
+    /// when the upstream servers may be back.
+    pub const stale_ttl = 30;
     const max_key_len = 3 + dns.max_name_len;
 
     const Map = std.array_hash_map.Custom([]const u8, *Entry, KeyContext, true);
@@ -53,6 +61,9 @@ pub const Cache = struct {
         min_ttl: u32,
         max_ttl: u32,
         seed: u64,
+        /// How long after expiring an answer may still be served when no
+        /// upstream server answers (RFC 8767); 0 for never.
+        serve_stale_s: u32 = 0,
     };
 
     pub fn init(gpa: Allocator, options: Options) Allocator.Error!Cache {
@@ -62,6 +73,7 @@ pub const Cache = struct {
             .capacity = options.capacity,
             .min_ttl = options.min_ttl,
             .max_ttl = options.max_ttl,
+            .serve_stale_s = options.serve_stale_s,
         };
         // Allocate the table once, so inserting never allocates under the lock.
         try cache.map.ensureTotalCapacityContext(gpa, options.capacity, cache.context());
@@ -82,6 +94,17 @@ pub const Cache = struct {
 
     /// Copies a cached answer for `q` into `out`, adjusted for this client.
     pub fn lookup(cache: *Cache, io: Io, query: []const u8, q: *const dns.Query, out: []u8) ?[]u8 {
+        return cache.find(io, query, q, out, .fresh);
+    }
+
+    /// Like `lookup`, but also finds an answer that expired less than
+    /// `serve_stale_s` ago, with every TTL set to `stale_ttl`. Only for when
+    /// no upstream server answers.
+    pub fn lookupStale(cache: *Cache, io: Io, query: []const u8, q: *const dns.Query, out: []u8) ?[]u8 {
+        return cache.find(io, query, q, out, .stale);
+    }
+
+    fn find(cache: *Cache, io: Io, query: []const u8, q: *const dns.Query, out: []u8, freshness: enum { fresh, stale }) ?[]u8 {
         if (cache.capacity == 0) return null;
         var key_buf: [max_key_len]u8 = undefined;
         const key = makeKey(&key_buf, q);
@@ -92,8 +115,11 @@ pub const Cache = struct {
             defer cache.mutex.unlock(io);
             const entry = cache.map.getContext(key, cache.context()) orelse return null;
             if (now >= entry.expires_at) {
-                cache.remove(entry);
-                return null;
+                if (now - entry.expires_at >= cache.serve_stale_s) {
+                    cache.remove(entry);
+                    return null;
+                }
+                if (freshness == .fresh) return null;
             }
             const cached = entry.response();
             if (cached.len > out.len) return null;
@@ -109,7 +135,10 @@ pub const Cache = struct {
         dns.writeFlags(response, flags);
         // Same name (ignoring case), type and class, so the lengths match.
         @memcpy(response[dns.header_len..q.question_end], query[dns.header_len..q.question_end]);
-        dns.ageTtls(response, std.math.cast(u32, age) orelse return null) catch return null;
+        switch (freshness) {
+            .fresh => dns.ageTtls(response, std.math.cast(u32, age) orelse return null) catch return null,
+            .stale => dns.clampTtls(response, stale_ttl, stale_ttl) catch return null,
+        }
         return response;
     }
 
@@ -269,6 +298,20 @@ test "TTLs are clamped and uncacheable responses are skipped" {
     dns.writeFlags(servfail, flags);
     cache.store(io, &m.q, servfail);
     try testing.expectEqual(null, cache.lookup(io, m.query, &m.q, &out));
+}
+
+test "min_ttl and max_ttl apply to negative answers too" {
+    var cache: Cache = try .init(testing.allocator, .{ .capacity = 4, .min_ttl = 60, .max_ttl = 120, .seed = 7 });
+    defer cache.deinit();
+    const io = testing.io;
+    var out: [512]u8 = undefined;
+
+    // An NXDOMAIN whose SOA says: cache this for 5 seconds.
+    var m: TestMessages = .{};
+    _ = try m.init(1, "gone.example", 5);
+    const nxdomain = try dns.writeResponse(&m.response_buf, m.query, &m.q, .{ .rcode = .nxdomain, .negative_ttl = 5 });
+    cache.store(io, &m.q, nxdomain);
+    try testing.expectEqual(60, (try dns.minTtl(cache.lookup(io, m.query, &m.q, &out).?)).?);
 }
 
 test "least recently used entries are evicted first" {

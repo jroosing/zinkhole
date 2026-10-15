@@ -210,7 +210,7 @@ fn healthcheck(io: Io, target: []const u8) u8 {
 fn check(io: Io, gpa: Allocator, cfg: *const Config) !u8 {
     var policy: Policy = try .init(io, gpa, cfg);
     defer policy.deinit();
-    const lists = Lists.load(io, gpa, .fromConfig(cfg)) catch |err| switch (err) {
+    const lists = Lists.load(io, gpa, .fromConfig(cfg), .{}) catch |err| switch (err) {
         error.OutOfMemory => |e| return e,
         error.Canceled => unreachable, // nothing cancels the main thread
     };
@@ -248,6 +248,7 @@ fn run(io: Io, gpa: Allocator, config_path: []const u8, cfg: *Config, tz: ?[]con
         .min_ttl = cfg.cache.min_ttl,
         .max_ttl = cfg.cache.max_ttl,
         .seed = randomSeed(io),
+        .serve_stale_s = cfg.cache.serve_stale_hours * 3600,
     });
     defer cache.deinit();
 
@@ -529,7 +530,7 @@ const App = struct {
     /// Runs as a background task: loads the lists, nothing else.
     fn loadLists(app: *App, sources: Sources) Io.Cancelable!?*Lists {
         defer app.task_done.store(true, .release);
-        return Lists.load(app.io, app.gpa, sources) catch |err| switch (err) {
+        return Lists.load(app.io, app.gpa, sources, .{}) catch |err| switch (err) {
             error.Canceled => |e| return e,
             error.OutOfMemory => {
                 log.err("out of memory while loading lists, keeping the previous lists", .{});
@@ -838,4 +839,5 @@ test {
     _ = @import("metrics.zig");
     _ = @import("http_service.zig");
     _ = @import("forwarder.zig");
+    _ = @import("test_fuzz.zig");
 }

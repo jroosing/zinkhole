@@ -319,6 +319,7 @@ const LineSplitter = struct {
 // Tests
 
 const testing = std.testing;
+const fuzz = @import("test_fuzz.zig");
 
 const TestSink = struct {
     rules: std.ArrayList([]const u8) = .empty,
@@ -479,3 +480,47 @@ test "a list fetched over https is never accepted from a redirect to http" {
     try refuseDowngrade("http://lists.example/ads.txt", try std.Uri.parse("http://cdn.example/ads.txt"));
     try refuseDowngrade("http://lists.example/ads.txt", try std.Uri.parse("https://lists.example/ads.txt"));
 }
+
+test "fuzz: every rule from a list is a valid name, however the list arrives in chunks" {
+    try testing.fuzz({}, fuzzList, .{ .corpus = &.{fuzz.input(
+        "\xEF\xBB\xBF# hosts\n0.0.0.0 ads.example.com tracker.example.com # comment\n" ++
+            "||ads.example^\n@@||ok.example^$important\n*.wild.example\n" ++
+            "address=/a.example/b.example/0.0.0.0\nlocal=/c.example/\nexample.com##.ad\r\nplain.example",
+    )} });
+}
+
+fn fuzzList(_: void, smith: *testing.Smith) !void {
+    var buf: [1024]u8 = undefined;
+    const text = buf[0..smith.slice(&buf)];
+
+    var whole: FuzzSink = .{};
+    var reader: Io.Reader = .fixed(text);
+    try consume(&reader, &whole, buf.len);
+
+    var parts: FuzzSink = .{};
+    var splitter: LineSplitter = .{};
+    const split = smith.index(text.len + 1);
+    try splitter.feed(text[0..split], &parts);
+    try splitter.feed(text[split..], &parts);
+    try splitter.finish(&parts);
+    try testing.expectEqual(whole, parts);
+}
+
+/// Checks each rule, and remembers them all as one hash.
+const FuzzSink = struct {
+    stats: Stats = .{},
+    hash: u64 = 0,
+
+    fn add(sink: *FuzzSink, rule: Rule) !void {
+        var buf: [dns.max_name_len]u8 = undefined;
+        try testing.expectEqualStrings(rule.name, dns.normalizeName(rule.name, &buf) orelse return error.TestUnexpectedResult);
+        try testing.expect(rule.match.exact or rule.match.subdomains);
+        const flags: u8 = @as(u8, @bitCast(rule.match)) | @as(u8, @intFromBool(rule.exception)) << 7;
+        sink.hash = std.hash.Wyhash.hash(sink.hash, rule.name) +% flags;
+        sink.stats.rules += 1;
+    }
+
+    fn skip(sink: *FuzzSink) void {
+        sink.stats.skipped += 1;
+    }
+};

@@ -14,9 +14,13 @@ No web UI, no database, no state on disk: one static binary and one YAML file
 - **Blocklists** from URLs or files, in any common format, auto-detected per
   line: hosts files, plain domains, `*.wildcards`, Adblock (`||domain^`,
   `@@||domain^` exceptions) and dnsmasq (`address=/domain/`). Allowlists and
-  inline rules. Lists refresh in the background.
+  inline rules. Lists refresh in the background. Answers that alias (CNAME) a
+  blocked domain are blocked too, so trackers cannot hide behind a
+  first-party name.
 - **Local DNS**: `nas.lan: 192.168.1.10`, multiple IPv4/IPv6 addresses per
-  name, `*.apps.lan` wildcards, automatic reverse (PTR) lookups.
+  name, `*.apps.lan` wildcards, automatic reverse (PTR) lookups. Zones such as
+  `lan` can be forwarded to your router, so its DHCP clients' names resolve
+  while everything else goes to encrypted upstream servers.
 - **Privacy**: private names (`.lan`, `.home.arpa`, `.internal`, single-label
   names, reverse lookups of private IPs) never leak upstream; client EDNS
   options (cookies, client subnet) are stripped before forwarding; Firefox's
@@ -24,13 +28,16 @@ No web UI, no database, no state on disk: one static binary and one YAML file
 - **DNS over TLS** to upstream servers, so your ISP can neither read nor
   alter your queries. Connections are reused, so after the first query it is
   as fast as plain DNS.
-- **Caching** of upstream answers (LRU, TTL-aware, bounded).
+- **Caching** of upstream answers (LRU, TTL-aware, bounded). When no upstream
+  server answers, answers that expired in the last 24 hours are served anyway
+  (RFC 8767), so a short outage goes unnoticed for names already in use.
 - **DNSSEC** flags are passed through, so a validating upstream (Quad9 and
   Cloudflare both validate) refuses forged data. zinkhole does not validate
   signatures itself.
 - UDP and TCP, IPv4 and IPv6, upstream failover, TCP fallback for large
   answers. Upstream servers are tried in the order listed, starting with the one
-  that answered last, so later ones act as fallbacks.
+  that answered last, so later ones act as fallbacks; after a failover, one
+  query a minute tries the first server again, and it takes over once it answers.
 - **Metrics** as JSON for `curl` or a browser: queries per outcome today
   (since local midnight) and in the last 24 hours, hour by hour, upstream
   answer times, and the state of the lists and sync (see [Metrics](#metrics)).
@@ -53,9 +60,16 @@ zig build --release            # ReleaseSafe: optimized, bounds checks kept
 zig build test                 # unit tests (offline)
 zig build test -Dnetwork       # also DNS over TLS to a public server
 zig build test -Dtest-filter="name"   # only tests whose name contains this
+zig build test --fuzz=1M -Dtest-filter="fuzz: no message"  # fuzz one target (see below)
 zig build --release -Dtarget=aarch64-linux-musl -Dstrip=true   # e.g. Raspberry Pi 64-bit
 zig build --release -Dtarget=arm-linux-musleabihf -Dstrip=true # Raspberry Pi 32-bit
 ```
+
+The parsers for untrusted input have coverage-guided fuzz tests (their names
+start with `fuzz:`: DNS messages, list lines and the config, which is also
+what replicas receive). A plain `zig build test` runs only their starting
+inputs; `--fuzz` searches for failures, one target at a time (pick it with
+`-Dtest-filter`). Without a limit it runs until stopped and serves a web UI.
 
 Linux builds are static binaries of about 1 MB (`-Dstrip=true` drops the
 debug info, which costs disk space only, not memory). Releases contain the
@@ -511,14 +525,22 @@ being silently ignored.
 1. Client not in `server.allow_clients` → `REFUSED`
 2. Name in `local.records` (or PTR for one of their addresses) → local answer
 3. Blocked by a list or inline rule, and not allowed → `0.0.0.0`/`::` or `NXDOMAIN`
-4. Private or special-use name → `NXDOMAIN` (unless `private_names: forward`)
-5. In the cache → cached answer, TTLs reduced by its age
-6. Otherwise → forwarded upstream, then cached
+4. Name in a zone of `local.forward` → cached answer, or the zone's server
+5. Private or special-use name → `NXDOMAIN` (unless `private_names: forward`)
+6. In the cache → cached answer, TTLs reduced by its age
+7. Otherwise → forwarded upstream, then cached; if no upstream server answers,
+   an answer that expired less than `cache.serve_stale_hours` ago, with TTL 30
 
 A listed domain blocks itself and all of its subdomains; `*.example.com`
-blocks only the subdomains. Allow rules always win over block rules. Blocked
+blocks only the subdomains. An upstream or cached answer whose CNAME records
+point at a blocked name gets the block response instead (CNAME cloaking),
+unless an allow rule matches the name asked for; this is checked on every
+answer, so a reload that changes the rules applies at once. Allow rules always win over block rules. Blocked
 names get an answer for every record type (empty for types other than A/AAAA),
-so clients cannot get around a block through HTTPS/SVCB records.
+so clients cannot get around a block through HTTPS/SVCB records. Answers that
+say a name or record type does not exist (NXDOMAIN, or no records of the type
+asked for) carry an SOA record, so clients cache them for `blocking.ttl` or
+`local.ttl` instead of asking again every time.
 
 ## Design
 
@@ -526,10 +548,10 @@ so clients cannot get around a block through HTTPS/SVCB records.
 |------|----------------|
 | `main.zig` | CLI, startup, signals, running list loads in the background |
 | `config.zig`, `yaml.zig` | YAML subset parser and validated, typed config |
-| `server.zig`, `tcp.zig` | UDP/TCP listeners, fixed worker pool, TCP framing with deadlines |
+| `server.zig`, `tcp.zig` | UDP/TCP listeners, fixed worker and TCP connection pools, TCP framing with deadlines |
 | `forwarder.zig` | The forwarding slots: cache misses go to upstream servers without holding up a worker |
 | `resolver.zig` | The query pipeline above, statistics, query log |
-| `policy.zig` | `Policy`: steps 2-4 of the pipeline (local, blocked, private), from the config (rebuilt on reload) and the downloaded `Lists` |
+| `policy.zig` | `Policy`: steps 2-5 of the pipeline (local, blocked, forwarded zone, private) and blocked aliases (ADR-0006), from the config (rebuilt on reload) and the downloaded `Lists` |
 | `refresh.zig` | When lists load: refresh interval, retry backoff, timeouts |
 | `sync.zig` | Sync: the origin's endpoint, signed fetches, the replica's state file |
 | `metrics.zig` | Counts per local hour, the JSON document and its endpoint |
@@ -562,7 +584,9 @@ pool of forwarding slots (`upstream.max_in_flight`, 64 by default), and the
 worker goes back to receiving at once, so a slow upstream server never holds
 up an answer that needs none. When every slot is busy, as in an upstream
 outage, a cache miss gets SERVFAIL at once, so local names and cache hits keep
-answering instantly.
+answering instantly. TCP connections are served by a pool of 16 connection
+slots shared by all listeners, so a few idle or slow TCP clients cannot hold
+up the others; a connection that finds every slot busy is closed at once.
 Each worker and slot owns one fixed query buffer and one fixed response
 buffer, so answering a query allocates nothing; only cache insertions do, and
 the cache has a fixed capacity. On one CPU this answers about 340,000
@@ -587,7 +611,8 @@ certificate, which must chain to the system's CA certificates.
 and inline rules while lists download in the background. This also lets the
 host resolve the list servers' names through zinkhole itself. Lists are
 streamed line by line, never held in memory as a whole, and capped at 64 MiB
-each. If a refresh fails partway, the previous complete lists stay in use and
+each. A source that has not finished after 2 minutes counts as failed, so a
+server that stops sending cannot hold up the others. If a refresh fails partway, the previous complete lists stay in use and
 the refresh is retried with exponential backoff. After a reload that changes
 the lists, the new ones are used right away, even if some of them failed.
 
@@ -596,9 +621,9 @@ the lists, the new ones are used right away, even if some of them failed.
 - Built in ReleaseSafe: bounds and integer overflow checks stay on. Every
   length read from a DNS message is checked before use; malformed packets get
   `FORMERR` or are dropped. The parsers are tested against random and mutated
-  input. The tests, including concurrent forwarding, shutdown in the middle of
+  input, and fuzzed with coverage guidance (`zig build test --fuzz`). The tests, including concurrent forwarding, shutdown in the middle of
   exchanges, reloads and syncs, pass under ThreadSanitizer
-  (`zig build test -Dsanitize-thread`). Pointer-stability locks make safe builds panic if a
+  (`zig build test -Dsanitize-thread`, which CI runs on every push). Pointer-stability locks make safe builds panic if a
   buffer that other code points into (the listener sockets workers use, the
   domain bytes a hash table reads) could be reallocated.
 - Upstream queries can use DNS over TLS with certificate verification. For
@@ -607,7 +632,8 @@ the lists, the new ones are used right away, even if some of them failed.
   same ID and question are accepted.
 - Only allowed client networks are answered (default: private ranges), so an
   accidentally exposed port is not an open resolver. TCP connections from
-  other networks are closed on arrival, so they cannot occupy a worker. Zone
+  other networks are closed on arrival, so they cannot occupy a TCP slot; at
+  most 16 connections are served at once, and further ones are closed. Zone
   transfers and non-IN classes are refused. The TCP ports are not shared
   with other processes (no `SO_REUSEPORT`).
 - Lists are fetched over TLS with system CA verification (plain `http://`
@@ -640,8 +666,6 @@ the lists, the new ones are used right away, even if some of them failed.
 - No DNSSEC validation in zinkhole itself: it relies on a validating upstream
   (Quad9 and Cloudflare both validate). Blocked and local answers are
   unsigned, which only matters to clients that validate on their own.
-- Upstream servers are tried starting with the one that answered last; there
-  is no mode that always prefers the first one.
 - Regular-expression rules and per-client blocking groups are not supported.
 - Lists are downloaded again on every start (nothing is stored on disk).
 

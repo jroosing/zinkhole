@@ -2,9 +2,11 @@
 //! threads. A UDP worker answers what needs no upstream server and hands
 //! cache misses to the forwarding stage (forwarder.zig, ADR-0005), so it
 //! never waits for one; when every forwarding slot is busy, it answers
-//! SERVFAIL. Memory is fixed at startup: each worker and each
-//! forwarding slot owns one query and one response buffer, and answering a
-//! query allocates nothing (only cache insertions do).
+//! SERVFAIL. TCP connections are handed to a fixed pool of connection
+//! slots, so a few slow or idle clients cannot hold up the others. Memory is
+//! fixed at startup: each worker, TCP slot and forwarding slot owns one
+//! query and one response buffer, and answering a query allocates nothing
+//! (only cache insertions do).
 
 const std = @import("std");
 const Io = std.Io;
@@ -22,8 +24,8 @@ const log = std.log.scoped(.server);
 
 /// Larger queries are dropped; real queries are well under 512 bytes.
 const max_query_len = forwarder_mod.max_query_len;
-/// TCP is only used for truncated answers, so few workers suffice.
-const tcp_workers_per_listener = 2;
+/// TCP connections served at once, over all listeners, unless set.
+const default_tcp_connections = 16;
 /// An idle TCP connection is closed after this long (RFC 7766 suggests seconds).
 const tcp_idle_timeout_ms = 5_000;
 /// Queries answered per TCP connection before it is closed.
@@ -35,7 +37,15 @@ pub const Server = struct {
     resolver: *Resolver,
     udp_sockets: std.ArrayList(net.Socket) = .empty,
     tcp_listeners: std.ArrayList(net.Server) = .empty,
+    /// UDP workers.
     workers: []Worker = &.{},
+    /// TCP connection slots: idle ones, and ones holding a connection for a
+    /// task. Each slot is in at most one queue, and both can hold every
+    /// slot, so putting one back never blocks.
+    tcp_slots: []Worker = &.{},
+    tcp_free: Io.Queue(*Worker) = undefined,
+    tcp_work: Io.Queue(*Worker) = undefined,
+    tcp_queue_buffer: []*Worker = &.{},
     group: Io.Group = .init,
     /// Valid once `start` has started it.
     forwarder: Forwarder = undefined,
@@ -47,6 +57,8 @@ pub const Server = struct {
         server: *Server,
         query: [max_query_len]u8,
         response: [dns.max_message_len]u8,
+        /// TCP slots only: the connection being served.
+        stream: net.Stream,
     };
 
     /// Opens a UDP socket and a TCP listener on every address.
@@ -90,18 +102,27 @@ pub const Server = struct {
         udp_workers: u16,
         /// Upstream queries in flight at once (`upstream.max_in_flight`).
         forward_slots: u16,
+        /// TCP connections served at once, over all listeners; further
+        /// connections are closed on arrival.
+        tcp_connections: u16 = default_tcp_connections,
     };
 
-    /// Starts the forwarding slots and the workers: `udp_workers` per UDP
-    /// socket plus a few per TCP listener. `server` must not move afterwards.
+    /// Starts the forwarding slots, `udp_workers` per UDP socket, the TCP
+    /// connection slots and one accepting task per TCP listener. `server`
+    /// must not move afterwards.
     pub fn start(server: *Server, options: Options) !void {
+        std.debug.assert(options.tcp_connections > 0);
         try server.forwarder.init(server.io, server.gpa, server.resolver, options.forward_slots);
         server.forwarding = true;
         const udp_workers = options.udp_workers;
-        const udp_count = server.udp_sockets.items.len * udp_workers;
-        const tcp_count = server.tcp_listeners.items.len * tcp_workers_per_listener;
-        server.workers = try server.gpa.alloc(Worker, udp_count + tcp_count);
+        server.workers = try server.gpa.alloc(Worker, server.udp_sockets.items.len * udp_workers);
         for (server.workers) |*worker| worker.server = server;
+        server.tcp_slots = try forwarder_mod.allocUnfilled(Worker, server.gpa, options.tcp_connections);
+        for (server.tcp_slots) |*slot| slot.server = server;
+        server.tcp_queue_buffer = try server.gpa.alloc(*Worker, 2 * @as(usize, options.tcp_connections));
+        server.tcp_free = .init(server.tcp_queue_buffer[0..options.tcp_connections]);
+        server.tcp_work = .init(server.tcp_queue_buffer[options.tcp_connections..]);
+        for (server.tcp_slots) |*slot| server.tcp_free.putOneUncancelable(server.io, slot) catch unreachable;
 
         // Workers keep pointers into the socket lists: from here on, any
         // operation that could move them panics instead of leaving workers
@@ -117,17 +138,18 @@ pub const Server = struct {
                 next += 1;
             }
         }
-        for (server.tcp_listeners.items) |*listener| {
-            for (0..tcp_workers_per_listener) |_| {
-                try server.group.concurrent(server.io, tcpWorker, .{ &server.workers[next], listener });
-                next += 1;
-            }
-        }
+        for (server.tcp_listeners.items) |*listener| try server.group.concurrent(server.io, acceptTcp, .{ server, listener });
+        for (server.tcp_slots) |_| try server.group.concurrent(server.io, tcpWorker, .{server});
     }
 
     /// Stops all workers and forwarding slots, then closes the sockets.
     pub fn deinit(server: *Server) void {
         server.group.cancel(server.io);
+        // Connections accepted but not yet taken by a slot.
+        if (server.tcp_queue_buffer.len > 0) {
+            var left: [1]*Worker = undefined;
+            while ((server.tcp_work.get(server.io, &left, 0) catch 0) == 1) left[0].stream.close(server.io);
+        }
         // Slots answer on the UDP sockets: they stop before those close.
         if (server.forwarding) server.forwarder.deinit();
         if (server.pointers_locked) {
@@ -139,6 +161,8 @@ pub const Server = struct {
         server.udp_sockets.deinit(server.gpa);
         server.tcp_listeners.deinit(server.gpa);
         server.gpa.free(server.workers);
+        forwarder_mod.freeUnfilled(Worker, server.gpa, server.tcp_slots);
+        server.gpa.free(server.tcp_queue_buffer);
         server.* = undefined;
     }
 
@@ -172,8 +196,10 @@ pub const Server = struct {
         }
     }
 
-    fn tcpWorker(worker: *Worker, listener: *net.Server) Io.Cancelable!void {
-        const io = worker.server.io;
+    /// Hands each connection to a free TCP slot, or closes it when every
+    /// slot is busy.
+    fn acceptTcp(server: *Server, listener: *net.Server) Io.Cancelable!void {
+        const io = server.io;
         while (true) {
             const stream = listener.accept(io) catch |err| switch (err) {
                 error.Canceled => |e| return e,
@@ -183,13 +209,45 @@ pub const Server = struct {
                     continue;
                 },
             };
-            defer stream.close(io);
             // Checked per connection, not just per query: a client that may
-            // not query must not get to hold one of the few TCP workers.
-            if (!ip.isAllowed(worker.server.resolver.allow_clients, stream.socket.address)) continue;
-            serveConnection(worker, stream) catch |err| {
+            // not query must not get to hold a TCP slot.
+            if (!ip.isAllowed(server.resolver.allow_clients, stream.socket.address)) {
+                stream.close(io);
+                continue;
+            }
+            var taken: [1]*Worker = undefined;
+            // With `min` 0 this never blocks.
+            const count = server.tcp_free.get(io, &taken, 0) catch |err| switch (err) {
+                error.Canceled => |e| {
+                    stream.close(io);
+                    return e;
+                },
+                error.Closed => unreachable, // the queues are never closed
+            };
+            if (count == 0) {
+                log.debug("tcp {f}: every connection slot is busy, closing", .{stream.socket.address});
+                stream.close(io);
+                continue;
+            }
+            taken[0].stream = stream;
+            // Room for every slot: this never blocks.
+            server.tcp_work.putOneUncancelable(io, taken[0]) catch unreachable;
+        }
+    }
+
+    fn tcpWorker(server: *Server) Io.Cancelable!void {
+        const io = server.io;
+        while (true) {
+            const slot = server.tcp_work.getOne(io) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                error.Closed => unreachable,
+            };
+            // Room for every slot: this never blocks.
+            defer server.tcp_free.putOneUncancelable(io, slot) catch unreachable;
+            defer slot.stream.close(io);
+            serveConnection(slot, slot.stream) catch |err| {
                 if (err == error.Canceled) return error.Canceled;
-                log.debug("tcp {f}: {t}", .{ stream.socket.address, err });
+                log.debug("tcp {f}: {t}", .{ slot.stream.socket.address, err });
             };
         }
     }
@@ -304,6 +362,57 @@ test "TCP connections from clients outside the allowed networks are closed at on
     // An allowed client would get 5 s to send its query; this one gets none.
     var buf: [2]u8 = undefined;
     try testing.expectError(error.EndOfStream, tcp.readMessage(testing.io, stream.socket.handle, &buf, tcp.deadlineIn(testing.io, 1000)));
+}
+
+/// Sends a query for nas.lan on `stream` and returns the answer count.
+fn askOverTcp(stream: net.Stream, ms: u32) !u16 {
+    var query_buf: [512]u8 = undefined;
+    const query = dns.testQuery(&query_buf, 7, "nas.lan", .a, null);
+    try tcp.writeMessage(testing.io, stream.socket.handle, query, tcp.deadlineIn(testing.io, ms));
+    var response_buf: [512]u8 = undefined;
+    const response = try tcp.readMessage(testing.io, stream.socket.handle, &response_buf, tcp.deadlineIn(testing.io, ms));
+    return dns.readU16(response, 6);
+}
+
+test "idle TCP connections do not hold up other TCP clients" {
+    var t: TestServer = undefined;
+    try t.init(&.{ip.Cidr.parse("127.0.0.0/8").?});
+    defer t.deinit();
+    const idle = [_]net.Stream{ try t.connect(), try t.connect() };
+    defer for (idle) |stream| stream.close(testing.io);
+    try testing.io.sleep(.fromMilliseconds(50), .awake); // both accepted
+
+    const stream = try t.connect();
+    defer stream.close(testing.io);
+    try testing.expectEqual(1, try askOverTcp(stream, 250));
+}
+
+test "TCP connections beyond the slots are closed at once, and freed slots serve again" {
+    var t: TestServer = undefined;
+    try t.init(&.{ip.Cidr.parse("127.0.0.0/8").?});
+    defer t.deinit();
+    var server: Server = .{ .io = testing.io, .gpa = testing.allocator, .resolver = &t.resolver };
+    defer server.deinit();
+    try server.listen(&.{.{ .ip4 = .loopback(0) }});
+    try server.start(.{ .udp_workers = 1, .forward_slots = 1, .tcp_connections = 2 });
+    const address = server.tcp_listeners.items[0].socket.address;
+    const connect: net.IpAddress.ConnectOptions = .{ .mode = .stream, .protocol = .tcp };
+
+    const first = try address.connect(testing.io, connect);
+    const second = try address.connect(testing.io, connect);
+    defer second.close(testing.io);
+    try testing.io.sleep(.fromMilliseconds(50), .awake); // both hold a slot
+
+    const third = try address.connect(testing.io, connect);
+    defer third.close(testing.io);
+    var buf: [2]u8 = undefined;
+    try testing.expectError(error.EndOfStream, tcp.readMessage(testing.io, third.socket.handle, &buf, tcp.deadlineIn(testing.io, 1000)));
+
+    first.close(testing.io);
+    try testing.io.sleep(.fromMilliseconds(50), .awake); // its slot is free again
+    const fourth = try address.connect(testing.io, connect);
+    defer fourth.close(testing.io);
+    try testing.expectEqual(1, try askOverTcp(fourth, 1000));
 }
 
 /// A TCP port that is free right now.

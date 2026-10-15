@@ -52,7 +52,7 @@ zinkhole's most subtle behaviour has no tests. It lives in the resolver, in the 
      - Stub servers on loopback (UDP and TCP on an ephemeral port, scripted per query) test the plain adapter and failover through the real interfaces. That covers answers, spoofed packets, the TCP fallback within the deadline, timeouts, REFUSED, the preferred server, all servers failing, and removing EDNS options.
      - The TLS adapter gets one opt-in test, `zig build test -Dnetwork`, which sends two queries to a public DNS-over-TLS server. It covers the handshake, certificate checks and connection reuse. Normal test runs stay offline.
 
-All three items are settled.
+All three items are settled. *(ADR-0006 adds the `forward` decision, `blockAlias` and a TTL on `private`.)*
 
 ## Considered options
 

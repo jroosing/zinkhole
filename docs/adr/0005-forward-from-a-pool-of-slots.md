@@ -21,7 +21,7 @@ Each UDP worker used to answer a query from start to finish, the upstream round 
   - TCP when the answer is truncated;
   - DNS over TLS with certificate checks;
   - failover in the configured order.
-- **The same answers.** Truncation for the client's UDP size, caching, Outcome counting, Metrics and the query log work as before. TCP clients are still answered by their worker, start to finish; TCP is only used for truncated answers.
+- **The same answers.** Truncation for the client's UDP size, caching, Outcome counting, Metrics and the query log work as before. TCP clients are still answered by their worker, start to finish; TCP is only used for truncated answers. *(Amended October 2026: TCP connections now have a pool of 16 connection slots of their own, shared by all listeners, so a few idle TCP clients cannot hold up the others; a connection that finds every slot busy is closed at once.)*
 - **DNS over TLS.** Parallel queries mean parallel connections. A server gets at most 16 connections at once. An exchange beyond that waits for one to come free, within its own timeout: a busy server is only treated as failed when that timeout passes, like any other timeout. Up to 8 idle connections are kept per server, so a burst does not need a new handshake for each query.
 - **Shutdown.** Stopping the server cancels the slots, including exchanges in flight, before it closes the sockets they answer on.
 - **Memory.** Two defaults would have cost more than the slots themselves, so they changed:

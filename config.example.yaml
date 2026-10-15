@@ -28,7 +28,7 @@ server:
     - fc00::/7
     - fe80::/10
 
-  # UDP worker threads per listen address (TCP gets 2 per address). They
+  # UDP worker threads per listen address (TCP connections share 16 slots). They
   # answer local records, blocked names and cache hits themselves, and hand
   # everything else to upstream.max_in_flight, so a few are enough.
   workers: 4
@@ -37,7 +37,8 @@ upstream:
   # DNS servers that answer everything not handled locally. Tried in order;
   # the one that answered last is tried first. (Required.) Servers further down
   # are the fallbacks: they are used when the ones before them fail, so listing
-  # a second provider keeps DNS working when one provider is down.
+  # a second provider keeps DNS working when one provider is down. After a
+  # failover, one query a minute tries the first server again.
   #
   # DNS over TLS (recommended): tls://<ip>[:port]#<name>, where <name> is the
   # name on the server's certificate. Queries are encrypted, so your ISP can
@@ -67,6 +68,10 @@ cache:
   # Clamp the TTLs of cached answers (seconds).
   min_ttl: 0
   max_ttl: 86400
+  # When no upstream server answers, answer from the cache anyway if the
+  # answer expired less than this many hours ago (with a TTL of 30 s, so
+  # clients ask again soon). 0 never serves expired answers. At most 168.
+  serve_stale_hours: 24
 
 blocking:
   # How blocked names are answered: `zero` (0.0.0.0 / :: and an empty answer
@@ -118,6 +123,15 @@ local:
   #   forward  - send them upstream, e.g. when upstream is your router and
   #              knows its DHCP clients' names
   private_names: nxdomain
+
+  # Zones whose names go to a server of their own instead of the upstream
+  # servers (plain DNS, ip[:port]), e.g. your router for its DHCP clients'
+  # names and reverse lookups. The longest matching zone wins; local records
+  # and blocking still apply first. Private names in these zones are not
+  # answered NXDOMAIN.
+  # forward:
+  #   lan: 192.168.1.1                          # example
+  #   1.168.192.in-addr.arpa: 192.168.1.1       # example
 
 log:
   # error, warn, info or debug

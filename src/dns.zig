@@ -272,6 +272,46 @@ fn skipName(msg: []const u8, start: usize) MalformedError!usize {
     }
 }
 
+/// Reads the possibly compressed name at `start` into `out` as lowercase
+/// dotted text. Each compression pointer must point before everything read
+/// so far, so pointers only ever move backwards and cannot loop.
+pub fn readName(msg: []const u8, start: usize, out: *[max_name_len]u8) MalformedError![]const u8 {
+    var pos = start;
+    var text_len: usize = 0;
+    // As in `readQuestionName`: at most 255 bytes including the root.
+    var wire_len: usize = 0;
+    var earliest = start;
+    while (true) {
+        if (pos >= msg.len) return error.Malformed;
+        const len = msg[pos];
+        switch (len >> 6) {
+            0b00 => {
+                if (len == 0) return out[0..text_len];
+                if (msg.len - pos - 1 < len) return error.Malformed;
+                wire_len += 1 + len;
+                if (wire_len > 254) return error.Malformed;
+                if (text_len != 0) {
+                    out[text_len] = '.';
+                    text_len += 1;
+                }
+                for (msg[pos + 1 ..][0..len]) |c| {
+                    out[text_len] = std.ascii.toLower(c);
+                    text_len += 1;
+                }
+                pos += 1 + len;
+            },
+            0b11 => {
+                if (msg.len - pos < 2) return error.Malformed;
+                const target = readU16(msg, pos) & 0x3FFF;
+                if (target >= earliest) return error.Malformed;
+                earliest = target;
+                pos = target;
+            },
+            else => return error.Malformed,
+        }
+    }
+}
+
 /// Offset just past the question section of a single-question message.
 fn questionEnd(msg: []const u8) MalformedError!usize {
     if (msg.len < header_len or readU16(msg, 4) != 1) return error.Malformed;
@@ -298,24 +338,36 @@ pub fn isResponseTo(response: []const u8, query: []const u8, question_end: usize
     return std.mem.eql(u8, response[name_end..question_end], query[name_end..question_end]);
 }
 
-/// Smallest TTL over all records except OPT, or null if there are none.
+/// Smallest TTL over all records except OPT, or null if there are none. An
+/// SOA in the authority section (a negative answer) also counts with its
+/// MINIMUM field, which caps how long the answer may be cached (RFC 2308).
 pub fn minTtl(msg: []const u8) MalformedError!?u32 {
     var min: ?u32 = null;
     var records: RecordIterator = .init(msg, try questionEnd(msg));
     while (try records.next()) |record| {
         if (record.type == .opt) continue;
         min = @min(min orelse record.ttl, record.ttl);
+        // MINIMUM is the last field, after two names of at least one byte.
+        if (record.type == .soa and record.section == .authority and record.rdata_len >= 22) {
+            min = @min(min.?, readU32(msg, record.rdata_offset + record.rdata_len - 4));
+        }
     }
     return min;
 }
 
-/// Clamps the TTL of every record except OPT into `[lo, hi]`.
+/// Clamps the TTL of every record except OPT into `[lo, hi]`, and the
+/// MINIMUM of an SOA in the authority section, which is a negative answer's
+/// TTL too (see `minTtl`).
 pub fn clampTtls(msg: []u8, lo: u32, hi: u32) MalformedError!void {
     assert(lo <= hi);
     var records: RecordIterator = .init(msg, try questionEnd(msg));
     while (try records.next()) |record| {
         if (record.type == .opt) continue;
         writeU32(msg, record.ttl_offset, std.math.clamp(record.ttl, lo, hi));
+        if (record.type == .soa and record.section == .authority and record.rdata_len >= 22) {
+            const minimum = record.rdata_offset + record.rdata_len - 4;
+            writeU32(msg, minimum, std.math.clamp(readU32(msg, minimum), lo, hi));
+        }
     }
 }
 
@@ -388,6 +440,8 @@ pub const Answer = union(enum) {
     aaaa: [16]u8,
     /// Target name in dotted form, for PTR records.
     ptr: []const u8,
+    /// Target name in dotted form, for CNAME records.
+    cname: []const u8,
 };
 
 pub const ResponseOptions = struct {
@@ -396,7 +450,14 @@ pub const ResponseOptions = struct {
     truncated: bool = false,
     answers: []const Answer = &.{},
     ttl: u32 = 0,
+    /// For an NXDOMAIN or an empty answer: adds an SOA record, so clients
+    /// cache the negative answer for this long (RFC 2308).
+    negative_ttl: ?u32 = null,
 };
+
+/// The made-up zone of the SOA in negative answers (`.invalid`, RFC 6761).
+const soa_mname = "zinkhole.invalid";
+const soa_rname = "hostmaster.zinkhole.invalid";
 
 pub const BuildError = error{NoSpaceLeft};
 
@@ -416,9 +477,11 @@ pub fn writeResponse(out: []u8, query: []const u8, q: *const Query, options: Res
 
     try b.int(u16, q.id);
     try b.int(u16, @backingInt(flags));
+    const negative = options.rcode == .nxdomain or (options.rcode == .noerror and options.answers.len == 0);
+    const soa_ttl: ?u32 = if (negative) options.negative_ttl else null;
     try b.int(u16, 1);
     try b.int(u16, @intCast(options.answers.len));
-    try b.int(u16, 0);
+    try b.int(u16, if (soa_ttl != null) 1 else 0);
     try b.int(u16, if (q.edns != null) 1 else 0);
     try b.bytes(query[header_len..q.question_end]);
 
@@ -433,11 +496,24 @@ pub fn writeResponse(out: []u8, query: []const u8, q: *const Query, options: Res
                 try b.recordHeader(.aaaa, options.ttl, ip.len);
                 try b.bytes(&ip);
             },
-            .ptr => |name| {
-                try b.recordHeader(.ptr, options.ttl, encodedNameLen(name));
+            .ptr, .cname => |name| {
+                try b.recordHeader(if (answer == .ptr) .ptr else .cname, options.ttl, encodedNameLen(name));
                 try b.name(name);
             },
         }
+    }
+
+    if (soa_ttl) |ttl| {
+        // Owned by the question name, so it covers exactly this answer.
+        try b.int(u16, 0xC000 | header_len);
+        try b.recordHeader(.soa, ttl, encodedNameLen(soa_mname) + encodedNameLen(soa_rname) + 20);
+        try b.name(soa_mname);
+        try b.name(soa_rname);
+        try b.int(u32, 1); // serial
+        try b.int(u32, 3600); // refresh
+        try b.int(u32, 600); // retry
+        try b.int(u32, 86400); // expire
+        try b.int(u32, ttl); // minimum: the negative TTL
     }
 
     if (q.edns) |edns| try b.opt(edns.dnssec_ok);
@@ -594,6 +670,7 @@ fn writeU32(msg: []u8, offset: usize, value: u32) void {
 // Tests
 
 const testing = std.testing;
+const fuzz = @import("test_fuzz.zig");
 
 fn repeat(comptime c: u8, comptime n: usize) [n]u8 {
     return @splat(c);
@@ -822,49 +899,104 @@ test "Type formatting" {
     try testing.expectEqualStrings("TYPE999", try std.fmt.bufPrint(&buf, "{f}", .{@as(Type, @fromBackingInt(999))}));
 }
 
-test "random and mutated messages never break the parsers" {
-    var prng: std.Random.DefaultPrng = .init(0x5eed);
-    const random = prng.random();
-    var name_buf: [max_name_len]u8 = undefined;
+test "fuzz: no message breaks the parsers, and a parsed query gets a response to it" {
+    try testing.fuzz({}, fuzzMessage, .{ .corpus = &.{
+        fuzz.input(fuzz_query),
+        fuzz.input(fuzz_response),
+    } });
+}
+
+/// www.example.com A, with an OPT record (DO set).
+const fuzz_query = "\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x01" ++
+    "\x03www\x07example\x03com\x00\x00\x01\x00\x01" ++
+    "\x00\x00\x29\x04\xd0\x00\x00\x80\x00\x00\x00";
+/// Its answer: www.example.com CNAME cdn.example.com (compressed), and an
+/// A record for that.
+const fuzz_response = "\x12\x34\x81\x80\x00\x01\x00\x02\x00\x00\x00\x00" ++
+    "\x03www\x07example\x03com\x00\x00\x01\x00\x01" ++
+    "\xc0\x0c\x00\x05\x00\x01\x00\x00\x00\x3c\x00\x06\x03cdn\xc0\x10" ++
+    "\xc0\x2d\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\x01\x02\x03\x04";
+
+fn fuzzMessage(_: void, smith: *testing.Smith) !void {
+    var buf: [600]u8 = undefined;
+    const msg = buf[0..smith.slice(&buf)];
     var out: [2048]u8 = undefined;
 
-    // A valid query and response to mutate.
+    _ = minTtl(msg) catch {};
+    ageTtls(msg, 5) catch {};
+    clampTtls(msg, 1, 100) catch {};
+    _ = writeHeaderOnly(&out, msg, .formerr);
+    if (questionEnd(msg)) |question_end| {
+        // Every name in the message reads as a valid name, or fails cleanly.
+        var name_buf: [max_name_len]u8 = undefined;
+        try expectValidName(readName(msg, header_len, &name_buf));
+        var records: RecordIterator = .init(msg, question_end);
+        while (records.next() catch null) |record| {
+            if (record.type == .cname or record.type == .ptr or record.type == .ns) {
+                try expectValidName(readName(msg, record.rdata_offset, &name_buf));
+            }
+        }
+    } else |_| {}
+
+    var parsed_name: [max_name_len]u8 = undefined;
+    const q = parseQuery(msg, &parsed_name) catch return;
+    try expectValidName(q.name);
+    const answers = [_]Answer{ .{ .a = .{ 1, 2, 3, 4 } }, .{ .cname = "a.b" }, .{ .ptr = "c" } };
+    for ([_]ResponseOptions{
+        .{ .answers = &answers, .ttl = 1 },
+        .{ .rcode = .nxdomain, .negative_ttl = 30 },
+    }) |options| {
+        const response = try writeResponse(&out, msg, &q, options);
+        try testing.expect(isResponseTo(response, msg, q.question_end));
+        _ = try minTtl(response);
+    }
+    // What goes upstream is still the same query.
+    const upstream = rewriteForUpstream(msg, &q);
+    var upstream_name: [max_name_len]u8 = undefined;
+    const sent = try parseQuery(upstream.bytes, &upstream_name);
+    try testing.expectEqualStrings(q.name, sent.name);
+}
+
+/// Lowercase text of at most `max_name_len` bytes (labels may hold any
+/// other byte), or `error.Malformed`.
+fn expectValidName(result: MalformedError![]const u8) !void {
+    const name = result catch return;
+    try testing.expect(name.len <= max_name_len);
+    for (name) |c| try testing.expect(!std.ascii.isUpper(c));
+}
+test "a negative answer's TTL is the smaller of its SOA's TTL and MINIMUM (RFC 2308)" {
+    var name_buf: [max_name_len]u8 = undefined;
     var query_buf: [512]u8 = undefined;
-    const query = testQuery(&query_buf, 1, "www.example.com", .a, 1232);
+    const query = testQuery(&query_buf, 1, "gone.example.com", .a, null);
     const q = try parseQuery(query, &name_buf);
     var response_buf: [512]u8 = undefined;
-    const answers = [_]Answer{ .{ .a = .{ 1, 2, 3, 4 } }, .{ .aaaa = @splat(1) }, .{ .ptr = "a.b" } };
-    const response = try writeResponse(&response_buf, query, &q, .{ .answers = &answers, .ttl = 60 });
+    const response = try writeResponse(&response_buf, query, &q, .{ .rcode = .nxdomain, .negative_ttl = 3600 });
+    try testing.expectEqual(3600, (try minTtl(response)).?);
 
-    var buf: [600]u8 = undefined;
-    for (0..50_000) |i| {
-        const msg: []u8 = switch (i % 3) {
-            0 => random: {
-                const len = random.uintLessThan(usize, buf.len);
-                random.bytes(buf[0..len]);
-                break :random buf[0..len];
-            },
-            else => mutated: {
-                const source = if (i % 3 == 1) query else response;
-                @memcpy(buf[0..source.len], source);
-                for (0..random.intRangeAtMost(usize, 1, 4)) |_| {
-                    buf[random.uintLessThan(usize, source.len)] = random.int(u8);
-                }
-                break :mutated buf[0..random.intRangeAtMost(usize, 0, source.len)];
-            },
-        };
+    // The SOA's MINIMUM is the last field of the message (there is no OPT).
+    writeU32(response, response.len - 4, 60);
+    try testing.expectEqual(60, (try minTtl(response)).?);
+}
 
-        _ = minTtl(msg) catch {};
-        ageTtls(msg, 5) catch {};
-        clampTtls(msg, 1, 100) catch {};
-        _ = isResponseTo(msg, query, q.question_end);
-        _ = writeHeaderOnly(&out, msg, .formerr);
-        var parsed_name: [max_name_len]u8 = undefined;
-        if (parseQuery(msg, &parsed_name)) |parsed| {
-            _ = writeResponse(&out, msg, &parsed, .{ .answers = &answers, .ttl = 1 }) catch {};
-            _ = rewriteForUpstream(msg, &parsed);
-        } else |_| {}
-    }
+test "compressed names are read in full, and pointers that do not point back are rejected" {
+    // At 12: "example.com"; at 25: "www" + a pointer to 12; at 31: "CDN" + a
+    // pointer to 25.
+    const msg = @as([header_len]u8, @splat(0)) ++
+        "\x07example\x03com\x00".* ++
+        "\x03www\xc0\x0c".* ++
+        "\x03CDN\xc0\x19".*;
+    var buf: [max_name_len]u8 = undefined;
+    try testing.expectEqualStrings("example.com", try readName(&msg, 12, &buf));
+    try testing.expectEqualStrings("www.example.com", try readName(&msg, 25, &buf));
+    try testing.expectEqualStrings("cdn.www.example.com", try readName(&msg, 31, &buf));
+
+    // A pointer to itself, and a pointer forwards.
+    const loop = @as([header_len]u8, @splat(0)) ++ "\x03www\xc0\x0c".*;
+    try testing.expectError(error.Malformed, readName(&loop, 12, &buf));
+    const forwards = @as([header_len]u8, @splat(0)) ++ "\xc0\x0e\x03www\x00".*;
+    try testing.expectError(error.Malformed, readName(&forwards, 12, &buf));
+    // Cut off in the middle of a label.
+    try testing.expectError(error.Malformed, readName(msg[0..20], 12, &buf));
 }
 
 test "names are printed safely for logs" {

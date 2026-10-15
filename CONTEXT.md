@@ -15,7 +15,7 @@ A client whose address falls inside one of the configured client networks; every
 _Avoid_: trusted client, whitelisted client
 
 **Query pipeline**:
-The fixed order in which a query is checked: allowed client, local record, blocked name, private name, cache, upstream server. The first step that applies decides the answer.
+The fixed order in which a query is checked: allowed client, local record, blocked name, forwarded zone, private name, cache, upstream server. The first step that applies decides the answer; a name in a forwarded zone is then answered from the cache or by the zone's server.
 _Avoid_: resolution chain, filter chain
 
 **Outcome**:
@@ -27,7 +27,7 @@ Counts of Outcomes and of upstream server attempts per local hour for the last 2
 _Avoid_: stats, statistics, telemetry
 
 **Policy**:
-Everything zinkhole uses to answer a name without asking an upstream server: local records, rules and private names.
+Everything zinkhole uses to decide how a name is answered before asking an upstream server: local records, rules, forwarded zones and private names.
 _Avoid_: rules, filter
 
 ### Blocking
@@ -62,7 +62,7 @@ The URL or file path a list is loaded from.
 _Avoid_: feed, subscription
 
 **Blocked name**:
-A name matched by at least one block rule and no allow rule.
+A name matched by at least one block rule and no allow rule. An upstream answer that makes a name an alias (CNAME) of a blocked name is blocked too, unless an allow rule matches the name asked for.
 
 **Block response**:
 How blocked names are answered: zero addresses (`0.0.0.0` / `::`) or NXDOMAIN.
@@ -81,8 +81,12 @@ A `*.name` pattern that matches every name below `name` but not `name` itself. U
 A query for the name that belongs to an address (PTR), answered from the local records.
 
 **Private name**:
-A name that cannot exist on the public internet, such as `.lan`, `.home.arpa`, `.internal`, single-label names and reverse lookups of private addresses. It is never sent to upstream servers unless forwarding of private names is configured.
+A name that cannot exist on the public internet, such as `.lan`, `.home.arpa`, `.internal`, single-label names and reverse lookups of private addresses. It is never sent to upstream servers unless forwarding of private names is configured, and is sent to a zone's server when it is in a forwarded zone.
 _Avoid_: special-use name, internal name, LAN name
+
+**Forwarded zone**:
+A zone (such as `lan` or `1.168.192.in-addr.arpa`) whose names are sent to a server of its own instead of the upstream servers, typically the router that knows its DHCP clients' names. Local records and rules still apply first.
+_Avoid_: conditional forwarder, stub zone
 
 ### Upstream
 

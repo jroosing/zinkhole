@@ -2,7 +2,8 @@
 //! (UDP first, TCP when the answer is truncated) or DNS over TLS (see
 //! dot.zig) behind the same `exchange`. `Upstream` tries the servers in
 //! order, starting with the one that answered last, so a dead server costs
-//! one timeout instead of one per query.
+//! one timeout instead of one per query. After a failover, one query a
+//! minute tries the first server again, and it is preferred once it answers.
 //!
 //! Spoofing defenses: every exchange uses a random query ID, and only answers
 //! with the same ID and the same question are accepted. Plain DNS also uses a
@@ -120,6 +121,13 @@ pub const Upstream = struct {
     timeout_ms: u32,
     /// Index of the server that answered most recently.
     preferred: std.atomic.Value(usize) = .init(0),
+    /// After a failover, one query tries the first server again this often,
+    /// so a short outage does not move traffic to a fallback for good.
+    retry_first_after_s: u32 = 60,
+    /// Boot-clock seconds + 1 from which one query tries the first server
+    /// again; 0 while the first server is preferred. 32 bits: some 32-bit
+    /// targets lack 64-bit atomics.
+    retry_first_at: std.atomic.Value(u32) = .init(0),
     /// CA certificates; loaded only when a server uses DNS over TLS.
     trust: dot.Trust,
     /// Counts every attempt per server, if set.
@@ -174,7 +182,8 @@ pub const Upstream = struct {
     /// its exchange.
     pub fn forward(upstream: *Upstream, io: Io, msg: []u8, q: *const dns.Query, out: []u8) Error![]u8 {
         const query = dns.rewriteForUpstream(msg, q);
-        const first = upstream.preferred.load(.monotonic);
+        const preferred = upstream.preferred.load(.monotonic);
+        const first = if (preferred != 0 and upstream.claimRetry(io)) 0 else preferred;
         for (0..upstream.servers.len) |attempt| {
             const index = (first + attempt) % upstream.servers.len;
             const server = &upstream.servers[index];
@@ -193,10 +202,42 @@ pub const Upstream = struct {
             }
             const micros = @max(0, started.untilNow(io).raw.toMicroseconds());
             upstream.count(io, index, .{ .answer = std.math.lossyCast(u32, @divTrunc(micros, 100)) });
-            if (index != first) upstream.preferred.store(index, .monotonic);
+            if (index != preferred) upstream.prefer(io, index);
             return response;
         }
         return error.AllServersFailed;
+    }
+
+    /// Forwards the client's query `msg` to `address` alone (plain DNS), for
+    /// a forwarded zone: no failover, no preferred server, and no Metrics,
+    /// which count the configured servers only. Rewrites `msg` as `forward`.
+    pub fn forwardTo(upstream: *Upstream, io: Io, address: net.IpAddress, msg: []u8, q: *const dns.Query, out: []u8) Error![]u8 {
+        const query = dns.rewriteForUpstream(msg, q);
+        var server: Server = .{ .plain = .{ .address = address } };
+        const response = server.exchange(io, query, out, tcp.deadlineIn(io, upstream.timeout_ms)) catch |err| {
+            if (err == error.Canceled) return error.Canceled;
+            log.debug("{f}: {t}", .{ server, err });
+            return error.AllServersFailed;
+        };
+        if (dns.readFlags(response).rcode == .refused) {
+            log.debug("{f}: refused", .{server});
+            return error.AllServersFailed;
+        }
+        return response;
+    }
+
+    fn prefer(upstream: *Upstream, io: Io, index: usize) void {
+        upstream.preferred.store(index, .monotonic);
+        const retry_at = if (index == 0) 0 else bootSeconds(io) +| upstream.retry_first_after_s;
+        upstream.retry_first_at.store(retry_at, .monotonic);
+    }
+
+    /// True for the one query that may try the first server again now.
+    fn claimRetry(upstream: *Upstream, io: Io) bool {
+        const at = upstream.retry_first_at.load(.monotonic);
+        const now = bootSeconds(io);
+        if (at == 0 or now < at) return false;
+        return upstream.retry_first_at.cmpxchgStrong(at, now +| upstream.retry_first_after_s, .monotonic, .monotonic) == null;
     }
 
     fn count(upstream: *Upstream, io: Io, server: usize, attempt: metrics_mod.Attempt) void {
@@ -204,6 +245,11 @@ pub const Upstream = struct {
         metrics.countAttempt(server, attempt, Io.Clock.real.now(io).toSeconds());
     }
 };
+
+/// Boot-clock seconds + 1, so that 0 can mean "none".
+fn bootSeconds(io: Io) u32 {
+    return std.math.lossyCast(u32, Io.Clock.boot.now(io).toSeconds() + 1);
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -216,7 +262,8 @@ const testing = std.testing;
 pub const Stub = struct {
     udp: net.Socket,
     tcp: net.Server,
-    behavior: Behavior,
+    /// Can change while the stub runs (`setBehavior`).
+    behavior: std.atomic.Value(Behavior),
     group: Io.Group = .init,
     /// Queries received so far; `last_buf` holds the latest.
     received: std.atomic.Value(u32) = .init(0),
@@ -227,7 +274,7 @@ pub const Stub = struct {
     udp_delay_ms: u32 = 0,
     tcp_delay_ms: u32 = 0,
 
-    const Behavior = enum {
+    const Behavior = enum(u8) {
         answer,
         silent,
         refuse,
@@ -236,12 +283,16 @@ pub const Stub = struct {
         spoof_first,
         /// Answers UDP queries with TC set and no records; TCP in full.
         truncate,
+        /// Answers that the name is an alias (CNAME) of `alias_target`.
+        alias,
     };
+
+    pub const alias_target = "tracker.example.net";
 
     pub fn start(stub: *Stub, behavior: Behavior) !void {
         const io = testing.io;
         const loopback: net.IpAddress = .{ .ip4 = .loopback(0) };
-        stub.* = .{ .behavior = behavior, .udp = try loopback.bind(io, .{ .mode = .dgram, .protocol = .udp }), .tcp = undefined };
+        stub.* = .{ .behavior = .init(behavior), .udp = try loopback.bind(io, .{ .mode = .dgram, .protocol = .udp }), .tcp = undefined };
         errdefer stub.udp.close(io);
         stub.tcp = try stub.udp.address.listen(io, .{ .reuse_address = true });
         errdefer stub.tcp.deinit(io);
@@ -258,6 +309,10 @@ pub const Stub = struct {
 
     pub fn address(stub: *const Stub) net.IpAddress {
         return stub.udp.address;
+    }
+
+    pub fn setBehavior(stub: *Stub, behavior: Behavior) void {
+        stub.behavior.store(behavior, .release);
     }
 
     fn lastQuery(stub: *const Stub) []const u8 {
@@ -279,7 +334,7 @@ pub const Stub = struct {
                 stub.group.concurrent(io, sendLater, .{ stub, message.from, copy }) catch testing.allocator.free(copy);
                 continue;
             }
-            if (stub.behavior == .spoof_first) {
+            if (stub.behavior.load(.acquire) == .spoof_first) {
                 var spoofed_buf: [512]u8 = undefined;
                 const spoofed = spoofed_buf[0..response.len];
                 @memcpy(spoofed, response);
@@ -327,11 +382,12 @@ pub const Stub = struct {
         _ = stub.received.fetchAdd(1, .release);
         var name_buf: [dns.max_name_len]u8 = undefined;
         const q = dns.parseQuery(query, &name_buf) catch return null;
-        const options: dns.ResponseOptions = switch (stub.behavior) {
+        const options: dns.ResponseOptions = switch (stub.behavior.load(.acquire)) {
             .silent => return null,
             .refuse => .{ .rcode = .refused },
             .truncate => if (transport == .udp) .{ .truncated = true } else answer,
             .answer, .spoof_first => answer,
+            .alias => .{ .answers = &.{ .{ .cname = alias_target }, .{ .a = .{ 1, 2, 3, 4 } } }, .ttl = 60 },
         };
         return dns.writeResponse(out, query, &q, options) catch null;
     }
@@ -474,6 +530,41 @@ test "when a server fails, the next answers and is asked first from then on" {
     try expectAnswer(t.sent(), response_6666, 0x6666);
     try testing.expectEqual(1, silent.received.load(.acquire));
     try testing.expectEqual(2, good.received.load(.acquire));
+}
+
+test "after a failover, the first server is asked again once it may have recovered" {
+    var first: Stub = undefined;
+    try first.start(.silent);
+    defer first.stop();
+    var second: Stub = undefined;
+    try second.start(.answer);
+    defer second.stop();
+
+    var upstream: Upstream = undefined;
+    try upstream.init(testing.io, testing.allocator, &.{ .{ .address = first.address() }, .{ .address = second.address() } }, 100);
+    defer upstream.deinit();
+    upstream.retry_first_after_s = 1;
+
+    var out: [512]u8 = undefined;
+    var t: TestQuery = .{};
+    _ = try t.forward(&upstream, 0x5151, &out); // the first times out, the second answers
+    _ = try t.forward(&upstream, 0x5152, &out); // the second only
+    try testing.expectEqual(1, first.received.load(.acquire));
+    try testing.expectEqual(2, second.received.load(.acquire));
+
+    // The first server recovers; within the interval it is not asked yet.
+    first.setBehavior(.answer);
+    _ = try t.forward(&upstream, 0x5153, &out);
+    try testing.expectEqual(1, first.received.load(.acquire));
+
+    try testing.io.sleep(.fromMilliseconds(1100), .awake);
+    const response = try t.forward(&upstream, 0x5154, &out);
+    try expectAnswer(t.sent(), response, 0x5154);
+    try testing.expectEqual(2, first.received.load(.acquire));
+    // From then on, the first server is preferred again.
+    _ = try t.forward(&upstream, 0x5155, &out);
+    try testing.expectEqual(3, first.received.load(.acquire));
+    try testing.expectEqual(3, second.received.load(.acquire));
 }
 
 test "a refusing server is skipped" {

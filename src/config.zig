@@ -57,6 +57,9 @@ pub const Config = struct {
         size: u32 = 4096,
         min_ttl: u32 = 0,
         max_ttl: u32 = 86400,
+        /// How long after expiring an answer may still be served when no
+        /// upstream server answers; 0 for never.
+        serve_stale_hours: u32 = 24,
     };
 
     pub const BlockResponse = enum {
@@ -91,6 +94,16 @@ pub const Config = struct {
         ttl: u32 = 300,
         private_names: PrivateNames = .nxdomain,
         records: []const local.Record = &.{},
+        /// Zones whose names go to a server of their own.
+        forward: []const Forward = &.{},
+    };
+
+    /// The names at and below `zone` are sent to `server` (plain DNS), for
+    /// example a router that knows its DHCP clients' names.
+    pub const Forward = struct {
+        /// Normalized: lowercase, without a trailing dot.
+        zone: []const u8,
+        server: net.IpAddress,
     };
 
     pub const Log = struct {
@@ -355,6 +368,8 @@ const Decoder = struct {
                 cache.min_ttl = try d.integer(u32, pair, 0, 604_800);
             } else if (is(pair, "max_ttl")) {
                 cache.max_ttl = try d.integer(u32, pair, 0, 604_800);
+            } else if (is(pair, "serve_stale_hours")) {
+                cache.serve_stale_hours = try d.integer(u32, pair, 0, 168);
             } else {
                 return d.unknownKey(pair, "cache");
             }
@@ -392,6 +407,8 @@ const Decoder = struct {
                 local_config.private_names = try d.enumeration(Config.PrivateNames, pair);
             } else if (is(pair, "records")) {
                 local_config.records = try d.records(pair.value);
+            } else if (is(pair, "forward")) {
+                local_config.forward = try d.forwards(pair.value);
             } else {
                 return d.unknownKey(pair, "local");
             }
@@ -525,6 +542,30 @@ const Decoder = struct {
                     return d.fail(value.line, "'{s}' is not an IP address", .{text});
             }
             record.* = .{ .name = name, .wildcard = wildcard, .addresses = addresses };
+        }
+        return result;
+    }
+
+    /// `zone: address`, where the address is a plain DNS server.
+    fn forwards(d: *Decoder, node: yaml.Node) Error![]const Config.Forward {
+        const pairs = try d.mapping(node, "local.forward");
+        const result = try d.arena.alloc(Config.Forward, pairs.len);
+        for (pairs, result, 0..) |pair, *forward, i| {
+            var name_buf: [dns.max_name_len]u8 = undefined;
+            const zone = dns.normalizeName(pair.key, &name_buf) orelse
+                return d.fail(pair.line, "invalid zone '{s}'", .{pair.key});
+            for (result[0..i]) |earlier| {
+                if (std.mem.eql(u8, earlier.zone, zone)) return d.fail(pair.line, "zone '{s}' is forwarded twice", .{pair.key});
+            }
+            const text = try d.scalar(pair.value, pair.key);
+            if (std.mem.startsWith(u8, text, "tls://")) {
+                return d.fail(pair.value.line, "'{s}': forwarding takes plain DNS servers only", .{text});
+            }
+            forward.* = .{
+                .zone = try d.arena.dupe(u8, zone),
+                .server = ip.parseSocketAddress(text, upstream_mod.plain_port) orelse
+                    return d.fail(pair.value.line, "'{s}' is not an IP address with optional port", .{text}),
+            };
         }
         return result;
     }
@@ -697,6 +738,7 @@ const RuleCounter = struct {
 // Tests
 
 const testing = std.testing;
+const fuzz = @import("test_fuzz.zig");
 
 fn expectConfigError(source: []const u8, line: u32, message_part: []const u8) !void {
     var diag: Diagnostic = .{};
@@ -707,6 +749,63 @@ fn expectConfigError(source: []const u8, line: u32, message_part: []const u8) !v
         return error.TestUnexpectedResult;
     }
 }
+
+test "fuzz: any text is a valid config, or an error that names a line in it" {
+    try testing.fuzz({}, fuzzConfig, .{ .corpus = &.{fuzz.input(
+        \\server:
+        \\  listen: ["127.0.0.1:53", "[::1]:53"]
+        \\  allow_clients: [10.0.0.0/8]
+        \\upstream:
+        \\  servers:
+        \\    - tls://9.9.9.9#dns.quad9.net
+        \\    - 1.1.1.1
+        \\cache:
+        \\  size: 10
+        \\blocking:
+        \\  response: nxdomain
+        \\  lists: [/etc/zinkhole/list.txt]
+        \\  block: ["*.ads.example", "||t.example^"]
+        \\local:
+        \\  records:
+        \\    nas.lan: [192.168.1.10, "fd00::10"]
+        \\  forward:
+        \\    lan: 192.168.1.1
+        \\log:
+        \\  level: debug   # comment
+        \\sync:
+        \\  serve: ["127.0.0.1:5380"]
+        \\  secret: '0123456789abcdef0123456789abcdef'
+    )} });
+}
+
+fn fuzzConfig(_: void, smith: *testing.Smith) !void {
+    var buf: [1024]u8 = undefined;
+    const source = buf[0..smith.slice(&buf)];
+    var diag: Diagnostic = .{};
+    var config = parse(testing.allocator, source, &diag) catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        error.InvalidConfig => {
+            try testing.expect(diag.line <= std.mem.countScalar(u8, source, '\n') + 1);
+            try testing.expect(diag.message().len > 0);
+            return;
+        },
+    };
+    defer config.deinit();
+    // What this config would serve as an origin, a replica accepts.
+    var replica = parseReplica(testing.allocator, fuzz_replica, config.policy_text, &diag) catch |err| {
+        std.debug.print("a replica rejects:\n{s}\nline {d}: {s}\n", .{ config.policy_text, diag.line, diag.message() });
+        return err;
+    };
+    replica.deinit();
+}
+
+const fuzz_replica =
+    \\upstream:
+    \\  servers: [1.1.1.1]
+    \\sync:
+    \\  origin: http://127.0.0.1:5380
+    \\  secret: '0123456789abcdef0123456789abcdef'
+;
 
 test "full configuration" {
     var diag: Diagnostic = .{};
@@ -867,6 +966,44 @@ test "upstream.max_in_flight limits the upstream queries at once" {
 
     try expectConfigError("upstream:\n  servers: [1.1.1.1]\n  max_in_flight: 0", 3, "between 1 and 1024");
     try expectConfigError("upstream:\n  servers: [1.1.1.1]\n  max_in_flight: 5000", 3, "between 1 and 1024");
+}
+
+test "cache.serve_stale_hours says how long expired answers may be served in an outage" {
+    var diag: Diagnostic = .{};
+    var config = try parse(testing.allocator, "upstream:\n  servers: [1.1.1.1]\ncache:\n  serve_stale_hours: 0\n", &diag);
+    defer config.deinit();
+    try testing.expectEqual(0, config.cache.serve_stale_hours);
+
+    var defaults = try parse(testing.allocator, "upstream:\n  servers: [1.1.1.1]\n", &diag);
+    defer defaults.deinit();
+    try testing.expectEqual(24, defaults.cache.serve_stale_hours);
+
+    try expectConfigError("upstream:\n  servers: [1.1.1.1]\ncache:\n  serve_stale_hours: 1000", 4, "between 0 and 168");
+}
+
+test "local.forward sends the names of a zone to a plain DNS server" {
+    var diag: Diagnostic = .{};
+    var config = try parse(testing.allocator,
+        \\upstream:
+        \\  servers: [1.1.1.1]
+        \\local:
+        \\  forward:
+        \\    Lan.: 192.168.1.1
+        \\    1.168.192.in-addr.arpa: "[fd00::1]:5353"
+    , &diag);
+    defer config.deinit();
+    const forward = config.local.forward;
+    try testing.expectEqual(2, forward.len);
+    try testing.expectEqualStrings("lan", forward[0].zone);
+    try testing.expect(forward[0].server.eql(&ip.parseSocketAddress("192.168.1.1", 53).?));
+    try testing.expectEqualStrings("1.168.192.in-addr.arpa", forward[1].zone);
+    try testing.expect(forward[1].server.eql(&ip.parseSocketAddress("[fd00::1]:5353", 53).?));
+
+    const base = "upstream:\n  servers: [1.1.1.1]\nlocal:\n  forward:\n";
+    try expectConfigError(base ++ "    lan: tls://9.9.9.9#dns.quad9.net", 5, "plain DNS");
+    try expectConfigError(base ++ "    lan: router", 5, "not an IP address");
+    try expectConfigError(base ++ "    \"*.lan\": 192.168.1.1", 5, "invalid zone");
+    try expectConfigError(base ++ "    lan: 192.168.1.1\n    LAN: 192.168.1.2", 6, "twice");
 }
 
 test "the metrics section says where metrics are served" {

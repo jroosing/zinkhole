@@ -1,6 +1,6 @@
-//! The Policy: decides how a name is answered without asking an upstream
-//! server (steps 2-4 of the query pipeline: local records, blocked names,
-//! private names). It is built from two parts:
+//! The Policy: decides how a name is answered before any upstream server is
+//! asked (steps 2-5 of the query pipeline: local records, blocked names,
+//! forwarded zones, private names). It is built from two parts:
 //!
 //!   ConfigPolicy  built from the config file alone: local records, inline
 //!                 block/allow rules and response settings. Cheap to build,
@@ -22,11 +22,15 @@ const dns = @import("dns.zig");
 const local = @import("local.zig");
 const LocalZone = local.LocalZone;
 const blocklist = @import("blocklist.zig");
+const tcp = @import("tcp.zig");
 
 const log = std.log.scoped(.lists);
 
 /// A single list may not exceed this much (decompressed) data.
 const max_list_bytes = 64 * 1024 * 1024;
+/// A source still loading after this long counts as failed, so one stalled
+/// server cannot hold up the others (`std.http.Client` has no read timeout).
+const default_source_timeout_ms = 2 * 60 * 1000;
 
 /// Firefox enables DNS-over-HTTPS on its own (bypassing this resolver)
 /// unless this name fails to resolve.
@@ -47,7 +51,9 @@ pub const Policy = struct {
         reverse: Reverse,
         blocked: Blocked,
         /// A private name that no local record answers: never sent upstream.
-        private,
+        private: Private,
+        /// A name in a forwarded zone: try the cache, then the zone's server.
+        forward: Forward,
         /// Not decided here: try the cache, then the upstream servers.
         upstream,
 
@@ -58,6 +64,15 @@ pub const Policy = struct {
 
         pub const Blocked = struct {
             response: Config.BlockResponse,
+            ttl: u32,
+        };
+
+        pub const Forward = struct {
+            server: Io.net.IpAddress,
+        };
+
+        pub const Private = struct {
+            /// How long clients may cache that the name does not exist.
             ttl: u32,
         };
 
@@ -166,15 +181,32 @@ pub const Policy = struct {
         if (policy.isBlocked(name)) {
             return .{ .blocked = .{ .response = config_policy.block_response, .ttl = config_policy.block_ttl } };
         }
-        if (!config_policy.forward_private and config_policy.local.isPrivate(name)) return .private;
+        if (config_policy.forwardServer(name)) |server| return .{ .forward = .{ .server = server } };
+        if (!config_policy.forward_private and config_policy.local.isPrivate(name)) return .{ .private = .{ .ttl = config_policy.local_ttl } };
         return .upstream;
+    }
+
+    /// How to block an upstream answer for `name` that makes it an alias
+    /// (CNAME) of `target`: null unless `target` is a blocked name and no
+    /// allow rule matches `name`. Trackers hide behind such aliases (CNAME
+    /// cloaking). Both names in the form `decide` takes.
+    pub fn blockAlias(policy: *Policy, name: []const u8, target: []const u8) ?Decision.Blocked {
+        policy.lock.lockSharedUncancelable(policy.io);
+        defer policy.lock.unlockShared(policy.io);
+        if (!policy.isBlocked(target) or policy.isAllowed(name)) return null;
+        return .{ .response = policy.config_policy.block_response, .ttl = policy.config_policy.block_ttl };
     }
 
     /// Blocked unless an allow rule (inline or from a list) also matches.
     /// Caller holds the lock.
     fn isBlocked(policy: *const Policy, name: []const u8) bool {
         const blocked = policy.config_policy.block.matches(name) or policy.lists.block.matches(name);
-        return blocked and !(policy.config_policy.allow.matches(name) or policy.lists.allow.matches(name));
+        return blocked and !policy.isAllowed(name);
+    }
+
+    /// Caller holds the lock.
+    fn isAllowed(policy: *const Policy, name: []const u8) bool {
+        return policy.config_policy.allow.matches(name) or policy.lists.allow.matches(name);
     }
 
     fn isNormalized(name: []const u8) bool {
@@ -196,6 +228,9 @@ const ConfigPolicy = struct {
     block_ttl: u32,
     local_ttl: u32,
     forward_private: bool,
+    /// Forwarded zones; their strings live in `arena`.
+    forward: []const Config.Forward,
+    arena: std.heap.ArenaAllocator,
 
     pub fn create(io: Io, gpa: Allocator, config: *const Config) Allocator.Error!*ConfigPolicy {
         const policy = try gpa.create(ConfigPolicy);
@@ -209,8 +244,13 @@ const ConfigPolicy = struct {
             .block_ttl = config.blocking.ttl,
             .local_ttl = config.local.ttl,
             .forward_private = config.local.private_names == .forward,
+            .forward = &.{},
+            .arena = .init(gpa),
         };
         errdefer policy.deinit();
+        const forward = try policy.arena.allocator().dupe(Config.Forward, config.local.forward);
+        for (forward) |*f| f.zone = try policy.arena.allocator().dupe(u8, f.zone);
+        policy.forward = forward;
 
         // The config loader already checked that every inline rule parses.
         var block_sink: blocklist.Sink = .{ .gpa = gpa, .block = &policy.block, .allow = &policy.allow, .is_allowlist = false };
@@ -227,9 +267,20 @@ const ConfigPolicy = struct {
     }
 
     fn deinit(policy: *ConfigPolicy) void {
+        policy.arena.deinit();
         policy.local.deinit();
         policy.block.deinit(policy.gpa);
         policy.allow.deinit(policy.gpa);
+    }
+
+    /// The server of the longest forwarded zone that `name` is in.
+    fn forwardServer(policy: *const ConfigPolicy, name: []const u8) ?Io.net.IpAddress {
+        var best: ?*const Config.Forward = null;
+        for (policy.forward) |*forward| {
+            if (!dns.isAtOrBelow(name, forward.zone)) continue;
+            if (best == null or forward.zone.len > best.?.zone.len) best = forward;
+        }
+        return if (best) |forward| forward.server else null;
     }
 
     fn addInline(rule: []const u8, sink: *blocklist.Sink) Allocator.Error!void {
@@ -302,9 +353,14 @@ pub const Lists = struct {
         return lists;
     }
 
+    pub const LoadOptions = struct {
+        /// One source may take this long; then it counts as failed.
+        source_timeout_ms: u32 = default_source_timeout_ms,
+    };
+
     /// Loads every source. A source that fails is logged and skipped, and
     /// leaves `complete` false.
-    pub fn load(io: Io, gpa: Allocator, sources: Sources) (Allocator.Error || Io.Cancelable)!*Lists {
+    pub fn load(io: Io, gpa: Allocator, sources: Sources, options: LoadOptions) (Allocator.Error || Io.Cancelable)!*Lists {
         const lists = try createEmpty(io, gpa);
         errdefer lists.destroy();
         lists.sources = try sources.dupe(lists.arena.allocator());
@@ -316,10 +372,10 @@ pub const Lists = struct {
         defer client.deinit();
         const loaded = try lists.arena.allocator().alloc(bool, sources.blocklists.len + sources.allowlists.len);
         for (sources.blocklists, loaded[0..sources.blocklists.len]) |source, *ok| {
-            ok.* = try lists.loadSource(io, &client, source, false);
+            ok.* = try lists.loadSourceWithin(io, &client, source, false, options.source_timeout_ms);
         }
         for (sources.allowlists, loaded[sources.blocklists.len..]) |source, *ok| {
-            ok.* = try lists.loadSource(io, &client, source, true);
+            ok.* = try lists.loadSourceWithin(io, &client, source, true, options.source_timeout_ms);
         }
         lists.loaded = loaded;
         const failed = std.mem.count(bool, loaded, &.{false});
@@ -344,6 +400,28 @@ pub const Lists = struct {
         lists.allow.deinit(lists.gpa);
         lists.arena.deinit();
         lists.gpa.destroy(lists);
+    }
+
+    /// `loadSource`, as a task that is canceled after `timeout_ms`: a server
+    /// that stops sending would otherwise hold up every later source.
+    fn loadSourceWithin(lists: *Lists, io: Io, client: *std.http.Client, source: []const u8, is_allowlist: bool, timeout_ms: u32) (Allocator.Error || Io.Cancelable)!bool {
+        var done: Io.Event = .unset;
+        var task = io.concurrent(loadSourceAndSignal, .{ lists, io, client, source, is_allowlist, &done }) catch {
+            return lists.loadSource(io, client, source, is_allowlist); // no thread to spare: no deadline
+        };
+        tcp.waitUntil(io, &done, tcp.deadlineIn(io, timeout_ms)) catch |err| {
+            // `cancel` waits for the task to finish, so `done` outlives it.
+            _ = task.cancel(io) catch |task_err| if (task_err == error.OutOfMemory) return error.OutOfMemory;
+            if (err == error.Canceled) return error.Canceled;
+            log.warn("{s}: not loaded within {d} s, skipped", .{ source, timeout_ms / 1000 });
+            return false;
+        };
+        return task.await(io);
+    }
+
+    fn loadSourceAndSignal(lists: *Lists, io: Io, client: *std.http.Client, source: []const u8, is_allowlist: bool, done: *Io.Event) (Allocator.Error || Io.Cancelable)!bool {
+        defer done.set(io);
+        return lists.loadSource(io, client, source, is_allowlist);
     }
 
     /// Returns false if the source could not be loaded.
@@ -371,6 +449,7 @@ fn randomSeed(io: Io) u64 {
 
 const testing = std.testing;
 const config_mod = @import("config.zig");
+const Watchdog = @import("test_watchdog.zig").Watchdog;
 
 /// A config parsed from `source`, with the upstream server the config requires.
 fn testConfig(source: []const u8) !Config {
@@ -558,6 +637,39 @@ test "a local record wins over a block rule, and a block rule over a private nam
     try testing.expect(policy.decide("printer.lan", .a) == .blocked);
 }
 
+fn expectForward(policy: *Policy, name: []const u8, qtype: dns.Type, server: []const u8) !void {
+    const decision = policy.decide(name, qtype);
+    try testing.expect(decision == .forward);
+    try testing.expect(decision.forward.server.eql(&@import("ip.zig").parseSocketAddress(server, 53).?));
+}
+
+test "a name in a forwarded zone decides forward, to the server of the longest zone" {
+    var policy = try testPolicy(
+        \\blocking:
+        \\  block: [ads.lan]
+        \\local:
+        \\  records:
+        \\    nas.lan: 192.168.1.10
+        \\  forward:
+        \\    lan: 192.168.1.1
+        \\    iot.lan: "192.168.2.1:5353"
+        \\    1.168.192.in-addr.arpa: 192.168.1.1
+    );
+    defer policy.deinit();
+
+    try expectForward(&policy, "printer.lan", .a, "192.168.1.1");
+    try expectForward(&policy, "lan", .soa, "192.168.1.1");
+    try expectForward(&policy, "cam.iot.lan", .a, "192.168.2.1:5353");
+    try expectForward(&policy, "20.1.168.192.in-addr.arpa", .ptr, "192.168.1.1");
+    // Local records, reverse lookups for them and block rules come first.
+    try testing.expect(policy.decide("nas.lan", .a) == .local);
+    try testing.expect(policy.decide("10.1.168.192.in-addr.arpa", .ptr) == .reverse);
+    try testing.expect(policy.decide("ads.lan", .a) == .blocked);
+    // Other private names are still not forwarded.
+    try testing.expect(policy.decide("printer.home.arpa", .a) == .private);
+    try testing.expect(policy.decide("example.com", .a) == .upstream);
+}
+
 test "applyConfig replaces local records and inline rules" {
     var policy = try testPolicy(
         \\local:
@@ -590,7 +702,7 @@ fn testLists(blocklist_text: []const u8, allowlist_text: []const u8) !*Lists {
     var allow_buf: [64]u8 = undefined;
     const block_path = try std.fmt.bufPrint(&block_buf, ".zig-cache/tmp/{s}/block.txt", .{tmp.sub_path});
     const allow_path = try std.fmt.bufPrint(&allow_buf, ".zig-cache/tmp/{s}/allow.txt", .{tmp.sub_path});
-    return Lists.load(testing.io, testing.allocator, .{ .blocklists = &.{block_path}, .allowlists = &.{allow_path} });
+    return Lists.load(testing.io, testing.allocator, .{ .blocklists = &.{block_path}, .allowlists = &.{allow_path} }, .{});
 }
 
 test "rules from lists block and allow like inline rules" {
@@ -632,16 +744,16 @@ test "partial lists replace complete ones only when the sources changed" {
     var policy = try testPolicy("");
     defer policy.deinit();
     const ab: Sources = .{ .blocklists = &.{ a, b }, .allowlists = &.{} };
-    try testing.expectEqual(.replaced, policy.replaceLists(try Lists.load(io, testing.allocator, ab)));
+    try testing.expectEqual(.replaced, policy.replaceLists(try Lists.load(io, testing.allocator, ab, .{})));
 
     // A Refresh in which b fails: the complete lists keep serving.
     try tmp.dir.deleteFile(io, "b.txt");
-    try testing.expectEqual(.kept, policy.replaceLists(try Lists.load(io, testing.allocator, ab)));
+    try testing.expectEqual(.kept, policy.replaceLists(try Lists.load(io, testing.allocator, ab, .{})));
     try testing.expect(policy.decide("b.example", .a) == .blocked);
 
     // A Reload removed b and added c, which fails: the new lists win anyway.
     const ac: Sources = .{ .blocklists = &.{ a, c }, .allowlists = &.{} };
-    try testing.expectEqual(.replaced, policy.replaceLists(try Lists.load(io, testing.allocator, ac)));
+    try testing.expectEqual(.replaced, policy.replaceLists(try Lists.load(io, testing.allocator, ac, .{})));
     try testing.expect(policy.decide("b.example", .a) == .upstream);
     try testing.expect(policy.decide("a.example", .a) == .blocked);
 }
@@ -660,7 +772,69 @@ test "a load records which sources it got" {
     const a = try std.fmt.bufPrint(&a_buf, ".zig-cache/tmp/{s}/a.txt", .{tmp.sub_path});
     const missing = try std.fmt.bufPrint(&missing_buf, ".zig-cache/tmp/{s}/missing.txt", .{tmp.sub_path});
 
-    const lists = try Lists.load(io, testing.allocator, .{ .blocklists = &.{ a, missing }, .allowlists = &.{a} });
+    const lists = try Lists.load(io, testing.allocator, .{ .blocklists = &.{ a, missing }, .allowlists = &.{a} }, .{});
     defer lists.destroy();
     try testing.expectEqualSlices(bool, &.{ true, false, true }, lists.loaded);
+}
+
+/// An HTTP server on loopback that sends the start of a list, then nothing
+/// more, and keeps the connection open: a stalled Source.
+const StallingServer = struct {
+    listener: Io.net.Server,
+    group: Io.Group = .init,
+
+    fn start(s: *StallingServer) !void {
+        const loopback: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        s.* = .{ .listener = try loopback.listen(testing.io, .{}) };
+        try s.group.concurrent(testing.io, serve, .{s});
+    }
+
+    fn stop(s: *StallingServer) void {
+        s.group.cancel(testing.io);
+        s.listener.deinit(testing.io);
+    }
+
+    fn serve(s: *StallingServer) Io.Cancelable!void {
+        const io = testing.io;
+        while (true) {
+            const stream = s.listener.accept(io) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                else => continue,
+            };
+            defer stream.close(io);
+            var buf: [256]u8 = undefined;
+            var writer: tcp.DeadlineWriter = .init(io, stream.socket.handle, &buf, .none);
+            writer.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\nstalled.example\n") catch continue;
+            writer.interface.flush() catch continue;
+            try io.sleep(.fromSeconds(60), .awake);
+        }
+    }
+};
+
+test "a Source that stalls fails after its deadline, and the other Sources are kept" {
+    const io = testing.io;
+    var watchdog: Watchdog = try .start(10);
+    defer watchdog.stop();
+    // The stalled source is logged as a warning; keep the test output quiet.
+    const log_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = log_level;
+    var server: StallingServer = undefined;
+    try server.start();
+    defer server.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "a.example\n" });
+    var a_buf: [64]u8 = undefined;
+    var url_buf: [64]u8 = undefined;
+    const a = try std.fmt.bufPrint(&a_buf, ".zig-cache/tmp/{s}/a.txt", .{tmp.sub_path});
+    const url = try std.fmt.bufPrint(&url_buf, "http://{f}/list.txt", .{server.listener.socket.address});
+
+    const started = Io.Clock.Timestamp.now(io, .awake);
+    const lists = try Lists.load(io, testing.allocator, .{ .blocklists = &.{ url, a }, .allowlists = &.{} }, .{ .source_timeout_ms = 300 });
+    defer lists.destroy();
+    try testing.expect(started.untilNow(io).raw.toMilliseconds() < 2000);
+    try testing.expectEqualSlices(bool, &.{ false, true }, lists.loaded);
+    try testing.expect(!lists.complete);
+    try testing.expect(lists.block.matches("a.example"));
 }

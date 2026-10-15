@@ -86,7 +86,7 @@ fn connectAndSignal(io: Io, address: *const net.IpAddress, done: *Io.Event) net.
 }
 
 /// Waits for `event`, retrying spurious wakeups until `deadline` has passed.
-fn waitUntil(io: Io, event: *Io.Event, deadline: Io.Timeout) Io.Event.WaitTimeoutError!void {
+pub fn waitUntil(io: Io, event: *Io.Event, deadline: Io.Timeout) Io.Event.WaitTimeoutError!void {
     while (true) {
         event.waitTimeout(io, deadline) catch |err| switch (err) {
             error.Timeout => {
