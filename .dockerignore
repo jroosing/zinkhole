@@ -1,0 +1,9 @@
+# Only what the image build reads: Cargo.toml, Cargo.lock, src/,
+# config.example.toml and (for BINARY=dist) dist/docker/. Leaving out
+# rust-toolchain.toml makes the source build use the image's Rust.
+*
+!Cargo.toml
+!Cargo.lock
+!src/
+!config.example.toml
+!dist/docker/

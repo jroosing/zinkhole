@@ -1,0 +1,6 @@
+# The lints in Cargo.toml forbid panicking shortcuts in zinkhole's own code;
+# tests may use them (docs/adr/0001).
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true

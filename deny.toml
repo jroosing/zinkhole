@@ -1,0 +1,39 @@
+# cargo-deny: known vulnerabilities, licenses and where crates come from
+# (docs/adr/0001). Run with `cargo deny check`.
+
+[graph]
+targets = [
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+]
+
+[advisories]
+# Every advisory fails the check, unmaintained crates included.
+unmaintained = "all"
+yanked = "deny"
+
+[licenses]
+# Permissive licenses only; zinkhole itself is MIT.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+# Licenses the crates will need as features land (rustls, ring, hickory).
+unused-allowed-license = "allow"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

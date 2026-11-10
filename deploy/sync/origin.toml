@@ -1,0 +1,27 @@
+# The origin of the sync test (deploy/sync/test.sh). Its [blocking] and
+# [local] sections are what replicas sync.
+
+[server]
+# Docker Desktop (macOS, Windows) shows clients with public addresses.
+allow_clients = ["0.0.0.0/0", "::/0"]
+
+[upstream]
+servers = [
+  { url = "https://dns.quad9.net/dns-query", address = "9.9.9.9" },
+  { url = "https://dns.quad9.net/dns-query", address = "149.112.112.112" },
+]
+
+[blocking]
+block = ["ads.example"]
+
+[local.records]
+"nas.lan" = "192.168.1.10"
+
+# GET /sync for replicas (and GET /metrics), on one port.
+[http]
+listen = ["0.0.0.0:5380"]
+
+[sync]
+role = "origin"
+# For this test only; make your own with `zinkhole secret`.
+secret = "5e1f0a4c0ffee5e1f0a4c0ffee5e1f0a4c0ffee5e1f0a4c0ffee5e1f0a4c0ffe"

@@ -1,0 +1,18 @@
+# The replica of the sync test (deploy/sync/test.sh). It has no [blocking] or
+# [local] sections: those come from the origin.
+
+[server]
+# Docker Desktop (macOS, Windows) shows clients with public addresses.
+allow_clients = ["0.0.0.0/0", "::/0"]
+
+[upstream]
+servers = [
+  { url = "https://dns.quad9.net/dns-query", address = "9.9.9.9" },
+  { url = "https://dns.quad9.net/dns-query", address = "149.112.112.112" },
+]
+
+[sync]
+role = "replica"
+origin = "http://origin:5380"
+secret = "5e1f0a4c0ffee5e1f0a4c0ffee5e1f0a4c0ffee5e1f0a4c0ffee5e1f0a4c0ffe"
+interval_secs = 2          # the default is 60

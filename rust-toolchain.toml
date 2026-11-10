@@ -1,0 +1,6 @@
+# The newest stable Rust, always (docs/adr/0001). No nightly: its features can
+# change or vanish, which the safety bar does not allow.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

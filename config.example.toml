@@ -1,0 +1,137 @@
+# zinkhole configuration. Every section is optional except [upstream]; leave
+# a setting out to get the default shown here. Check a file with
+#   zinkhole check -c /etc/zinkhole/config.toml
+# A reload (SIGHUP) applies [blocking], [local] and the log level and query
+# log at once; everything else needs a restart.
+
+[server]
+# Where to answer DNS, over UDP and TCP. An address without a port uses 53.
+listen = ["0.0.0.0:53", "[::]:53"]
+# Only clients in these networks are answered (a network or a single address).
+# Others are dropped over UDP, and their TCP connections closed. The default covers
+# loopback, private, link-local and CGNAT ranges.
+allow_clients = [
+  "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+  "169.254.0.0/16", "100.64.0.0/10", "::1/128", "fc00::/7", "fe80::/10",
+]
+
+[upstream]
+# DNS servers for everything not answered locally (required). Tried in order,
+# starting with the one that answered last; later ones are fallbacks.
+#   DNS over HTTPS: { url = "https://<name>/<path>", address = "<ip>" }. The
+#                   name is checked against the server's certificate; the
+#                   address is where to connect, so no name lookup is needed.
+#   DNS over QUIC:  { url = "quic://<name>", address = "<ip>" } (port 853
+#                   unless the URL gives one), e.g. AdGuard DNS:
+#                   { url = "quic://dns.adguard-dns.com", address = "94.140.14.14" }
+#   Plain DNS:      "<ip>" or "<ip>:<port>", e.g. a local resolver.
+servers = [
+  { url = "https://dns.quad9.net/dns-query", address = "9.9.9.9" },
+  { url = "https://dns.quad9.net/dns-query", address = "149.112.112.112" },
+  { url = "https://cloudflare-dns.com/dns-query", address = "1.0.0.1" },
+]
+# Everything one server gets for one query, in milliseconds (100 to 30000).
+timeout_ms = 2000
+# Upstream exchanges at once (1 to 1024). A cache miss beyond that is answered
+# SERVFAIL at once, so local and cached answers never wait.
+max_in_flight = 64
+# Who checks DNSSEC signatures on answers from these servers:
+#   "upstream"  the servers do (Quad9 and Cloudflare validate); zinkhole passes
+#               the DNSSEC flags through.
+#   "validate"  zinkhole does too, from the root zone's keys: an answer whose
+#               signatures do not hold is SERVFAIL (Outcome "bogus"), and
+#               signed answers carry AD. Forwarded zones are not validated.
+#               Needs the right time: on a device without a clock battery,
+#               every signed answer fails until the clock is set.
+dnssec = "upstream"
+
+[cache]
+# Memory for cached upstream answers, in MiB (0 to 1024; 0 disables).
+size_mb = 16
+# Clamp the TTLs of cached answers (seconds, up to 604800).
+min_ttl = 0
+max_ttl = 86400
+# When no upstream server answers, serve an answer that expired less than this
+# many hours ago (with TTL 30), so a short outage goes unnoticed (0 to 168).
+serve_stale_hours = 24
+
+[blocking]
+# How blocked names are answered: "zero" (0.0.0.0 / ::, and an empty answer
+# for other types) or "nxdomain".
+response = "zero"
+# TTL of blocked answers (seconds, up to 86400).
+ttl = 300
+# Download the lists again this often (0 to 8760); 0 means only at start, and
+# when a reload changes the lists.
+refresh_hours = 24
+# Blocklists: http(s) URLs or file paths. Formats are detected per line: hosts
+# files, plain domains, *.wildcards, Adblock (||domain^, @@ exceptions) and
+# dnsmasq (address=/domain/). A listed domain also blocks its subdomains.
+lists = ["https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/pro.txt"]
+# Allowlists, same formats. An allowed name is never blocked.
+allowlists = []
+# Inline rules, in any list syntax.
+block = []
+allow = []
+
+[local]
+# TTL of local answers and of "does not exist" answers for private names.
+ttl = 300
+# Private names (.lan, .home.arpa, .internal, single labels, reverse lookups of
+# private addresses) that no local record answers: "nxdomain" (never sent
+# upstream) or "forward" (sent to the upstream servers like any other name).
+# The zone records of a single label (NS, SOA, DS, DNSKEY: com, lan) always go
+# upstream: validating clients need them, and they say nothing about hosts.
+private_names = "nxdomain"
+
+[local.records]
+# Names for your own devices and apps: one address or a list of up to 16.
+# "*.name" matches every name below name. Reverse lookups (PTR) are answered
+# too, and localhost is built in.
+# "nas.lan" = "192.168.1.10"
+# "printer.lan" = ["192.168.1.20", "fd00::20"]
+# "*.apps.lan" = "192.168.1.30"
+
+[local.forward]
+# Zones whose names go to a server of their own (plain DNS), typically the
+# router that knows its DHCP clients' names. The longest matching zone wins;
+# local records and blocking still apply first.
+# "lan" = "192.168.1.1"
+# "1.168.192.in-addr.arpa" = "192.168.1.1"
+
+[log]
+# "error", "warn", "info" or "debug". The level and the query log change on
+# a reload; the format needs a restart.
+level = "info"
+# "text" or "json".
+format = "text"
+# One line per query: client, name, type, outcome, duration.
+queries = false
+
+# HTTP, on one port (only clients in server.allow_clients get answers):
+#   GET /metrics  Metrics for a monitoring system (Prometheus format).
+#   GET /sync     on an origin: its Policy settings for its replicas.
+# Leave this out to serve nothing over HTTP. Changes need a restart.
+#
+# [http]
+# listen = ["0.0.0.0:5380"]
+
+# Two instances, one config. Leave this out to run a single instance. The
+# secret is the same on every instance; make one with `zinkhole secret`.
+# What the origin sends, and the replica's saved copy, are sealed with it:
+# nobody without the secret can read or change them.
+#
+# Origin: serves this file's [blocking] and [local] at GET /sync on
+# http.listen (which an origin needs).
+# [sync]
+# role = "origin"
+# secret = "<64 hex digits>"
+#
+# Replica: takes [blocking] and [local] from the origin (leave them out of
+# this file) and keeps the last ones in state_dir for restarts.
+# [sync]
+# role = "replica"
+# origin = "http://192.168.1.5:5380"
+# secret = "<64 hex digits>"
+# interval_secs = 60
+# state_dir = "/var/lib/zinkhole"

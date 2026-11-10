@@ -1,0 +1,500 @@
+//! `zinkhole serve`: the parts wired together, running until SIGTERM or
+//! SIGINT.
+//!
+//! - SIGHUP reloads the config file: local records, inline rules and the
+//!   other Policy settings apply at once; the lists load again only when
+//!   their sources changed; the log level and the query log change too.
+//!   Server, upstream, cache, HTTP and sync settings apply after a restart,
+//!   and a changed sync role is refused.
+//! - SIGUSR1 logs the queries per Outcome since start and the cache entries.
+
+use std::io;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::signal::unix::{Signal, SignalKind, signal};
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+use crate::cache::Cache;
+use crate::config::{self, Config, PolicySettings, Role};
+use crate::http::{self, HttpListeners, MetricsSource};
+use crate::lists::{ClientError, Loader};
+use crate::logging::Logging;
+use crate::metrics;
+use crate::policy::Policy;
+use crate::refresh;
+use crate::resolver::{Forwarder, Outcome, Resolver};
+use crate::server::{self, BindError, Listeners};
+use crate::settings::InForce;
+use crate::sync::{self, Origin, Replica};
+use crate::upstream::Upstream;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ServeError {
+    #[error("cannot serve the Policy settings: {0}")]
+    Publish(#[from] sync::PublishError),
+    #[error(transparent)]
+    Bind(#[from] BindError),
+    #[error(transparent)]
+    Client(#[from] ClientError),
+    #[error(transparent)]
+    Io(#[from] io::Error),
+}
+
+/// Runs the server for `config`, read from `path`, until `shutdown`.
+/// Queries are answered at once, with local records and inline rules; the
+/// lists load in the background (which also lets this host resolve the list
+/// servers through itself).
+///
+/// # Errors
+///
+/// The signal handlers cannot be set up, a listen address cannot be bound,
+/// a socket not served, or the HTTP client for lists not set up.
+pub async fn run(
+    path: PathBuf,
+    config: Config,
+    logging: Option<Logging>,
+    controls: Controls,
+    shutdown: CancellationToken,
+) -> Result<(), ServeError> {
+    let Controls {
+        mut hangup,
+        mut user1,
+    } = controls;
+
+    let resolver = Arc::new(resolver(&config, Upstream::new(&config.upstream)));
+    resolver.log_queries(config.log.queries);
+    let loader = Loader::new()?;
+    let addresses: Vec<SocketAddr> = config
+        .server
+        .listen
+        .iter()
+        .map(|address| address.0)
+        .collect();
+    let listeners = Listeners::bind(&addresses)?;
+    for address in listeners.addresses() {
+        tracing::info!(%address, "answering DNS over UDP and TCP");
+    }
+    let http_listeners = bind_http(&config)?;
+    let state = Arc::new(metrics::State::new(config.role()));
+    let Roles {
+        settings,
+        origin,
+        replica,
+    } = Roles::of(&config, &state)?;
+    let (in_force, refresh_changes) = InForce::new(Arc::clone(resolver.policy()), &settings);
+    let in_force = Arc::new(in_force);
+
+    let refresh = tokio::spawn(refresh::run(
+        Arc::clone(resolver.policy()),
+        loader,
+        refresh_changes,
+        Arc::clone(&state),
+        shutdown.clone(),
+    ));
+    let http = http_listeners.map(|listeners| {
+        let router = http_router(&resolver, &state, origin.as_ref(), &listeners);
+        tokio::spawn(http::serve(
+            listeners,
+            router,
+            config.server.allow_clients.clone(),
+            shutdown.clone(),
+        ))
+    });
+    let sync_now = Arc::new(Notify::new());
+    let syncing = replica.map(|(replica, have, interval)| {
+        tracing::info!(
+            origin = %replica.origin(),
+            "syncing the Policy settings every {} s",
+            interval.as_secs()
+        );
+        tokio::spawn(sync::run(
+            replica,
+            config.server.clone(),
+            Arc::clone(&in_force),
+            have,
+            interval,
+            Arc::clone(&sync_now),
+            Arc::clone(&state),
+            shutdown.clone(),
+        ))
+    });
+    let mut serving = tokio::spawn(server::serve(
+        listeners,
+        Arc::clone(&resolver),
+        shutdown.clone(),
+    ));
+    let role = match (origin, config.role()) {
+        (Some(origin), _) => RoleHooks::Origin(origin),
+        (None, Role::Replica) => RoleHooks::Replica(sync_now),
+        (None, _) => RoleHooks::Alone,
+    };
+    let reloader = Reloader::new(path, config, in_force, role, logging);
+
+    let served = loop {
+        tokio::select! {
+            _ = hangup.recv() => {
+                if let Err(error) = reloader.reload(&resolver) {
+                    tracing::error!("reload failed, keeping the current configuration: {error}");
+                }
+            }
+            _ = user1.recv() => log_summary(&resolver),
+            served = &mut serving => break served,
+        }
+    };
+    shutdown.cancel();
+    stopped("the list refresh", Some(refresh)).await;
+    stopped("syncing", syncing).await;
+    if let Some(Err(error)) = stopped_with("the HTTP port", http).await {
+        tracing::error!(%error, "the HTTP port failed");
+    }
+    served.map_err(io::Error::other)??;
+    tracing::info!("stopped");
+    Ok(())
+}
+
+/// `GET /metrics`, and `GET /sync` on an origin.
+fn http_router(
+    resolver: &Arc<Resolver<Upstream>>,
+    state: &Arc<metrics::State>,
+    origin: Option<&Arc<Origin>>,
+    listeners: &HttpListeners,
+) -> axum::Router {
+    let router = http::metrics_router(MetricsSource {
+        resolver: Arc::clone(resolver),
+        state: Arc::clone(state),
+    });
+    let Some(origin) = origin else {
+        return router;
+    };
+    for address in listeners.addresses() {
+        tracing::info!("serving the Policy settings to replicas on http://{address}/sync");
+    }
+    router.merge(Arc::clone(origin).router())
+}
+
+/// Waits for a background task that was told to stop; logs if it panicked.
+async fn stopped<T>(what: &str, task: Option<JoinHandle<T>>) {
+    let _ = stopped_with(what, task).await;
+}
+
+/// The same, returning what the task returned unless it panicked.
+async fn stopped_with<T>(what: &str, task: Option<JoinHandle<T>>) -> Option<T> {
+    match task?.await {
+        Ok(returned) => Some(returned),
+        Err(error) => {
+            tracing::error!(%error, "{what} failed");
+            None
+        }
+    }
+}
+
+/// The HTTP port's listeners, if there is one.
+fn bind_http(config: &Config) -> Result<Option<HttpListeners>, BindError> {
+    let Some(settings) = &config.http else {
+        return Ok(None);
+    };
+    let addresses: Vec<SocketAddr> = settings.listen.iter().map(|address| address.0).collect();
+    let bound = HttpListeners::bind(&addresses)?;
+    for address in bound.addresses() {
+        tracing::info!("serving the Metrics on http://{address}/metrics");
+    }
+    Ok(Some(bound))
+}
+
+/// What the sync role brings: the Policy settings to start with, and the
+/// origin or the replica.
+struct Roles {
+    settings: PolicySettings,
+    origin: Option<Arc<Origin>>,
+    /// The replica, the `ETag` of the settings it starts with, and its
+    /// interval.
+    replica: Option<(Replica, Option<String>, Duration)>,
+}
+
+impl Roles {
+    fn of(config: &Config, state: &Arc<metrics::State>) -> Result<Roles, ServeError> {
+        Ok(match &config.sync {
+            None => Roles {
+                settings: config.policy_settings(),
+                origin: None,
+                replica: None,
+            },
+            Some(config::Sync::Origin { secret }) => {
+                let settings = config.policy_settings();
+                let origin = Origin::new(secret, &settings, Arc::clone(state))?;
+                Roles {
+                    settings,
+                    origin: Some(Arc::new(origin)),
+                    replica: None,
+                }
+            }
+            // A replica starts from the settings it saved, if any, until it
+            // syncs.
+            Some(config::Sync::Replica {
+                secret,
+                origin,
+                interval_secs,
+                state_dir,
+            }) => {
+                let replica = Replica::new(&origin.0, secret, state_dir)?;
+                if let Err(error) = replica.check_state_dir() {
+                    tracing::error!(
+                        dir = %state_dir.display(),
+                        %error,
+                        "cannot save synced settings here: a restart while the origin is down would start without them"
+                    );
+                    state.state_file(false);
+                }
+                let (settings, have) = saved_settings(&replica, &config.server);
+                Roles {
+                    settings,
+                    origin: None,
+                    replica: Some((
+                        replica,
+                        have,
+                        Duration::from_secs(u64::from(*interval_secs)),
+                    )),
+                }
+            }
+        })
+    }
+}
+
+/// The settings a replica saved, if they are valid here, with their `ETag`;
+/// else empty settings until the first sync.
+fn saved_settings(replica: &Replica, server: &config::Server) -> (PolicySettings, Option<String>) {
+    let file = replica.state_file().display();
+    match replica.load_state() {
+        Ok(Some(saved)) => match server.synced_settings(&saved.text) {
+            Ok(settings) => {
+                tracing::info!(%file, "starting from the settings synced earlier");
+                return (settings, Some(saved.etag));
+            }
+            Err(error) => {
+                tracing::warn!(%file, "the settings synced earlier are invalid here: {error}");
+            }
+        },
+        Ok(None) => tracing::info!("no settings synced yet; blocking starts with the first sync"),
+        Err(error) => tracing::warn!(%file, %error, "cannot use the settings synced earlier"),
+    }
+    (PolicySettings::default(), None)
+}
+
+/// The Resolver for `config`, asking `forwarder` what it cannot answer.
+pub fn resolver<F: Forwarder>(config: &Config, forwarder: F) -> Resolver<F> {
+    Resolver::new(
+        Arc::new(Policy::new(&config.policy_settings())),
+        Cache::new(&config.cache),
+        forwarder,
+        config.server.allow_clients.clone(),
+        usize::try_from(config.upstream.max_in_flight).unwrap_or(usize::MAX),
+    )
+}
+
+/// Why a Reload changed nothing.
+#[derive(Debug, thiserror::Error)]
+pub enum ReloadError {
+    #[error(transparent)]
+    Config(#[from] config::Error),
+    #[error("changing the sync role (from {from} to {to}) needs a restart")]
+    RoleChanged { from: Role, to: Role },
+}
+
+/// What a Reload does for this instance's role.
+#[derive(Debug)]
+pub enum RoleHooks {
+    /// Puts the file's Policy settings in force.
+    Alone,
+    /// Also serves them to the replicas.
+    Origin(Arc<Origin>),
+    /// Keeps the synced settings, and syncs at once.
+    Replica(Arc<Notify>),
+}
+
+/// Applies the config file again, as far as it can while running.
+#[derive(Debug)]
+pub struct Reloader {
+    path: PathBuf,
+    /// The config the server started with: what needs a restart stays as
+    /// it says.
+    started: Config,
+    in_force: Arc<InForce>,
+    role: RoleHooks,
+    logging: Option<Logging>,
+}
+
+impl Reloader {
+    #[must_use]
+    pub fn new(
+        path: PathBuf,
+        started: Config,
+        in_force: Arc<InForce>,
+        role: RoleHooks,
+        logging: Option<Logging>,
+    ) -> Reloader {
+        Reloader {
+            path,
+            started,
+            in_force,
+            role,
+            logging,
+        }
+    }
+
+    /// Reads the config file and applies what can change while running.
+    ///
+    /// # Errors
+    ///
+    /// The file is invalid or changes the sync role; nothing changed then.
+    pub fn reload<F: Forwarder>(&self, resolver: &Resolver<F>) -> Result<(), ReloadError> {
+        let new = Config::load(&self.path)?;
+        let (from, to) = (self.started.role(), new.role());
+        if from != to {
+            return Err(ReloadError::RoleChanged { from, to });
+        }
+        match &self.role {
+            RoleHooks::Alone => self.in_force.apply(&new.policy_settings()),
+            RoleHooks::Origin(origin) => {
+                let settings = new.policy_settings();
+                self.in_force.apply(&settings);
+                if let Err(error) = origin.publish(&settings) {
+                    tracing::error!(%error, "cannot serve the new settings to the replicas");
+                }
+            }
+            RoleHooks::Replica(sync_now) => sync_now.notify_one(),
+        }
+        if let Some(logging) = &self.logging {
+            logging.set_level(new.log.level);
+        }
+        resolver.log_queries(new.log.queries);
+        tracing::info!("configuration reloaded");
+
+        let restart = self.needs_restart(&new);
+        if !restart.is_empty() {
+            tracing::warn!("changes to {} apply after a restart", restart.join(", "));
+        }
+        Ok(())
+    }
+
+    /// The settings in `new` that differ from those running and only apply
+    /// after a restart.
+    fn needs_restart(&self, new: &Config) -> Vec<&'static str> {
+        let old = &self.started;
+        [
+            ("server", old.server != new.server),
+            ("upstream", old.upstream != new.upstream),
+            ("cache", old.cache != new.cache),
+            ("http", old.http != new.http),
+            ("log.format", old.log.format != new.log.format),
+            ("sync", sync_changed(old.sync.as_ref(), new.sync.as_ref())),
+        ]
+        .into_iter()
+        .filter_map(|(section, changed)| changed.then_some(section))
+        .collect()
+    }
+}
+
+/// True if the sync settings differ (the role is checked before). The secret
+/// is compared in constant time.
+fn sync_changed(old: Option<&config::Sync>, new: Option<&config::Sync>) -> bool {
+    use config::Sync::{Origin, Replica};
+    match (old, new) {
+        (None, None) => false,
+        (Some(Origin { secret: a }), Some(Origin { secret: b })) => !a.same_as(b),
+        (
+            Some(Replica {
+                secret: a,
+                origin: origin_a,
+                interval_secs: interval_a,
+                state_dir: dir_a,
+            }),
+            Some(Replica {
+                secret: b,
+                origin: origin_b,
+                interval_secs: interval_b,
+                state_dir: dir_b,
+            }),
+        ) => origin_a != origin_b || interval_a != interval_b || dir_a != dir_b || !a.same_as(b),
+        _ => true,
+    }
+}
+
+/// The SIGUSR1 summary.
+fn log_summary<F: Forwarder>(resolver: &Resolver<F>) {
+    let queries = resolver.queries();
+    tracing::info!(
+        local = queries.count(Outcome::Local),
+        blocked = queries.count(Outcome::Blocked),
+        private = queries.count(Outcome::Private),
+        cached = queries.count(Outcome::Cached),
+        forwarded = queries.count(Outcome::Forwarded),
+        failed = queries.count(Outcome::Failed),
+        bogus = queries.count(Outcome::Bogus),
+        refused = queries.count(Outcome::Refused),
+        invalid = queries.count(Outcome::Invalid),
+        cache_entries = resolver.cache().entry_count(),
+        "queries since start"
+    );
+}
+
+/// The signals zinkhole handles, set up first thing: until a handler is in
+/// place a signal's default action applies, which for SIGHUP and SIGUSR1 is
+/// to end the process (and systemd counts SIGHUP as a clean exit, so it
+/// would not restart it).
+#[derive(Debug)]
+pub struct Signals {
+    terminate: Signal,
+    interrupt: Signal,
+    controls: Controls,
+}
+
+/// SIGHUP (reload) and SIGUSR1 (summary), for [`run`].
+#[derive(Debug)]
+pub struct Controls {
+    hangup: Signal,
+    user1: Signal,
+}
+
+impl Signals {
+    /// # Errors
+    ///
+    /// A handler cannot be set up; a server that cannot be stopped or
+    /// reloaded gracefully should not start.
+    pub fn new() -> io::Result<Signals> {
+        Ok(Signals {
+            terminate: signal(SignalKind::terminate())?,
+            interrupt: signal(SignalKind::interrupt())?,
+            controls: Controls {
+                hangup: signal(SignalKind::hangup())?,
+                user1: signal(SignalKind::user_defined1())?,
+            },
+        })
+    }
+
+    /// A future that cancels `shutdown` at the first SIGTERM or SIGINT, and
+    /// the controls for [`run`].
+    pub fn split(self, shutdown: CancellationToken) -> (impl Future<Output = ()>, Controls) {
+        let Signals {
+            mut terminate,
+            mut interrupt,
+            controls,
+        } = self;
+        let stop = async move {
+            tokio::select! {
+                _ = terminate.recv() => tracing::info!("SIGTERM, shutting down"),
+                _ = interrupt.recv() => tracing::info!("SIGINT, shutting down"),
+                () = shutdown.cancelled() => {}
+            }
+            shutdown.cancel();
+        };
+        (stop, controls)
+    }
+}
+
+#[cfg(test)]
+mod tests;

@@ -1,0 +1,58 @@
+# zinkhole with Docker Compose.
+#
+#   cp config.example.toml config.toml      # then edit it
+#   docker compose up -d --build
+#   dig @127.0.0.1 example.com
+#
+#   docker compose kill -s HUP zinkhole     # reload config.toml
+#   docker compose kill -s USR1 zinkhole    # log a summary (see `docker compose logs`)
+#
+# With these port mappings Docker keeps the address of clients on your LAN,
+# so `server.allow_clients` and the query log see real addresses (queries from
+# the Docker host itself show up from Docker's bridge address).
+
+services:
+  zinkhole:
+    build: .
+    image: zinkhole:latest
+    container_name: zinkhole
+    restart: unless-stopped
+    ports:
+      # Port 53 may already be taken on the host (e.g. by systemd-resolved);
+      # then bind one address, e.g. "192.168.1.5:53:53/udp".
+      - "53:53/udp"
+      - "53:53/tcp"
+      # With an [http] section: the Metrics (and an origin's settings).
+      # - "5380:5380/tcp"
+    volumes:
+      # Rewrite the file in place when editing (the bind mount follows the
+      # inode), then reload.
+      - ./config.toml:/etc/zinkhole/config.toml:ro
+      # A sync replica saves its last settings here, to start from when the
+      # origin is down; the container is read-only otherwise. Uncomment for
+      # a replica, with the volume at the end of this file.
+      # - zinkhole-state:/var/lib/zinkhole
+    # The healthcheck comes from the image (zinkhole healthcheck).
+
+    # Hardening: zinkhole writes nothing (a replica only its state volume),
+    # needs no capabilities and runs as an unprivileged user.
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    sysctls:
+      # Lets the unprivileged user bind port 53 (Docker's default since
+      # 20.10; set explicitly so it does not depend on the runtime).
+      net.ipv4.ip_unprivileged_port_start: 0
+    # HaGeZi Pro (~225,000 domains) takes about 30 MB, briefly more while a
+    # refresh builds the new lists; the cache adds up to cache.size_mb.
+    mem_limit: 256m
+    pids_limit: 64
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+# For a replica (see the zinkhole-state mount above):
+# volumes:
+#   zinkhole-state:

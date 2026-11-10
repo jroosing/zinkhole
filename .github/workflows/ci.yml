@@ -1,0 +1,127 @@
+# zinkhole CI (docs/adr/0001).
+#
+#   every push   formatting, clippy, tests, cargo-deny, shellcheck, and a static
+#                musl release build on each architecture's own runner
+#                and the container image (linux/amd64 and linux/arm64) from
+#                those binaries
+#   tag v<x.y.z> also: check the tag against Cargo.toml, pack the release files
+#                and publish them as a public GitHub release, and push the
+#                image to ghcr.io/jroosing/zinkhole (<version> and latest)
+#
+# To release: bump `version` in Cargo.toml, commit, then
+#   git tag v<version> && git push origin v<version>
+#
+# The release logic lives in deploy/ci/release.sh, so it also runs locally.
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v[0-9]*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      # rust-toolchain.toml picks the newest stable Rust.
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+      - uses: EmbarkStudios/cargo-deny-action@v2
+      - run: shellcheck -x deploy/proxmox/*.sh deploy/proxmox/ct/*.sh deploy/proxmox/install/*.sh deploy/ci/*.sh deploy/install.sh deploy/sync/test.sh
+
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      # ring's C parts need a musl C compiler; native runners need nothing else.
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+      - run: rustup target add ${{ matrix.arch }}-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.arch }}-musl
+      - run: sh deploy/ci/release.sh binary ${{ matrix.arch }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: zinkhole-${{ matrix.arch }}
+          path: dist/
+          retention-days: 3
+
+  image:
+    needs: [check, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: zinkhole-*
+          merge-multiple: true
+          path: dist
+      # A tag that does not match Cargo.toml must not push (or overwrite)
+      # the image of the version Cargo.toml names.
+      - if: startsWith(github.ref, 'refs/tags/v')
+        run: sh deploy/ci/release.sh check-tag "$GITHUB_REF_NAME"
+      - id: version
+        run: echo "version=$(sh deploy/ci/release.sh version)" >>"$GITHUB_OUTPUT"
+      - run: sh deploy/ci/release.sh image-layout
+      - uses: docker/setup-buildx-action@v4
+      - if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          build-args: BINARY=dist
+          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          tags: |
+            ghcr.io/jroosing/zinkhole:${{ steps.version.outputs.version }}
+            ghcr.io/jroosing/zinkhole:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/jroosing/zinkhole
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.description=DNS blocker and local DNS server for home networks
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [check, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: zinkhole-*
+          merge-multiple: true
+          path: dist
+      - run: sh deploy/ci/release.sh check-tag "$GITHUB_REF_NAME"
+      - run: sh deploy/ci/release.sh bundle
+      - run: sh deploy/ci/release.sh publish
+        env:
+          GH_TOKEN: ${{ github.token }}

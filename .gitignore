@@ -1,0 +1,5 @@
+# Build output
+/target/
+dist/
+# Local configuration (see config.example.toml)
+/config.toml

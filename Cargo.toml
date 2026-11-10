@@ -1,0 +1,81 @@
+[package]
+name = "zinkhole"
+version = "3.0.0"
+edition = "2024"
+description = "A DNS blocker and local DNS server for home networks"
+license = "MIT"
+repository = "https://github.com/jroosing/zinkhole"
+readme = "README.md"
+publish = false
+
+[dependencies]
+arc-swap = "1.9.5"
+axum = { version = "0.8.9", default-features = false, features = ["http1"] }
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+getrandom = "0.4.3"
+hickory-net = { version = "0.26.3", features = ["dnssec-ring", "https-ring", "quic-ring", "webpki-roots"] }
+hickory-proto = { version = "0.26.3", default-features = false, features = ["std", "dnssec-ring"] }
+hkdf = "0.13.0"
+hmac = "0.13.0"
+hyper = { version = "1.12.0", features = ["server", "http1"] }
+hyper-util = { version = "0.1.21", features = ["tokio", "server", "http1", "service"] }
+indexmap = { version = "2.14.2", features = ["serde"] }
+ipnet = { version = "2.12.2", features = ["serde"] }
+moka = { version = "0.12.16", features = ["sync"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "gzip", "deflate"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+secrecy = { version = "0.10.3", features = ["serde"] }
+serde = { version = "1.0.229", features = ["derive"] }
+sha2 = { version = "0.11.1", default-features = false }
+socket2 = "0.6.5"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal", "fs", "io-util"] }
+tokio-util = { version = "0.7.20", features = ["rt"] }
+toml = { version = "1.2.1", features = ["preserve_order"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std", "ansi", "json", "registry"] }
+url = { version = "2.5.8", features = ["serde"] }
+webpki-roots = "1.0.11"
+
+[dev-dependencies]
+bytes = "1.12.1"
+flate2 = "1.1.11"
+h2 = "0.4.20"
+http = "1.5.0"
+proptest = "1.12.0"
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "crypto"] }
+tempfile = "3.27.0"
+time = "0.3"
+tokio = { version = "1.54.1", features = ["test-util"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"] }
+
+# The safety bar (docs/adr/0001).
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Untrusted input must never panic the server: no shortcuts that can.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "warn"
+print_stderr = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+# Integer overflow panics instead of wrapping. Panics unwind, so one query's
+# task dies and the server keeps answering.
+overflow-checks = true
+panic = "unwind"
