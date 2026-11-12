@@ -141,20 +141,22 @@ impl Upstream {
 
     /// What each server did, in config order.
     #[must_use]
-    pub fn stats(&self) -> Vec<ServerMetrics> {
-        self.failover.stats()
+    pub fn server_metrics(&self) -> Vec<ServerMetrics> {
+        self.failover.server_metrics()
     }
 }
 
 impl Failover {
     fn new(settings: &config::Upstream, roots: rustls::RootCertStore) -> Failover {
         let tls = Arc::new(crate::tls::client_config(roots));
+        let mut servers: Vec<Server> = settings
+            .servers
+            .iter()
+            .map(|server| Server::new(server, &tls))
+            .collect();
+        number_same_names(&mut servers);
         Failover {
-            servers: settings
-                .servers
-                .iter()
-                .map(|server| Server::new(server, &tls))
-                .collect(),
+            servers,
             timeout: Duration::from_millis(settings.timeout_ms.into()),
             preferred: AtomicUsize::new(0),
             retry_first_at: AtomicU64::new(0),
@@ -167,7 +169,7 @@ impl Failover {
         self.preferred.load(Ordering::Relaxed)
     }
 
-    fn stats(&self) -> Vec<ServerMetrics> {
+    fn server_metrics(&self) -> Vec<ServerMetrics> {
         let preferred = self.preferred();
         self.servers
             .iter()
@@ -460,6 +462,35 @@ struct Encrypted {
     generations: AtomicU64,
 }
 
+/// An encrypted server for the Metrics and the log: its scheme, host and
+/// port (if the URL gives one), and the address it is reached at. Not its
+/// path or query, which can name an account at the provider: the Metrics
+/// are served to every allowed client.
+fn encrypted_name(server: &config::EncryptedServer) -> String {
+    let url = &server.url;
+    let port = url
+        .port()
+        .map_or_else(String::new, |port| format!(":{port}"));
+    format!(
+        "{}://{}{port} ({})",
+        url.scheme(),
+        server.tls_name,
+        server.address.ip()
+    )
+}
+
+/// Servers whose names are the same (their URLs differ only in the path)
+/// get their place in `upstream.servers` added, so the Metrics tell them
+/// apart.
+fn number_same_names(servers: &mut [Server]) {
+    let names: Vec<String> = servers.iter().map(|server| server.name.clone()).collect();
+    for (index, server) in servers.iter_mut().enumerate() {
+        if names.iter().filter(|name| **name == server.name).count() > 1 {
+            server.name = format!("{} #{}", server.name, index + 1);
+        }
+    }
+}
+
 impl Server {
     fn new(server: &UpstreamServer, tls: &Arc<ClientConfig>) -> Server {
         let (name, transport) = match server {
@@ -482,7 +513,7 @@ impl Server {
         protocol: Protocol,
         tls: &Arc<ClientConfig>,
     ) -> (String, Transport) {
-        let name = format!("{} ({})", server.url, server.address.ip());
+        let name = encrypted_name(server);
         let transport = Transport::Encrypted(Encrypted {
             protocol,
             address: server.address,

@@ -47,8 +47,11 @@ async fn a_plain_server_answers() {
         .await
         .unwrap();
     assert_eq!(first_a(&answer), Some(std::net::Ipv4Addr::new(1, 2, 3, 4)));
-    let stats = upstream.stats();
-    assert_eq!((stats[0].answer_times.count(), stats[0].failures), (1, 0));
+    let servers = upstream.server_metrics();
+    assert_eq!(
+        (servers[0].answer_times.count(), servers[0].failures),
+        (1, 0)
+    );
 }
 
 #[tokio::test]
@@ -111,9 +114,9 @@ async fn refused_and_silent_servers_fail_over_to_the_next_which_is_then_preferre
         "the silent server gets one timeout, no more"
     );
     assert_eq!(upstream.preferred(), 2);
-    let stats = upstream.stats();
+    let servers = upstream.server_metrics();
     assert_eq!(
-        stats.iter().map(|s| s.failures).collect::<Vec<_>>(),
+        servers.iter().map(|s| s.failures).collect::<Vec<_>>(),
         [1, 1, 0]
     );
 
@@ -207,7 +210,7 @@ async fn a_forwarded_zone_server_is_asked_alone_and_not_counted() {
         .await
         .unwrap();
     assert_eq!((zone.received(), upstream_stub.received()), (1, 0));
-    assert_eq!(upstream.stats()[0].answer_times.count(), 0);
+    assert_eq!(upstream.server_metrics()[0].answer_times.count(), 0);
 
     zone.set(Behaviour::Refuse);
     assert_eq!(
@@ -269,7 +272,7 @@ async fn a_closed_dns_over_https_connection_is_replaced_and_the_query_retried() 
     assert!(answer.is_ok(), "{answer:?}");
     assert_eq!(doh.connections(), 2);
     assert_eq!(
-        upstream.stats()[0].failures,
+        upstream.server_metrics()[0].failures,
         0,
         "a stale connection is not a failure of the server"
     );
@@ -308,7 +311,7 @@ async fn an_http_error_from_a_dns_over_https_server_fails_over() {
         "at once, not after the timeout"
     );
     assert_eq!(upstream.preferred(), 1);
-    assert_eq!(upstream.stats()[0].failures, 1);
+    assert_eq!(upstream.server_metrics()[0].failures, 1);
 }
 
 #[tokio::test]
@@ -342,10 +345,47 @@ async fn dns_over_https_and_plain_dns_fail_over_to_each_other() {
         .await
         .unwrap();
     assert_eq!(upstream.preferred(), 1);
-    let names: Vec<String> = upstream.stats().into_iter().map(|s| s.name).collect();
+    let names: Vec<String> = upstream
+        .server_metrics()
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
     assert!(
         names[0].starts_with("https://doh.test:") && names[0].ends_with("(127.0.0.1)"),
         "{names:?}"
+    );
+    assert!(!names[0].contains("dns-query"), "{names:?}");
+}
+
+#[test]
+fn a_server_is_named_without_its_path_or_query() {
+    let config = config::Config::parse(
+        r#"[upstream]
+servers = [
+    { url = "https://dns.provider.example/account123?token=SECRET", address = "192.0.2.1" },
+    { url = "https://dns.provider.example/account456", address = "192.0.2.1" },
+    { url = "https://dns.other.example:8443/dns-query", address = "192.0.2.2" },
+    { url = "quic://dns.other.example", address = "2001:db8::2" },
+    "192.0.2.3",
+]
+"#,
+    )
+    .unwrap();
+    let names: Vec<String> = Upstream::new(&config.upstream)
+        .server_metrics()
+        .into_iter()
+        .map(|server| server.name)
+        .collect();
+    assert_eq!(
+        names,
+        [
+            // The same but for the path: told apart by their place.
+            "https://dns.provider.example (192.0.2.1) #1",
+            "https://dns.provider.example (192.0.2.1) #2",
+            "https://dns.other.example:8443 (192.0.2.2)",
+            "quic://dns.other.example (2001:db8::2)",
+            "192.0.2.3:53",
+        ]
     );
 }
 
@@ -390,12 +430,12 @@ async fn dns_over_quic_answers_and_shares_one_connection() {
     }
     assert_eq!(doq.received(), 21);
     assert_eq!(doq.connections(), 1);
-    let stats = upstream.stats();
-    assert_eq!(stats[0].answer_times.count(), 21);
+    let servers = upstream.server_metrics();
+    assert_eq!(servers[0].answer_times.count(), 21);
     assert!(
-        stats[0].name.starts_with("quic://doq.test:") && stats[0].name.ends_with("(127.0.0.1)"),
+        servers[0].name.starts_with("quic://doq.test:") && servers[0].name.ends_with("(127.0.0.1)"),
         "{}",
-        stats[0].name
+        servers[0].name
     );
 }
 
@@ -414,7 +454,7 @@ async fn a_closed_dns_over_quic_connection_is_replaced_and_the_query_retried() {
     assert!(answer.is_ok(), "{answer:?}");
     assert_eq!(doq.connections(), 2);
     assert_eq!(
-        upstream.stats()[0].failures,
+        upstream.server_metrics()[0].failures,
         0,
         "a stale connection is not a failure of the server"
     );
@@ -448,7 +488,7 @@ async fn a_refusing_dns_over_quic_server_is_a_failure() {
             .await,
         Err(ForwardError::NoAnswer)
     );
-    assert_eq!(upstream.stats()[0].failures, 1);
+    assert_eq!(upstream.server_metrics()[0].failures, 1);
 }
 
 // ---------------------------------------------------------------------------

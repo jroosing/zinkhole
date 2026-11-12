@@ -9,7 +9,7 @@
 #   rc-service zinkhole start
 #
 #   rc-service zinkhole reload   # reload the config file (SIGHUP)
-#   rc-service zinkhole stats    # log a summary of the queries (SIGUSR1)
+#   rc-service zinkhole summary  # log a summary of the queries (SIGUSR1)
 #
 # Runs as the unprivileged user "zinkhole" (created on first start) with only
 # the capability to bind port 53, and is restarted if it crashes. Logs go to
@@ -37,9 +37,9 @@ capabilities="^cap_net_bind_service"
 no_new_privs="yes"
 error_logger="logger -t zinkhole -p daemon.info"
 
-extra_started_commands="reload stats"
+extra_started_commands="reload summary"
 description_reload="Reload the configuration file"
-description_stats="Log a summary of the queries"
+description_summary="Log a summary of the queries"
 
 depend() {
 	need net
@@ -69,8 +69,8 @@ reload() {
 	eend $?
 }
 
-stats() {
-	ebegin "Logging $name statistics"
+summary() {
+	ebegin "Logging a summary of the $name queries"
 	supervise-daemon "$RC_SVCNAME" --signal USR1
 	eend $?
 }

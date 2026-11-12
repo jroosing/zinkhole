@@ -58,7 +58,7 @@ fn render_sample(state: &State) -> String {
         queries: &queries,
         upstream: vec![
             ServerMetrics {
-                name: "https://dns.quad9.net/dns-query (9.9.9.9)".to_owned(),
+                name: "https://dns.quad9.net (9.9.9.9)".to_owned(),
                 preferred: true,
                 failures: 3,
                 answer_times: histogram.snapshot(),
@@ -86,7 +86,7 @@ fn the_exposition_holds_every_metric() {
     let state = State::default();
     state.complete_load(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
     let text = render_sample(&state);
-    let quad9 = r#"server="https://dns.quad9.net/dns-query (9.9.9.9)""#;
+    let quad9 = r#"server="https://dns.quad9.net (9.9.9.9)""#;
     for line in [
         "zinkhole_build_info{version=\"3.0.0\"} 1".to_owned(),
         "zinkhole_queries_total{outcome=\"blocked\"} 2".to_owned(),
@@ -182,4 +182,17 @@ fn every_sample_belongs_to_a_declared_family_once() {
             );
         }
     }
+}
+
+#[test]
+fn every_outcome_has_a_counter_of_its_own() {
+    let queries = Queries::default();
+    for (times, outcome) in (1u64..).zip(Outcome::ALL) {
+        for _ in 0..times {
+            queries.record(outcome);
+        }
+    }
+    let counts: Vec<u64> = queries.counts().map(|(_, count)| count).collect();
+    let expected: Vec<u64> = (1u64..).take(Outcome::ALL.len()).collect();
+    assert_eq!(counts, expected);
 }

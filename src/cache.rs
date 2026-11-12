@@ -1,8 +1,9 @@
 //! A bounded cache of upstream answers, keyed by question and the client's
-//! DNSSEC flags. Bounded by memory (`cache.size_mb`): each entry weighs its
-//! encoded size. On a hit, record TTLs are lowered by the time spent in the
-//! cache. An expired entry is kept `serve_stale` longer, for when no upstream
-//! server answers (RFC 8767): [`Cache::lookup_stale`] serves it with TTL 30.
+//! DNSSEC flags. Bounded by memory (`cache.size_mb`): each entry weighs what
+//! it takes in memory, estimated. On a hit, record TTLs are lowered by the
+//! time spent in the cache. An expired entry is kept `serve_stale` longer,
+//! for when no upstream server answers (RFC 8767): [`Cache::lookup_stale`]
+//! serves it with TTL 30. Storing an answer again starts that time anew.
 //!
 //! The current time is passed in, so expiry is tested without waiting.
 
@@ -11,11 +12,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hickory_proto::op::{Message, ResponseCode};
-use hickory_proto::rr::{LowerName, RData, RecordType};
+use hickory_proto::rr::{LowerName, RData, Record, RecordType};
 
 /// TTL of stale answers, as RFC 8767 recommends: clients ask again soon, when
 /// the upstream servers may be back.
 pub const STALE_TTL: u32 = 30;
+
+/// What the cache keeps per entry beside the key and the answer: its own
+/// bookkeeping (the entry, its place in the access and expiry queues) and
+/// the allocations' headers. An estimate, on the generous side.
+const BOOKKEEPING: usize = 256;
 
 /// What an answer depends on: the question, whether the client used EDNS,
 /// set DO (DNSSEC records wanted) or CD (no validation wanted), and which
@@ -91,9 +97,29 @@ struct ExpireAfterStale {
     serve_stale: Duration,
 }
 
+impl ExpireAfterStale {
+    /// How long `entry` is kept from the moment it is stored.
+    fn lifetime(&self, entry: &Entry) -> Duration {
+        Duration::from_secs(entry.ttl.into()) + self.serve_stale
+    }
+}
+
 impl moka::Expiry<Key, Arc<Entry>> for ExpireAfterStale {
     fn expire_after_create(&self, _: &Key, entry: &Arc<Entry>, _: Instant) -> Option<Duration> {
-        Some(Duration::from_secs(entry.ttl.into()) + self.serve_stale)
+        Some(self.lifetime(entry))
+    }
+
+    /// An answer stored again is a new answer: its time starts anew. (The
+    /// default keeps the first one's, which would drop an answer fetched a
+    /// moment ago, and with it the stale answer for an outage.)
+    fn expire_after_update(
+        &self,
+        _: &Key,
+        entry: &Arc<Entry>,
+        _: Instant,
+        _: Option<Duration>,
+    ) -> Option<Duration> {
+        Some(self.lifetime(entry))
     }
 }
 
@@ -184,10 +210,20 @@ impl Cache {
     }
 }
 
-/// The encoded size of an entry, the unit of `cache.size_mb`.
+/// What an entry takes in memory, the unit of `cache.size_mb`: an estimate.
+/// An answer is kept decoded, which is several times its encoded size: the
+/// message, each record, and (taken as their encoded size) the names and
+/// record data that live outside those.
 fn weight(key: &Key, answer: &Message) -> u32 {
+    let records = answer.answers.len() + answer.authorities.len() + answer.additionals.len();
     let encoded = answer.to_vec().map_or(usize::MAX, |bytes| bytes.len());
-    u32::try_from(encoded.saturating_add(key.name.len())).unwrap_or(u32::MAX)
+    let bytes = BOOKKEEPING
+        .saturating_add(size_of::<Key>())
+        .saturating_add(key.name.len())
+        .saturating_add(size_of::<Entry>())
+        .saturating_add(records.saturating_mul(size_of::<Record>()))
+        .saturating_add(encoded);
+    u32::try_from(bytes).unwrap_or(u32::MAX)
 }
 
 /// Applies `change` to every record's TTL, and to the MINIMUM of an SOA in
@@ -381,6 +417,60 @@ mod tests {
         let never = new_cache(0);
         never.store(key.clone(), &upstream_answer(&query, 10), now);
         assert!(never.lookup_stale(&key, later).is_none());
+    }
+
+    #[test]
+    fn an_entry_weighs_what_it_takes_in_memory_not_its_encoded_size() {
+        let query = query("example.com.");
+        let key = Key::of(&query).unwrap();
+        let mut one = upstream_answer(&query, 100);
+        one.queries.clear();
+        let mut two = one.clone();
+        two.answers.push(one.answers[0].clone());
+
+        let encoded = one.to_vec().unwrap().len();
+        let in_memory = size_of::<Message>() + size_of::<Record>();
+        assert!(in_memory > 4 * encoded, "kept decoded: far larger");
+        let weigh = |answer: &Message| usize::try_from(weight(&key, answer)).unwrap();
+        assert!(weigh(&one) >= in_memory + encoded);
+        assert!(weigh(&two) - weigh(&one) >= size_of::<Record>());
+    }
+
+    #[test]
+    fn the_size_bounds_the_memory_of_the_entries_kept() {
+        let cache = new_cache(0);
+        let now = Instant::now();
+        for i in 0..5000 {
+            let query = query(&format!("host{i}.example.com."));
+            cache.store(Key::of(&query).unwrap(), &upstream_answer(&query, 100), now);
+        }
+        let kept = usize::try_from(cache.entry_count()).unwrap();
+        assert!(kept > 0);
+        let each = size_of::<Message>() + size_of::<Record>();
+        assert!(
+            kept * each <= 1024 * 1024,
+            "{kept} entries of at least {each} bytes in 1 MiB"
+        );
+    }
+
+    #[test]
+    fn an_answer_stored_again_is_kept_as_long_as_a_new_one() {
+        let cache = new_cache(0);
+        let query = query("example.com.");
+        let key = Key::of(&query).unwrap();
+        let wait = |millis| std::thread::sleep(Duration::from_millis(millis));
+
+        // The entries' removal runs on the real clock: stored again three
+        // quarters into its two seconds, the answer must outlive them.
+        cache.store(key.clone(), &upstream_answer(&query, 2), Instant::now());
+        wait(1500);
+        let again = Instant::now();
+        cache.store(key.clone(), &upstream_answer(&query, 2), again);
+        wait(1000);
+        assert!(
+            cache.lookup(&key, again).is_some(),
+            "removed when the first answer was due"
+        );
     }
 
     #[test]

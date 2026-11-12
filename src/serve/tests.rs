@@ -188,3 +188,21 @@ fn an_origin_serves_what_a_reload_puts_in_force() {
     assert_ne!(origin.published_text(), before);
     assert!(origin.published_text().contains("ads.example"));
 }
+
+#[test]
+fn the_summary_names_every_outcome_with_its_count() {
+    use crate::resolver::Outcome;
+
+    let queries = metrics::Queries::default();
+    queries.record(Outcome::Blocked);
+    queries.record(Outcome::Blocked);
+    queries.record(Outcome::Local);
+    let summary = summary(&queries);
+    assert!(summary.starts_with("local=1 blocked=2 "), "{summary}");
+    for outcome in Outcome::ALL {
+        assert!(
+            summary.contains(&format!("{outcome}=")),
+            "{outcome}: {summary}"
+        );
+    }
+}

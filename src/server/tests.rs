@@ -11,12 +11,14 @@ use tokio::task::JoinHandle;
 
 use super::*;
 use crate::config::Config;
+use crate::resolver::Outcome;
 use crate::serve;
 use crate::stub::{Behaviour, PlainStub};
 use crate::upstream::Upstream;
 
 struct Running {
     address: SocketAddr,
+    resolver: Arc<Resolver<Upstream>>,
     shutdown: CancellationToken,
     task: JoinHandle<io::Result<()>>,
     _upstream: PlainStub,
@@ -43,9 +45,10 @@ async fn start_on(addresses: &[SocketAddr], toml: &str) -> Running {
     let listeners = Listeners::bind(addresses).unwrap();
     let address = listeners.addresses()[0];
     let shutdown = CancellationToken::new();
-    let task = tokio::spawn(serve(listeners, resolver, shutdown.clone()));
+    let task = tokio::spawn(serve(listeners, Arc::clone(&resolver), shutdown.clone()));
     Running {
         address,
+        resolver,
         shutdown,
         task,
         _upstream: upstream,
@@ -154,6 +157,11 @@ async fn tcp_answers_several_queries_on_one_connection_in_order() {
 async fn clients_that_may_not_query_get_nothing_over_udp_and_a_closed_connection_over_tcp() {
     let server = start("[server]\nallow_clients = [\"10.0.0.0/8\"]").await;
     assert!(udp_ask(server.address, "nas.lan.").await.is_none());
+    assert_eq!(
+        server.resolver.queries().count(Outcome::Refused),
+        1,
+        "dropped unread, and counted all the same"
+    );
     let mut stream = TcpStream::connect(server.address).await.unwrap();
     assert!(closed(&mut stream).await);
     server.stop().await;
@@ -293,29 +301,4 @@ async fn ipv4_clients_of_an_ipv6_socket_are_allowed_by_their_ipv4_address() {
     let ipv4 = SocketAddr::from((Ipv4Addr::LOCALHOST, server.address.port()));
     assert!(udp_ask(ipv4, "nas.lan.").await.is_some());
     server.stop().await;
-}
-
-#[test]
-fn tcp_limits_count_per_client_and_overall_and_free_on_drop() {
-    let limits = Arc::new(TcpLimits::new());
-    let client = |n: u8| IpAddr::from([10, 0, 0, n]);
-    let first: Vec<_> = (0..TCP_PER_CLIENT)
-        .map(|_| limits.admit(client(1)).unwrap())
-        .collect();
-    assert!(limits.admit(client(1)).is_none());
-    let mut others: Vec<_> = (2..)
-        .map(client)
-        .take(TCP_CONNECTIONS - TCP_PER_CLIENT)
-        .map(|c| limits.admit(c).unwrap())
-        .collect();
-    assert!(limits.admit(client(200)).is_none(), "all 16 are taken");
-    others.pop();
-    assert!(limits.admit(client(200)).is_some());
-    drop(first);
-    drop(others);
-    assert_eq!(
-        limits.per_client.lock().unwrap().len(),
-        0,
-        "nothing left behind"
-    );
 }

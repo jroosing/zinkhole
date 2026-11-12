@@ -164,7 +164,7 @@ the config.
   sandboxing (`systemd-analyze security zinkhole` rates it 1.6, "OK").
 - **OpenRC** ([deploy/openrc/zinkhole](deploy/openrc/zinkhole)): a `zinkhole`
   user created on first start, restarted by supervise-daemon if it crashes,
-  logs to syslog; `rc-service zinkhole stats` logs a summary.
+  logs to syslog; `rc-service zinkhole summary` logs a summary.
 - **Port 53 already in use?** `systemd-resolved` (default on Ubuntu, optional
   on Debian) listens on 127.0.0.53:53. Set `DNSStubListener=no` in
   `/etc/systemd/resolved.conf`, or listen on the LAN address only, e.g.
@@ -325,7 +325,7 @@ curl http://192.168.1.5:5380/metrics
 | Metric | Meaning |
 |--------|---------|
 | `zinkhole_queries_total{outcome}` | Queries since start, by [how they were answered](#how-a-query-is-answered): `local`, `blocked`, `private`, `cached`, `forwarded`, `failed`, `bogus`, `refused`, `invalid` |
-| `zinkhole_upstream_answer_duration_seconds{server}` | Histogram of upstream answer times; its `_count` is the answers |
+| `zinkhole_upstream_answer_duration_seconds{server}` | Histogram of upstream answer times; its `_count` is the answers. `server` is the address of a plain server, or an encrypted one's URL without its path, with its address: `https://dns.quad9.net (9.9.9.9)` |
 | `zinkhole_upstream_failures_total{server}` | Timeouts, connection errors, malformed answers and `REFUSED` |
 | `zinkhole_upstream_preferred{server}` | 1 for the server asked first |
 | `zinkhole_blocked_domains`, `zinkhole_allowed_domains` | Domains in the lists in force |
@@ -417,7 +417,7 @@ run locally (`publish --dry-run`).
 |--------|----------------|
 | `main.rs`, `serve.rs` | The CLI; wiring the parts together, signals, Reload |
 | `config.rs` | The TOML config: typed, validated |
-| `server.rs` | UDP and TCP listeners: a task per query, TCP limits |
+| `server.rs`, `listen.rs` | UDP and TCP listeners: a task per query, TCP limits; binding and admitting connections, shared with the HTTP port |
 | `resolver.rs` | The query pipeline above, query counting and log |
 | `policy.rs` | The Policy: local records, rules, forwarded zones and private names, and blocked aliases (ADR-0001) |
 | `local.rs`, `domain_set.rs`, `rules.rs`, `name.rs` | Local records and reverse lookups; domain sets with subdomain matching; the list line parser |
@@ -428,7 +428,7 @@ run locally (`publish --dry-run`).
 | `settings.rs` | Putting Policy settings in force, for a Reload, a Sync or a start |
 | `sync.rs` | The origin's endpoint, the replica's fetch and state file, sealing |
 | `http.rs`, `metrics.rs` | The HTTP port; the Prometheus metrics |
-| `logging.rs`, `tls.rs` | Log output; TLS with the compiled-in roots |
+| `logging.rs`, `tls.rs`, `client.rs` | Log output; TLS with the compiled-in roots; what the HTTP clients share |
 
 The design as a whole is described in
 [ADR-0001](docs/adr/0001-zinkhole-architecture.md), and
@@ -475,8 +475,8 @@ right away, even if some failed.
   a 256-bit secret, per request (ADR-0001); the state file is sealed too and
   readable by its owner only. The secret is never logged.
 - The HTTP port answers only `server.allow_clients`, gives a request head 2
-  seconds, serves one request per connection and at most 16 at once. The
-  config file is limited to 1 MiB.
+  seconds, serves one request per connection and at most 16 at once, 4 per
+  client address. The config file is limited to 1 MiB.
 
 ## Limitations
 

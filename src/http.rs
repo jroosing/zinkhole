@@ -3,8 +3,8 @@
 //! Only clients in `server.allow_clients` are served; others have their
 //! connection closed on arrival, as on the DNS port. A request head must
 //! arrive within 2 seconds of connecting, a connection serves one request
-//! and lasts at most 10 seconds, and at most 16 are served at once. Unknown paths are
-//! 404, other methods 405.
+//! and lasts at most 10 seconds, and at most 16 are served at once, 4 of
+//! them from one client address. Unknown paths are 404, other methods 405.
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -19,14 +19,13 @@ use axum::{Extension, Router};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::config::Network;
+use crate::listen::{self, Admitted, BindError, Limits, Unbound};
 use crate::metrics::{self, Snapshot};
 use crate::resolver::Resolver;
-use crate::server::{self, BindError, Unavailable};
 use crate::upstream::Upstream;
 
 /// For the request head, from the connection's start.
@@ -35,7 +34,9 @@ const HEAD_TIMEOUT: Duration = Duration::from_secs(2);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 /// Connections served at once, over all listeners.
 const CONNECTIONS: usize = 16;
-const BACKOFF: Duration = Duration::from_millis(10);
+/// Of those, the most one client address may hold: one client cannot keep
+/// the replicas and the monitoring system out.
+const PER_CLIENT: usize = 4;
 
 /// The client of a request, as allowed: an extension on every request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,7 +55,7 @@ impl MetricsSource {
         let policy = self.resolver.policy();
         metrics::render(&Snapshot {
             queries: self.resolver.queries(),
-            upstream: self.resolver.forwarder().stats(),
+            upstream: self.resolver.forwarder().server_metrics(),
             counts: policy.counts(),
             cache_entries: self.resolver.cache().entry_count(),
             lists: policy.lists(),
@@ -94,25 +95,9 @@ impl HttpListeners {
     ///
     /// An address cannot be bound, or none is left.
     pub fn bind(addresses: &[SocketAddr]) -> Result<HttpListeners, BindError> {
-        let mut listeners = Vec::with_capacity(addresses.len());
-        for &address in addresses {
-            match server::bind_tcp(address, server::ipv6_only(address, addresses)) {
-                Ok(listener) => listeners.push(listener),
-                Err(Unavailable::Ipv6(error)) => {
-                    tracing::warn!(%address, %error, "IPv6 is unavailable, not listening here");
-                }
-                Err(Unavailable::Other(source)) => {
-                    return Err(BindError::Socket {
-                        address,
-                        protocol: "http",
-                        source,
-                    });
-                }
-            }
-        }
-        if listeners.is_empty() {
-            return Err(BindError::Nothing);
-        }
+        let listeners = listen::bind_each(addresses, |address, ipv6_only| {
+            listen::bind_tcp(address, ipv6_only).map_err(|why| Unbound::new(address, "http", why))
+        })?;
         Ok(HttpListeners { listeners })
     }
 
@@ -142,14 +127,14 @@ pub async fn serve(
         .map(TcpListener::from_std)
         .collect::<io::Result<Vec<_>>>()?;
     let allow_clients: Arc<[Network]> = allow_clients.into();
-    let connections = Arc::new(Semaphore::new(CONNECTIONS));
+    let limits = Limits::new(CONNECTIONS, PER_CLIENT);
     let tasks = TaskTracker::new();
     for listener in listeners {
         tasks.spawn(accept(
             listener,
             router.clone(),
             Arc::clone(&allow_clients),
-            Arc::clone(&connections),
+            Arc::clone(&limits),
             tasks.clone(),
             shutdown.clone(),
         ));
@@ -163,31 +148,19 @@ async fn accept(
     listener: TcpListener,
     router: Router,
     allow_clients: Arc<[Network]>,
-    connections: Arc<Semaphore>,
+    limits: Arc<Limits>,
     tasks: TaskTracker,
     shutdown: CancellationToken,
 ) {
-    loop {
-        let accepted = tokio::select! {
-            () = shutdown.cancelled() => return,
-            accepted = listener.accept() => accepted,
-        };
-        let (stream, from) = match accepted {
-            Ok(accepted) => accepted,
-            Err(error) => {
-                tracing::debug!(%error, "http accept failed");
-                tokio::time::sleep(BACKOFF).await;
-                continue;
-            }
-        };
-        let client = from.ip().to_canonical();
-        if !allow_clients.iter().any(|network| network.contains(client)) {
-            continue;
-        }
-        let Ok(permit) = Arc::clone(&connections).try_acquire_owned() else {
-            tracing::debug!(%from, "too many http connections, closing");
-            continue;
-        };
+    let allowed = |client| allow_clients.iter().any(|network| network.contains(client));
+    while let Some(admitted) = listen::accept(&listener, "http", allowed, &limits, &shutdown).await
+    {
+        let Admitted {
+            stream,
+            from,
+            client,
+            slot,
+        } = admitted;
         let service = TowerToHyperService::new(router.clone().layer(Extension(Client(client))));
         let connection = async move {
             let served = hyper::server::conn::http1::Builder::new()
@@ -200,7 +173,7 @@ async fn accept(
                 Ok(Err(error)) => tracing::debug!(%from, %error, "http connection failed"),
                 Err(_) => tracing::debug!(%from, "http connection took too long, closed"),
             }
-            drop(permit);
+            drop(slot);
         };
         tasks.spawn(shutdown.clone().run_until_cancelled_owned(connection));
     }

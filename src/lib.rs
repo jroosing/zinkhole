@@ -3,11 +3,13 @@
 
 pub mod answer;
 pub mod cache;
+pub mod client;
 pub mod config;
 pub mod domain_set;
 pub mod healthcheck;
 pub mod hex;
 pub mod http;
+pub mod listen;
 pub mod lists;
 pub mod local;
 pub mod logging;

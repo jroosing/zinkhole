@@ -28,7 +28,7 @@ use crate::policy::{Lists, Policy, Replacement, Sources};
 
 /// A load still running after this is canceled: a backstop, as the Loader
 /// ends a load at [`lists::LOAD_TIMEOUT`] on its own.
-const LOAD_TIMEOUT: Duration = lists::LOAD_TIMEOUT.saturating_add(Duration::from_mins(1));
+const LOAD_BACKSTOP: Duration = lists::LOAD_TIMEOUT.saturating_add(Duration::from_mins(1));
 /// The first retry after an incomplete load; doubles with each further one.
 const MIN_RETRY_DELAY: Duration = Duration::from_mins(1);
 /// The retry delay without a Refresh interval to cap it.
@@ -79,7 +79,7 @@ impl Schedule {
     pub fn next(&self, now: Instant, interval: Option<Duration>) -> Action {
         if let Some(since) = self.running_since {
             // A load of outdated sources is not worth finishing.
-            if self.sources_changed || now.duration_since(since) > LOAD_TIMEOUT {
+            if self.sources_changed || now.duration_since(since) > LOAD_BACKSTOP {
                 return Action::Cancel;
             }
             return Action::Idle;
@@ -114,7 +114,7 @@ impl Schedule {
     /// the running load's deadline, or the next due load.
     fn wake_at(&self, interval: Option<Duration>) -> Option<Instant> {
         match self.running_since {
-            Some(since) => Some(since + LOAD_TIMEOUT),
+            Some(since) => Some(since + LOAD_BACKSTOP),
             None => self.due(interval),
         }
     }
@@ -196,7 +196,7 @@ pub async fn run(
                 if !schedule.sources_changed {
                     tracing::warn!(
                         "loading the lists took longer than {} minutes, canceled",
-                        LOAD_TIMEOUT.as_secs() / 60
+                        LOAD_BACKSTOP.as_secs() / 60
                     );
                 }
                 report_retry(schedule.finished(now, false, current.interval));

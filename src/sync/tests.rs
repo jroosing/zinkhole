@@ -84,6 +84,32 @@ fn an_answer_cannot_be_replayed_to_another_request_or_its_etag_altered() {
     assert!(origin.answer("not hex", None).is_err());
 }
 
+#[test]
+fn unchanged_counts_only_for_the_settings_a_replica_has() {
+    let origin = Origin::new(
+        &secret(1),
+        &settings("[blocking]\nblock = [\"ads.example\"]\n"),
+        Arc::default(),
+    )
+    .unwrap();
+    let keys = Keys::new(&secret(1));
+    let nonce = [7u8; NONCE_LEN];
+    let current = origin.published.load().etag.clone();
+    // What the origin answers when `If-None-Match` names its current
+    // settings, whoever put that there.
+    let (etag, sealed) = origin.answer(&hex::encode(&nonce), Some(&current)).unwrap();
+    assert_eq!(etag, current);
+
+    assert_eq!(
+        opened(&keys, &nonce, Some(&current), etag.clone(), &sealed).unwrap(),
+        Fetched::Unchanged
+    );
+    for have in [None, Some("\"older\"")] {
+        let error = opened(&keys, &nonce, have, etag.clone(), &sealed).unwrap_err();
+        assert!(matches!(error, SyncError::NotOurs), "{have:?}: {error}");
+    }
+}
+
 struct Running {
     url: Url,
     origin: Arc<Origin>,
@@ -230,6 +256,20 @@ fn the_state_file_is_sealed_owner_only_and_checked() {
     assert!(matches!(replica.load_state(), Err(StateError::Tampered(_))));
 }
 
+/// A Sync loop for `replica` on an instance with `config`, with nothing
+/// synced yet and an interval that never comes round.
+fn syncer(replica: Replica, config: &Config, in_force: InForce) -> Syncer {
+    Syncer {
+        replica,
+        server: config.server.clone(),
+        in_force: Arc::new(in_force),
+        have: None,
+        interval: Duration::from_secs(3600),
+        now: Arc::new(Notify::new()),
+        metrics: Arc::new(metrics::State::new(config::Role::Replica)),
+    }
+}
+
 #[tokio::test]
 async fn the_sync_loop_applies_saves_skips_invalid_settings_and_syncs_on_request() {
     let running = start_origin(1, "[blocking]\nblock = [\"ads.example\"]\n");
@@ -245,16 +285,12 @@ async fn the_sync_loop_applies_saves_skips_invalid_settings_and_syncs_on_request
     let metrics = Arc::new(metrics::State::new(config::Role::Replica));
     let now = Arc::new(Notify::new());
     let shutdown = CancellationToken::new();
-    let task = tokio::spawn(run(
-        replica(&running.url, 1, dir.path()),
-        config.server.clone(),
-        Arc::new(in_force),
-        None,
-        Duration::from_secs(3600),
-        Arc::clone(&now),
-        Arc::clone(&metrics),
-        shutdown.clone(),
-    ));
+    let syncer = Syncer {
+        now: Arc::clone(&now),
+        metrics: Arc::clone(&metrics),
+        ..syncer(replica(&running.url, 1, dir.path()), &config, in_force)
+    };
+    let task = tokio::spawn(syncer.run(shutdown.clone()));
     let blocked = |name: &str| matches!(policy.decide(name, RecordType::A), Decision::Blocked(_));
     let settle = || tokio::time::sleep(Duration::from_millis(300));
 
@@ -313,11 +349,6 @@ async fn the_sync_loop_applies_saves_skips_invalid_settings_and_syncs_on_request
 }
 
 #[test]
-fn synced_text_has_the_config_files_limit() {
-    assert_eq!(MAX_TEXT as u64, config::MAX_FILE_SIZE);
-}
-
-#[test]
 fn a_state_dir_that_cannot_be_written_is_found_at_start_and_on_save() {
     let dir = tempfile::tempdir().unwrap();
     let url = Url::parse("http://127.0.0.1:1").unwrap();
@@ -337,16 +368,13 @@ fn a_state_dir_that_cannot_be_written_is_found_at_start_and_on_save() {
     let config = Config::parse("[upstream]\nservers = [\"9.9.9.9\"]\n").unwrap();
     let policy = Arc::new(Policy::new(&PolicySettings::default()));
     let (in_force, _refresh) = InForce::new(policy, &PolicySettings::default());
-    let metrics = metrics::State::new(config::Role::Replica);
-    let synced = Synced {
+    let settings = Synced {
         etag: "\"e\"".to_owned(),
         text: "[blocking]\nblock = [\"ads.example\"]\n".to_owned(),
     };
-    assert!(
-        apply(&stuck, &config.server, &in_force, &synced, &metrics),
-        "valid, though not saved"
-    );
-    let text = metrics::render(&snapshot(&metrics));
+    let syncer = syncer(stuck, &config, in_force);
+    assert!(syncer.apply(&settings), "valid, though not saved");
+    let text = metrics::render(&snapshot(&syncer.metrics));
     assert!(text.contains("zinkhole_sync_state_file_ok 0"), "{text}");
 }
 
@@ -371,4 +399,36 @@ fn an_origin_never_serves_more_than_replicas_accept() {
         origin.published_text().contains("ads.example"),
         "the last settings stay served"
     );
+}
+
+#[tokio::test]
+async fn a_shutdown_does_not_wait_for_a_fetch_the_origin_never_answers() {
+    // Accepts connections and says nothing, like an origin behind a
+    // firewall that drops packets.
+    let silent = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let url = Url::parse(&format!("http://{}", silent.local_addr().unwrap())).unwrap();
+    let held = tokio::spawn(async move {
+        let mut connections = Vec::new();
+        while let Ok((stream, _)) = silent.accept().await {
+            connections.push(stream);
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config::parse("[upstream]\nservers = [\"9.9.9.9\"]\n").unwrap();
+    let policy = Arc::new(Policy::new(&PolicySettings::default()));
+    let (in_force, _refresh) = InForce::new(policy, &PolicySettings::default());
+    let shutdown = CancellationToken::new();
+    let syncer = syncer(replica(&url, 1, dir.path()), &config, in_force);
+    let task = tokio::spawn(syncer.run(shutdown.clone()));
+    // Long enough for the fetch to be under way.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("well within the fetch timeout")
+        .unwrap();
+    held.abort();
 }

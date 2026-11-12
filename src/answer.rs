@@ -4,6 +4,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
+use std::sync::LazyLock;
 
 use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::{A, AAAA, PTR, SOA};
@@ -24,6 +25,13 @@ pub const HEADER_LEN: usize = 12;
 /// The made-up zone of the SOA in negative answers (`.invalid`, RFC 6761).
 const SOA_MNAME: &str = "zinkhole.invalid.";
 const SOA_RNAME: &str = "hostmaster.zinkhole.invalid.";
+/// Those two as names, parsed once and not for every negative answer. None
+/// only if one of them were not a name.
+static SOA_NAMES: LazyLock<Option<(Name, Name)>> = LazyLock::new(|| {
+    let mname = Name::from_str(SOA_MNAME).ok()?;
+    let rname = Name::from_str(SOA_RNAME).ok()?;
+    Some((mname, rname))
+});
 
 /// An empty response to `query`: its ID, opcode, RD and CD flags, its
 /// question as the client wrote it, and an OPT record if the client sent one.
@@ -131,10 +139,10 @@ fn add_soa(response: &mut Message, ttl: u32) {
     let Some(owner) = response.queries.first().map(|q| q.name().clone()) else {
         return;
     };
-    let (Ok(mname), Ok(rname)) = (Name::from_str(SOA_MNAME), Name::from_str(SOA_RNAME)) else {
+    let Some((mname, rname)) = SOA_NAMES.as_ref() else {
         return;
     };
-    let soa = SOA::new(mname, rname, 1, 3600, 600, 86_400, ttl);
+    let soa = SOA::new(mname.clone(), rname.clone(), 1, 3600, 600, 86_400, ttl);
     response
         .authorities
         .push(Record::from_rdata(owner, ttl, RData::SOA(soa)));

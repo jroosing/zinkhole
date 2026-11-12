@@ -20,11 +20,11 @@ use std::time::{Duration, Instant};
 use reqwest::StatusCode;
 use reqwest::redirect;
 use tokio::io::AsyncReadExt;
-use url::Url;
 
+use crate::client::{self, ClientError};
 use crate::config::Source;
 use crate::policy::{Lists, ListsBuilder, Sources};
-use crate::rules::{ListParser, ListStats, ListTooLarge, Rule};
+use crate::rules::{ListCounts, ListParser, ListTooLarge, Rule};
 
 /// The most one source may hold, decompressed.
 pub const MAX_LIST_BYTES: u64 = 64 * 1024 * 1024;
@@ -57,24 +57,9 @@ pub enum LoadError {
 
 impl From<reqwest::Error> for LoadError {
     fn from(error: reqwest::Error) -> Self {
-        // Without reqwest's "for url (...)": its query may hold a token.
-        let error = error.without_url();
-        // The whole chain: "error sending request" alone says little.
-        let mut text = error.to_string();
-        let mut source = std::error::Error::source(&error);
-        while let Some(cause) = source {
-            text.push_str(": ");
-            text.push_str(&cause.to_string());
-            source = cause.source();
-        }
-        LoadError::Http(text)
+        LoadError::Http(client::error_text(error))
     }
 }
-
-/// The client could not be set up.
-#[derive(Debug, thiserror::Error)]
-#[error("cannot set up the HTTP client: {0}")]
-pub struct ClientError(#[from] reqwest::Error);
 
 /// Loads lists; one client, so connections to a list server are reused.
 #[derive(Debug, Clone)]
@@ -107,12 +92,9 @@ impl Loader {
     ) -> Result<Loader, ClientError> {
         let mut tls = crate::tls::client_config(roots);
         tls.alpn_protocols = vec![b"http/1.1".to_vec()];
-        let client = reqwest::Client::builder()
-            .tls_backend_preconfigured(tls)
-            .user_agent(concat!("zinkhole/", env!("CARGO_PKG_VERSION")))
+        let client = client::builder(tls)
             .connect_timeout(CONNECT_TIMEOUT)
             .redirect(redirect::Policy::custom(no_downgrade))
-            .no_proxy()
             // A redirect to another host must not learn the list's URL.
             .referer(false)
             .build()?;
@@ -159,10 +141,10 @@ impl Loader {
             };
             builder.source_done(loaded.is_ok());
             match loaded {
-                Ok(stats) => tracing::info!(
+                Ok(counts) => tracing::info!(
                     source = %shown(source),
-                    rules = stats.rules,
-                    skipped_lines = stats.skipped,
+                    rules = counts.rules,
+                    skipped_lines = counts.skipped,
                     "list loaded"
                 ),
                 Err(error) => {
@@ -190,12 +172,17 @@ impl Loader {
         &self,
         source: &Source,
         sink: &mut impl FnMut(Rule),
-    ) -> Result<ListStats, LoadError> {
+    ) -> Result<ListCounts, LoadError> {
         let mut parser = ListParser::new(self.max_bytes);
         match source {
             Source::Url(url) => {
                 if url.scheme() == "http" {
-                    tracing::warn!(%url, "loading a list over plain HTTP: anyone on the way can change its rules");
+                    // Shown as in every other line about a source: without
+                    // its query, which may hold a token.
+                    tracing::warn!(
+                        source = %shown(source),
+                        "loading a list over plain HTTP: anyone on the way can change its rules"
+                    );
                 }
                 let mut response = self.client.get(url.clone()).send().await?;
                 if response.status() != StatusCode::OK {
@@ -237,7 +224,7 @@ fn no_downgrade(attempt: redirect::Attempt<'_>) -> redirect::Action {
     if from_https && attempt.url().scheme() != "https" {
         let error = format!(
             "refused a redirect from https to {}",
-            shown_url(attempt.url())
+            client::shown_url(attempt.url())
         );
         return attempt.error(error);
     }
@@ -251,19 +238,9 @@ fn no_downgrade(attempt: redirect::Attempt<'_>) -> redirect::Action {
 /// which may hold tokens.
 pub(crate) fn shown(source: &Source) -> String {
     match source {
-        Source::Url(url) => shown_url(url),
+        Source::Url(url) => client::shown_url(url),
         Source::File(path) => path.display().to_string(),
     }
-}
-
-/// `url` without credentials, query or fragment.
-fn shown_url(url: &Url) -> String {
-    let mut shown = url.clone();
-    let _ = shown.set_username("");
-    let _ = shown.set_password(None);
-    shown.set_query(None);
-    shown.set_fragment(None);
-    shown.to_string()
 }
 
 #[cfg(test)]

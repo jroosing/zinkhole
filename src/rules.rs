@@ -211,7 +211,7 @@ fn parse_domain(token: &str) -> Parsed {
 
 /// What a list held.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ListStats {
+pub struct ListCounts {
     pub lines: u64,
     pub rules: u64,
     pub skipped: u64,
@@ -235,7 +235,7 @@ pub struct ListParser {
     /// The current line is longer than [`MAX_LINE_LEN`] and is being skipped.
     overflow: bool,
     first_line: bool,
-    stats: ListStats,
+    counts: ListCounts,
 }
 
 impl ListParser {
@@ -247,7 +247,7 @@ impl ListParser {
             partial: Vec::new(),
             overflow: false,
             first_line: true,
-            stats: ListStats::default(),
+            counts: ListCounts::default(),
         }
     }
 
@@ -281,12 +281,12 @@ impl ListParser {
     }
 
     /// Parses the last line, if it had no newline, and says what the list held.
-    pub fn finish(mut self, sink: &mut impl FnMut(Rule)) -> ListStats {
+    pub fn finish(mut self, sink: &mut impl FnMut(Rule)) -> ListCounts {
         if !self.partial.is_empty() || self.overflow {
             let line = std::mem::take(&mut self.partial);
             self.line(&line, sink);
         }
-        self.stats
+        self.counts
     }
 
     fn append(&mut self, bytes: &[u8]) {
@@ -302,7 +302,7 @@ impl ListParser {
     }
 
     fn line(&mut self, bytes: &[u8], sink: &mut impl FnMut(Rule)) {
-        self.stats.lines += 1;
+        self.counts.lines += 1;
         let first = std::mem::replace(&mut self.first_line, false);
         let bytes = if first {
             bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes)
@@ -314,12 +314,12 @@ impl ListParser {
             .then(|| std::str::from_utf8(bytes).ok())
             .flatten();
         let Some(text) = text else {
-            self.stats.skipped += 1;
+            self.counts.skipped += 1;
             return;
         };
         let parsed = parse_line(text);
-        self.stats.skipped += u64::from(parsed.skipped);
-        self.stats.rules += parsed.rules.len() as u64;
+        self.counts.skipped += u64::from(parsed.skipped);
+        self.counts.rules += parsed.rules.len() as u64;
         parsed.rules.into_iter().for_each(&mut *sink);
     }
 }
@@ -412,14 +412,14 @@ mod tests {
         for chunk in text.as_bytes().chunks(7) {
             parser.feed(chunk, &mut sink).unwrap();
         }
-        let stats = parser.finish(&mut sink);
+        let counts = parser.finish(&mut sink);
         assert_eq!(
             found,
             ["first.example.com", "mple.com", "third.example.com"]
         );
         assert_eq!(
-            stats,
-            ListStats {
+            counts,
+            ListCounts {
                 lines: 4,
                 rules: 3,
                 skipped: 1

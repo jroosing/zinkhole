@@ -39,6 +39,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
+use crate::client::{self, ClientError};
 use crate::config::{self, PolicySettings, Secret};
 use crate::hex;
 use crate::http::Client;
@@ -49,9 +50,8 @@ pub const PATH: &str = "/sync";
 const NONCE_HEADER: &str = "x-zinkhole-nonce";
 const NONCE_LEN: usize = 32;
 const XNONCE_LEN: usize = 24;
-/// Synced settings are config sections: the config's limit applies
-/// (`config::MAX_FILE_SIZE`).
-const MAX_TEXT: usize = 1024 * 1024;
+/// Synced settings are config sections: the config's limit applies.
+const MAX_TEXT: usize = config::MAX_FILE_SIZE;
 /// The most a sealed answer adds: the nonce, the payload tag and the tag.
 const OVERHEAD: usize = XNONCE_LEN + 1 + 16;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -337,18 +337,15 @@ pub enum SyncError {
     Tampered(#[from] Tampered),
     #[error("the answer is not settings")]
     Malformed,
+    /// "Unchanged", but about other settings than the ones this replica
+    /// has: its `If-None-Match` was altered on the way.
+    #[error("the answer says \"unchanged\" about settings this replica does not have")]
+    NotOurs,
 }
 
 impl From<reqwest::Error> for SyncError {
     fn from(error: reqwest::Error) -> Self {
-        let mut text = error.to_string();
-        let mut source = std::error::Error::source(&error);
-        while let Some(cause) = source {
-            text.push_str(": ");
-            text.push_str(&cause.to_string());
-            source = cause.source();
-        }
-        SyncError::Http(text)
+        SyncError::Http(client::error_text(error))
     }
 }
 
@@ -392,20 +389,13 @@ impl Replica {
     /// # Errors
     ///
     /// The HTTP client cannot be set up.
-    pub fn new(
-        origin: &Url,
-        secret: &Secret,
-        state_dir: &Path,
-    ) -> Result<Replica, crate::lists::ClientError> {
+    pub fn new(origin: &Url, secret: &Secret, state_dir: &Path) -> Result<Replica, ClientError> {
         let mut url = origin.clone();
         url.set_path(PATH);
         let tls = crate::tls::client_config(crate::tls::public_roots());
-        let client = reqwest::Client::builder()
-            .tls_backend_preconfigured(tls)
-            .user_agent(concat!("zinkhole/", env!("CARGO_PKG_VERSION")))
+        let client = client::builder(tls)
             .timeout(FETCH_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
             .build()?;
         Ok(Replica {
             url,
@@ -453,15 +443,7 @@ impl Replica {
             }
             sealed.extend_from_slice(&chunk);
         }
-        let payload = open(&self.keys.answer(&nonce), &answer_ad(&etag), &sealed)?;
-        match payload.split_first() {
-            Some((&UNCHANGED, [])) => Ok(Fetched::Unchanged),
-            Some((&SETTINGS, text)) => {
-                let text = String::from_utf8(text.to_vec()).map_err(|_| SyncError::Malformed)?;
-                Ok(Fetched::Changed(Synced { etag, text }))
-            }
-            _ => Err(SyncError::Malformed),
-        }
+        opened(&self.keys, &nonce, have, etag, &sealed)
     }
 
     /// The settings in the state file; None if there is none.
@@ -530,91 +512,126 @@ impl Replica {
     }
 }
 
-/// Syncs with the origin every `interval`, and at once when `now` is
-/// notified (a Reload), until `shutdown`. Valid settings are put in force
-/// and saved; `have` is the `ETag` of the settings in force at start.
-#[allow(clippy::too_many_arguments)]
-pub async fn run(
-    replica: Replica,
-    server: config::Server,
-    in_force: Arc<InForce>,
-    mut have: Option<String>,
-    interval: Duration,
-    now: Arc<Notify>,
-    metrics: Arc<metrics::State>,
-    shutdown: CancellationToken,
-) {
-    let origin = replica.origin().clone();
-    let mut failures: u64 = 0;
-    // The origin's current settings are refused here.
-    let mut rejected = false;
-    loop {
-        match replica.fetch(have.as_deref()).await {
-            Ok(fetched) => {
-                if failures >= WARN_AFTER {
-                    tracing::info!(%origin, "syncing again");
-                }
-                failures = 0;
-                if let Fetched::Changed(synced) = fetched {
-                    rejected = !apply(&replica, &server, &in_force, &synced, &metrics);
-                    // Also after invalid settings: they are not fetched and
-                    // logged again until the origin's settings change (the
-                    // Metrics show them refused meanwhile).
-                    have = Some(synced.etag);
-                }
-                if rejected {
-                    metrics.sync_rejected();
-                } else {
-                    metrics.synced(SystemTime::now());
-                }
-            }
-            Err(error) => {
-                failures += 1;
-                metrics.sync_failed();
-                if failures == WARN_AFTER {
-                    tracing::warn!(%origin, %error, "syncing failed {WARN_AFTER} times in a row; keeping the last settings");
-                } else {
-                    tracing::debug!(%origin, %error, "sync failed");
-                }
-            }
+/// What the sealed answer to the request with `nonce` says, to a replica
+/// that has the settings with the `ETag` `have`.
+///
+/// The request is not sealed, so "unchanged" counts only for the `ETag`
+/// the replica really has: an altered `If-None-Match` must not keep it on
+/// old settings.
+fn opened(
+    keys: &Keys,
+    nonce: &[u8; NONCE_LEN],
+    have: Option<&str>,
+    etag: String,
+    sealed: &[u8],
+) -> Result<Fetched, SyncError> {
+    let payload = open(&keys.answer(nonce), &answer_ad(&etag), sealed)?;
+    match payload.split_first() {
+        Some((&UNCHANGED, [])) if have == Some(etag.as_str()) => Ok(Fetched::Unchanged),
+        Some((&UNCHANGED, [])) => Err(SyncError::NotOurs),
+        Some((&SETTINGS, text)) => {
+            let text = String::from_utf8(text.to_vec()).map_err(|_| SyncError::Malformed)?;
+            Ok(Fetched::Changed(Synced { etag, text }))
         }
-        tokio::select! {
-            () = tokio::time::sleep(interval) => {}
-            () = now.notified() => {}
-            () = shutdown.cancelled() => return,
-        }
+        _ => Err(SyncError::Malformed),
     }
 }
 
-/// Puts `synced` in force and saves it, if it is valid here; false if not.
-fn apply(
-    replica: &Replica,
-    server: &config::Server,
-    in_force: &InForce,
-    synced: &Synced,
-    metrics: &metrics::State,
-) -> bool {
-    match server.synced_settings(&synced.text) {
-        Ok(settings) => {
-            in_force.apply(&settings);
-            tracing::info!(origin = %replica.origin(), "applied the settings synced from the origin");
-            let saved = replica.save_state(synced);
-            metrics.state_file(saved.is_ok());
-            if let Err(error) = saved {
-                tracing::error!(
-                    file = %replica.state_file().display(),
-                    %error,
-                    "cannot save the synced settings: a restart while the origin is down would start without them"
-                );
+/// A replica's Sync loop: what it syncs with, and where the settings go.
+#[derive(Debug)]
+pub struct Syncer {
+    pub replica: Replica,
+    /// This instance's `[server]` section, which synced settings must fit.
+    pub server: config::Server,
+    pub in_force: Arc<InForce>,
+    /// The `ETag` of the settings in force, if they came from the origin.
+    pub have: Option<String>,
+    pub interval: Duration,
+    /// Notified to sync at once (a Reload).
+    pub now: Arc<Notify>,
+    pub metrics: Arc<metrics::State>,
+}
+
+impl Syncer {
+    /// Syncs with the origin every `interval`, and at once when `now` is
+    /// notified, until `shutdown`. Valid settings are put in force and
+    /// saved.
+    pub async fn run(mut self, shutdown: CancellationToken) {
+        let origin = self.replica.origin().clone();
+        let mut failures: u64 = 0;
+        // The origin's current settings are refused here.
+        let mut rejected = false;
+        loop {
+            // A fetch can take as long as its timeout: a shutdown does not
+            // wait for it, and nothing fetched after it is put in force.
+            let fetched = tokio::select! {
+                biased;
+                () = shutdown.cancelled() => return,
+                fetched = self.replica.fetch(self.have.as_deref()) => fetched,
+            };
+            match fetched {
+                Ok(fetched) => {
+                    if failures >= WARN_AFTER {
+                        tracing::info!(%origin, "syncing again");
+                    }
+                    failures = 0;
+                    if let Fetched::Changed(synced) = fetched {
+                        rejected = !self.apply(&synced);
+                        // Also after invalid settings: they are not fetched
+                        // and logged again until the origin's settings
+                        // change (the Metrics show them refused meanwhile).
+                        self.have = Some(synced.etag);
+                    }
+                    if rejected {
+                        self.metrics.sync_rejected();
+                    } else {
+                        self.metrics.synced(SystemTime::now());
+                    }
+                }
+                Err(error) => {
+                    failures += 1;
+                    self.metrics.sync_failed();
+                    if failures == WARN_AFTER {
+                        tracing::warn!(%origin, %error, "syncing failed {WARN_AFTER} times in a row; keeping the last settings");
+                    } else {
+                        tracing::debug!(%origin, %error, "sync failed");
+                    }
+                }
             }
-            true
+            tokio::select! {
+                () = tokio::time::sleep(self.interval) => {}
+                () = self.now.notified() => {}
+                () = shutdown.cancelled() => return,
+            }
         }
-        Err(error) => {
-            tracing::error!(
-                origin = %replica.origin(),
-                "the settings from the origin are invalid here, keeping the current ones: {error}"
-            );
-            false
+    }
+
+    /// Puts `synced` in force and saves it, if it is valid here; false if
+    /// not.
+    fn apply(&self, synced: &Synced) -> bool {
+        let origin = self.replica.origin();
+        match self.server.synced_settings(&synced.text) {
+            Ok(settings) => {
+                self.in_force.apply(&settings);
+                tracing::info!(%origin, "applied the settings synced from the origin");
+                let saved = self.replica.save_state(synced);
+                self.metrics.state_file(saved.is_ok());
+                if let Err(error) = saved {
+                    tracing::error!(
+                        file = %self.replica.state_file().display(),
+                        %error,
+                        "cannot save the synced settings: a restart while the origin is down would start without them"
+                    );
+                }
+                true
+            }
+            Err(error) => {
+                tracing::error!(
+                    %origin,
+                    "the settings from the origin are invalid here, keeping the current ones: {error}"
+                );
+                false
+            }
         }
     }
 }

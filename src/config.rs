@@ -16,10 +16,12 @@ use serde::Deserialize;
 use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 use url::Url;
 
+use crate::name;
+
 /// Where `serve` and `check` look unless told otherwise.
 pub const DEFAULT_PATH: &str = "/etc/zinkhole/config.toml";
 /// A config file larger than this is refused.
-pub const MAX_FILE_SIZE: u64 = 1024 * 1024;
+pub const MAX_FILE_SIZE: usize = 1024 * 1024;
 /// The port DNS uses when an address gives none.
 pub const DNS_PORT: u16 = 53;
 /// The HTTP port in the docs and the installers (ADR-0001).
@@ -84,7 +86,7 @@ impl Config {
             source,
         };
         let size = std::fs::metadata(path).map_err(read_error)?.len();
-        if size > MAX_FILE_SIZE {
+        if size > MAX_FILE_SIZE as u64 {
             return Err(Error::TooLarge {
                 path: path.to_path_buf(),
             });
@@ -107,7 +109,7 @@ impl Config {
         Ok(config)
     }
 
-    /// The Policy settings: this file's, or the defaults when it has none.
+    /// What this instance is to sync.
     #[must_use]
     pub fn role(&self) -> Role {
         match self.sync {
@@ -117,6 +119,7 @@ impl Config {
         }
     }
 
+    /// The Policy settings: this file's, or the defaults when it has none.
     #[must_use]
     pub fn policy_settings(&self) -> PolicySettings {
         PolicySettings {
@@ -152,8 +155,12 @@ impl Config {
                 ));
             }
         }
-        self.server
-            .check_policy(self.blocking.as_ref(), self.local.as_ref())?;
+        if let Some(local) = &self.local {
+            self.server.check_forwards(local)?;
+        }
+        if let Some(blocking) = &self.blocking {
+            blocking.validate()?;
+        }
         if self.cache.min_ttl > self.cache.max_ttl {
             return Err(invalid(
                 "cache.min_ttl",
@@ -161,6 +168,9 @@ impl Config {
             ));
         }
         if let Some(http) = &self.http {
+            if http.listen.is_empty() {
+                return Err(invalid("http.listen", "needs at least one address"));
+            }
             for address in &http.listen {
                 if let Some(dns) = self
                     .server
@@ -222,6 +232,17 @@ pub struct PolicySettings {
     pub local: Local,
 }
 
+impl PolicySettings {
+    /// The checks that need nothing but the settings themselves. Whether
+    /// they fit an instance is for its [`Server`] to say.
+    ///
+    /// # Errors
+    /// When the settings contradict themselves or hold an invalid rule.
+    pub fn validate(&self) -> Result<(), Error> {
+        self.blocking.validate()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Sections
 
@@ -244,53 +265,22 @@ impl Server {
     /// instance (such as a forwarded zone pointing at it).
     pub fn synced_settings(&self, text: &str) -> Result<PolicySettings, Error> {
         let settings: PolicySettings = toml::from_str(text)?;
-        self.check_policy(Some(&settings.blocking), Some(&settings.local))?;
+        self.check_forwards(&settings.local)?;
+        settings.validate()?;
         Ok(settings)
     }
 
-    /// The checks of the Policy settings that need the rest of the config.
-    fn check_policy(
-        &self,
-        blocking: Option<&Blocking>,
-        local: Option<&Local>,
-    ) -> Result<(), Error> {
-        if let Some(local) = local {
-            for (zone, server) in &local.forward {
-                if self.is_this_server(server.0) {
-                    return Err(invalid(
-                        format!("local.forward.\"{zone}\""),
-                        format!(
-                            "{} is this server itself (server.listen); every query for '{zone}' would come back here",
-                            server.0
-                        ),
-                    ));
-                }
-            }
-        }
-        if let Some(blocking) = blocking {
-            for (key, sources) in [
-                ("blocking.lists", &blocking.lists),
-                ("blocking.allowlists", &blocking.allowlists),
-            ] {
-                if let Some(i) = first_repeat(sources) {
-                    return Err(invalid(format!("{key}[{i}]"), "is listed twice"));
-                }
-            }
-            for (key, rules) in [
-                ("blocking.block", &blocking.block),
-                ("blocking.allow", &blocking.allow),
-            ] {
-                for (i, rule) in rules.iter().enumerate() {
-                    let parsed = crate::rules::parse_line(rule);
-                    if parsed.rules.is_empty() || parsed.skipped > 0 {
-                        return Err(invalid(
-                            format!("{key}[{i}]"),
-                            format!(
-                                "'{rule}' is not a rule (a domain, *.domain, ||domain^ or a hosts or dnsmasq line)"
-                            ),
-                        ));
-                    }
-                }
+    /// No forwarded zone of `local` may send its queries to this server.
+    fn check_forwards(&self, local: &Local) -> Result<(), Error> {
+        for (zone, server) in &local.forward {
+            if self.is_this_server(server.0) {
+                return Err(invalid(
+                    format!("local.forward.\"{zone}\""),
+                    format!(
+                        "{} is this server itself (server.listen); every query for '{zone}' would come back here",
+                        server.0
+                    ),
+                ));
             }
         }
         Ok(())
@@ -535,6 +525,37 @@ impl Default for Blocking {
             block: Vec::new(),
             allow: Vec::new(),
         }
+    }
+}
+
+impl Blocking {
+    /// No source listed twice, and every inline rule a rule.
+    fn validate(&self) -> Result<(), Error> {
+        for (key, sources) in [
+            ("blocking.lists", &self.lists),
+            ("blocking.allowlists", &self.allowlists),
+        ] {
+            if let Some(i) = first_repeat(sources) {
+                return Err(invalid(format!("{key}[{i}]"), "is listed twice"));
+            }
+        }
+        for (key, rules) in [
+            ("blocking.block", &self.block),
+            ("blocking.allow", &self.allow),
+        ] {
+            for (i, rule) in rules.iter().enumerate() {
+                let parsed = crate::rules::parse_line(rule);
+                if parsed.rules.is_empty() || parsed.skipped > 0 {
+                    return Err(invalid(
+                        format!("{key}[{i}]"),
+                        format!(
+                            "'{rule}' is not a rule (a domain, *.domain, ||domain^ or a hosts or dnsmasq line)"
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -831,109 +852,78 @@ impl<'de> Deserialize<'de> for Addresses {
     }
 }
 
-/// A local record's name: lowercase, without a trailing dot, optionally
-/// `*.name` for every name below `name`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
-#[serde(into = "String")]
-pub struct RecordName(String);
+/// A name in the config, as its own type: lowercase, without a trailing
+/// dot, and a hostname. `$noun` is what the error calls it; with `wildcard`,
+/// `*.name` stands for every name below `name`.
+macro_rules! config_name {
+    ($(#[$doc:meta])* $type:ident, $noun:literal, wildcard: $wildcard:literal) => {
+        $(#[$doc])*
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
+        #[serde(into = "String")]
+        pub struct $type(String);
 
-impl RecordName {
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
+        impl $type {
+            #[must_use]
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl FromStr for $type {
+            type Err = String;
+
+            fn from_str(text: &str) -> Result<Self, Self::Err> {
+                checked_name(text, $noun, $wildcard).map($type)
+            }
+        }
+
+        impl fmt::Display for $type {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl From<$type> for String {
+            fn from(name: $type) -> String {
+                name.0
+            }
+        }
+    };
 }
 
-impl FromStr for RecordName {
-    type Err = String;
+config_name!(
+    /// A local record's name: lowercase, without a trailing dot, optionally
+    /// `*.name` for every name below `name`.
+    RecordName,
+    "hostname",
+    wildcard: true
+);
 
-    fn from_str(text: &str) -> Result<Self, Self::Err> {
-        let name = normalize_name(text)?;
-        let host = name.strip_prefix("*.").unwrap_or(&name);
-        check_hostname(host).map_err(|why| format!("'{text}' is not a valid hostname: {why}"))?;
-        Ok(RecordName(name))
-    }
-}
+config_name!(
+    /// A forwarded zone's name, such as `lan` or `1.168.192.in-addr.arpa`.
+    ZoneName,
+    "zone",
+    wildcard: false
+);
 
-impl fmt::Display for RecordName {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl From<RecordName> for String {
-    fn from(name: RecordName) -> String {
-        name.0
-    }
-}
-
-/// A forwarded zone's name, such as `lan` or `1.168.192.in-addr.arpa`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
-#[serde(into = "String")]
-pub struct ZoneName(String);
-
-impl ZoneName {
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl FromStr for ZoneName {
-    type Err = String;
-
-    fn from_str(text: &str) -> Result<Self, Self::Err> {
-        let name = normalize_name(text)?;
-        check_hostname(&name).map_err(|why| format!("'{text}' is not a valid zone: {why}"))?;
-        Ok(ZoneName(name))
-    }
-}
-
-impl fmt::Display for ZoneName {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl From<ZoneName> for String {
-    fn from(name: ZoneName) -> String {
-        name.0
-    }
-}
-
-/// Lowercase, without the trailing dot.
-fn normalize_name(text: &str) -> Result<String, String> {
-    let name = text.strip_suffix('.').unwrap_or(text).to_ascii_lowercase();
+/// `text` lowercased and without its trailing dot, if it is a hostname (see
+/// [`name::check_hostname`]), after `*.` if a `wildcard` may stand there.
+fn checked_name(text: &str, noun: &str, wildcard: bool) -> Result<String, String> {
+    let name = name::lowercase(text);
     if name.is_empty() {
         return Err("a name must not be empty".to_owned());
     }
+    let host = if wildcard {
+        name.strip_prefix("*.").unwrap_or(&name)
+    } else {
+        &name
+    };
+    name::check_hostname(host).map_err(|why| format!("'{text}' is not a valid {noun}: {why}"))?;
     Ok(name)
 }
 
-/// Letters, digits and hyphens; labels of 1 to 63 characters that neither
-/// start nor end with a hyphen; at most 253 characters in all.
-fn check_hostname(name: &str) -> Result<(), &'static str> {
-    if name.len() > 253 {
-        return Err("longer than 253 characters");
-    }
-    for label in name.split('.') {
-        if label.is_empty() || label.len() > 63 {
-            return Err("each label needs 1 to 63 characters");
-        }
-        if label.starts_with('-') || label.ends_with('-') {
-            return Err("a label may not start or end with a hyphen");
-        }
-        if !label
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        {
-            return Err("only letters, digits, hyphens and dots");
-        }
-    }
-    Ok(())
-}
-
-/// A sync origin's URL: `http(s)://host:port`.
+/// A sync origin's URL: `http(s)://host:port`, and nothing more. The URL is
+/// logged, so it must not hold anything secret.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "Url")]
 pub struct OriginUrl(pub Url);
@@ -942,12 +932,24 @@ impl TryFrom<Url> for OriginUrl {
     type Error = String;
 
     fn try_from(url: Url) -> Result<Self, Self::Error> {
-        match url.scheme() {
-            "http" | "https" if url.host().is_some() => Ok(OriginUrl(url)),
-            _ => Err(format!(
-                "'{url}': the origin is an http:// URL with a host, e.g. http://192.168.1.5:{HTTP_PORT}"
-            )),
+        // The errors do not repeat the URL: it may hold a password.
+        let example = format!("e.g. http://192.168.1.5:{HTTP_PORT}");
+        if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
+            return Err(format!(
+                "the origin is an http:// URL with a host, {example}"
+            ));
         }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(format!(
+                "the origin's URL takes no user or password: remove them ({example})"
+            ));
+        }
+        if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
+            return Err(format!(
+                "the origin's URL is its host and port only: remove the path, query and fragment ({example})"
+            ));
+        }
+        Ok(OriginUrl(url))
     }
 }
 
@@ -1313,6 +1315,21 @@ servers = [
     }
 
     #[test]
+    fn the_http_port_needs_an_address() {
+        expect_error(
+            &format!("{UPSTREAM}[http]\nlisten = []\n"),
+            "http.listen: needs at least one address",
+        );
+        // An origin's [http] section without one is no section.
+        expect_error(
+            &format!(
+                "{UPSTREAM}[http]\nlisten = []\n[sync]\nrole = \"origin\"\nsecret = \"{SECRET}\"\n"
+            ),
+            "http.listen: needs at least one address",
+        );
+    }
+
+    #[test]
     fn sync_role_origin_or_replica() {
         let origin = parse(&format!(
             "{UPSTREAM}[http]\nlisten = [\"0.0.0.0:5380\"]\n[sync]\nrole = \"origin\"\nsecret = \"{SECRET}\"\n"
@@ -1371,6 +1388,35 @@ servers = [
             ),
             "from its origin",
         );
+    }
+
+    #[test]
+    fn an_origin_url_is_a_host_and_port_and_nothing_secret() {
+        let replica = |origin: &str| {
+            format!(
+                "{UPSTREAM}[sync]\nrole = \"replica\"\norigin = \"{origin}\"\nsecret = \"{SECRET}\"\n"
+            )
+        };
+        for fine in [
+            "http://10.0.0.1:5380",
+            "http://10.0.0.1:5380/",
+            "https://origin.lan",
+        ] {
+            parse(&replica(fine));
+        }
+        for (origin, fragment) in [
+            ("http://user:hunter2@10.0.0.1:5380", "no user or password"),
+            ("http://user@10.0.0.1:5380", "no user or password"),
+            ("http://10.0.0.1:5380/sync", "remove the path"),
+            ("http://10.0.0.1:5380/?token=hunter2", "remove the path"),
+            ("http://10.0.0.1:5380/#hunter2", "remove the path"),
+        ] {
+            expect_error(&replica(origin), fragment);
+            let error = Config::parse(&replica(origin))
+                .expect_err("rejected")
+                .to_string();
+            assert!(!error.contains("hunter2"), "{error}");
+        }
     }
 
     #[test]

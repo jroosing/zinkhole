@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
+use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{DNSClass, Name, RData, RecordType};
 use tokio::sync::Semaphore;
 
@@ -31,49 +31,44 @@ use crate::config::Network;
 use crate::metrics::Queries;
 use crate::policy::{Decision, Policy};
 
-/// How a single query was answered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Outcome {
-    Local,
-    Blocked,
-    Private,
-    Cached,
-    Forwarded,
-    Failed,
-    /// The upstream answer's DNSSEC signatures do not hold (`upstream.dnssec
-    /// = "validate"`): SERVFAIL.
-    Bogus,
-    Refused,
-    Invalid,
+/// Defines [`Outcome`] from one list of its variants and their names, so
+/// that none can be missing from [`Outcome::ALL`], which the counters and
+/// the Metrics go by.
+macro_rules! outcomes {
+    ($($(#[$doc:meta])* $variant:ident => $name:literal,)+) => {
+        /// How a single query was answered.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum Outcome {
+            $($(#[$doc])* $variant,)+
+        }
+
+        impl Outcome {
+            /// Every Outcome, in the order the Metrics show them.
+            pub const ALL: [Outcome; [$(Outcome::$variant),+].len()] = [$(Outcome::$variant),+];
+
+            /// Its name in the Metrics and the log.
+            #[must_use]
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(Outcome::$variant => $name,)+
+                }
+            }
+        }
+    };
 }
 
-impl Outcome {
-    pub const ALL: [Outcome; 9] = [
-        Outcome::Local,
-        Outcome::Blocked,
-        Outcome::Private,
-        Outcome::Cached,
-        Outcome::Forwarded,
-        Outcome::Failed,
-        Outcome::Bogus,
-        Outcome::Refused,
-        Outcome::Invalid,
-    ];
-
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Outcome::Local => "local",
-            Outcome::Blocked => "blocked",
-            Outcome::Private => "private",
-            Outcome::Cached => "cached",
-            Outcome::Forwarded => "forwarded",
-            Outcome::Failed => "failed",
-            Outcome::Bogus => "bogus",
-            Outcome::Refused => "refused",
-            Outcome::Invalid => "invalid",
-        }
-    }
+outcomes! {
+    Local => "local",
+    Blocked => "blocked",
+    Private => "private",
+    Cached => "cached",
+    Forwarded => "forwarded",
+    Failed => "failed",
+    /// The upstream answer's DNSSEC signatures do not hold (`upstream.dnssec
+    /// = "validate"`): SERVFAIL.
+    Bogus => "bogus",
+    Refused => "refused",
+    Invalid => "invalid",
 }
 
 impl fmt::Display for Outcome {
@@ -200,19 +195,32 @@ impl<F: Forwarder> Resolver<F> {
     pub async fn handle(&self, query: &[u8], client: IpAddr, transport: Transport) -> Reply {
         let started = Instant::now();
         let (reply, message) = self.answer(query, client, transport).await;
-        self.queries.record(reply.outcome);
+        let question = message.as_ref().and_then(|message| message.queries.first());
+        self.record(client, question, reply.outcome, started);
+        reply
+    }
+
+    /// Counts and logs a UDP query from a `client` that may not query,
+    /// which the listener dropped without reading it: refused, as it would
+    /// be had it come this far.
+    pub fn dropped_unread(&self, client: IpAddr) {
+        self.record(client, None, Outcome::Refused, Instant::now());
+    }
+
+    /// Counts a query answered with `outcome`, and logs it if the query log
+    /// is on.
+    fn record(&self, client: IpAddr, question: Option<&Query>, outcome: Outcome, started: Instant) {
+        self.queries.record(outcome);
         if self.log_queries.load(Ordering::Relaxed) {
-            let question = message.as_ref().and_then(|message| message.queries.first());
             tracing::info!(
                 target: "zinkhole::query",
                 %client,
                 name = %question.map_or_else(|| "-".to_owned(), |q| shown_name(q.name())),
                 r#type = %question.map_or_else(|| "-".to_owned(), |q| q.query_type().to_string()),
-                outcome = %reply.outcome,
+                %outcome,
                 micros = started.elapsed().as_micros(),
             );
         }
-        reply
     }
 
     /// The reply, and the query if it could be read.

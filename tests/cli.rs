@@ -51,6 +51,22 @@ fn check_rejects_an_invalid_config_and_names_the_file_and_line() {
 }
 
 #[test]
+fn check_rejects_an_http_section_without_an_address() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_config(
+        &dir,
+        "[upstream]\nservers = [\"9.9.9.9\"]\n\n[http]\nlisten = []\n",
+    );
+    let out = zinkhole(&["check"], Some(&path));
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("http.listen: needs at least one address"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn a_missing_config_file_is_an_error() {
     let out = zinkhole(&["check", "-c", "/no/such/zinkhole.toml"], None);
     assert_eq!(out.status.code(), Some(1));

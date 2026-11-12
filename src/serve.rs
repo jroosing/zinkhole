@@ -20,17 +20,19 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::cache::Cache;
+use crate::client::ClientError;
 use crate::config::{self, Config, PolicySettings, Role};
 use crate::http::{self, HttpListeners, MetricsSource};
-use crate::lists::{ClientError, Loader};
+use crate::listen::BindError;
+use crate::lists::Loader;
 use crate::logging::Logging;
 use crate::metrics;
 use crate::policy::Policy;
 use crate::refresh;
-use crate::resolver::{Forwarder, Outcome, Resolver};
-use crate::server::{self, BindError, Listeners};
+use crate::resolver::{Forwarder, Resolver};
+use crate::server::{self, Listeners};
 use crate::settings::InForce;
-use crate::sync::{self, Origin, Replica};
+use crate::sync::{self, Origin, Replica, Syncer};
 use crate::upstream::Upstream;
 
 #[derive(Debug, thiserror::Error)]
@@ -106,22 +108,27 @@ pub async fn run(
         ))
     });
     let sync_now = Arc::new(Notify::new());
-    let syncing = replica.map(|(replica, have, interval)| {
+    let syncing = replica.map(|starting| {
+        let Starting {
+            replica,
+            have,
+            interval,
+        } = starting;
         tracing::info!(
             origin = %replica.origin(),
             "syncing the Policy settings every {} s",
             interval.as_secs()
         );
-        tokio::spawn(sync::run(
+        let syncer = Syncer {
             replica,
-            config.server.clone(),
-            Arc::clone(&in_force),
+            server: config.server.clone(),
+            in_force: Arc::clone(&in_force),
             have,
             interval,
-            Arc::clone(&sync_now),
-            Arc::clone(&state),
-            shutdown.clone(),
-        ))
+            now: Arc::clone(&sync_now),
+            metrics: Arc::clone(&state),
+        };
+        tokio::spawn(syncer.run(shutdown.clone()))
     });
     let mut serving = tokio::spawn(server::serve(
         listeners,
@@ -211,9 +218,15 @@ fn bind_http(config: &Config) -> Result<Option<HttpListeners>, BindError> {
 struct Roles {
     settings: PolicySettings,
     origin: Option<Arc<Origin>>,
-    /// The replica, the `ETag` of the settings it starts with, and its
-    /// interval.
-    replica: Option<(Replica, Option<String>, Duration)>,
+    replica: Option<Starting>,
+}
+
+/// A replica as it starts.
+struct Starting {
+    replica: Replica,
+    /// The `ETag` of the saved settings it starts with, if it has any.
+    have: Option<String>,
+    interval: Duration,
 }
 
 impl Roles {
@@ -254,11 +267,11 @@ impl Roles {
                 Roles {
                     settings,
                     origin: None,
-                    replica: Some((
+                    replica: Some(Starting {
                         replica,
                         have,
-                        Duration::from_secs(u64::from(*interval_secs)),
-                    )),
+                        interval: Duration::from_secs(u64::from(*interval_secs)),
+                    }),
                 }
             }
         })
@@ -424,22 +437,23 @@ fn sync_changed(old: Option<&config::Sync>, new: Option<&config::Sync>) -> bool 
     }
 }
 
-/// The SIGUSR1 summary.
+/// The SIGUSR1 summary: the queries per Outcome, every one of them, and
+/// the cache entries.
 fn log_summary<F: Forwarder>(resolver: &Resolver<F>) {
-    let queries = resolver.queries();
     tracing::info!(
-        local = queries.count(Outcome::Local),
-        blocked = queries.count(Outcome::Blocked),
-        private = queries.count(Outcome::Private),
-        cached = queries.count(Outcome::Cached),
-        forwarded = queries.count(Outcome::Forwarded),
-        failed = queries.count(Outcome::Failed),
-        bogus = queries.count(Outcome::Bogus),
-        refused = queries.count(Outcome::Refused),
-        invalid = queries.count(Outcome::Invalid),
         cache_entries = resolver.cache().entry_count(),
-        "queries since start"
+        "queries since start: {}",
+        summary(resolver.queries())
     );
+}
+
+/// `local=3 blocked=1 ...`: every Outcome with its count.
+fn summary(queries: &metrics::Queries) -> String {
+    queries
+        .counts()
+        .map(|(outcome, count)| format!("{outcome}={count}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The signals zinkhole handles, set up first thing: until a handler is in

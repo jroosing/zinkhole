@@ -148,6 +148,37 @@ async fn a_request_head_must_arrive_within_two_seconds_of_connecting() {
 }
 
 #[tokio::test]
+async fn one_client_holds_at_most_four_connections() {
+    let running = start("\"127.0.0.0/8\"");
+    // Four that say nothing: held until their two seconds are up.
+    let mut held = Vec::new();
+    for _ in 0..PER_CLIENT {
+        held.push(TcpStream::connect(running.address).await.unwrap());
+    }
+    let fifth = TcpStream::connect(running.address).await.unwrap();
+    let (waited, response) = closed_after(fifth).await;
+    assert!(
+        waited < Duration::from_secs(1),
+        "closed at once: {waited:?}"
+    );
+    assert_eq!(response, "");
+
+    // Once one is gone, there is room again.
+    drop(held.pop());
+    let mut served = false;
+    for _ in 0..50 {
+        let response = exchange(running.address, &request("GET", "/metrics")).await;
+        if response.starts_with("HTTP/1.1 200 ") {
+            served = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(served);
+    running.shutdown.cancel();
+}
+
+#[tokio::test]
 async fn shutdown_returns_with_a_connection_open() {
     let running = start("\"127.0.0.0/8\"");
     let _idle = TcpStream::connect(running.address).await.unwrap();
