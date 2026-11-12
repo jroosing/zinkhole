@@ -88,7 +88,10 @@ fn the_exposition_holds_every_metric() {
     let text = render_sample(&state);
     let quad9 = r#"server="https://dns.quad9.net (9.9.9.9)""#;
     for line in [
-        "zinkhole_build_info{version=\"3.0.0\"} 1".to_owned(),
+        format!(
+            "zinkhole_build_info{{version=\"{}\"}} 1",
+            env!("CARGO_PKG_VERSION")
+        ),
         "zinkhole_queries_total{outcome=\"blocked\"} 2".to_owned(),
         "zinkhole_queries_total{outcome=\"local\"} 0".to_owned(),
         format!("zinkhole_upstream_answer_duration_seconds_bucket{{{quad9},le=\"0.01\"}} 0"),
