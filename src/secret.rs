@@ -1,4 +1,4 @@
-//! `zinkhole secret`: a new Sync secret (ADR-0003).
+//! `zinkhole secret`: a new Sync secret (ADR-0001).
 
 use crate::config::Secret;
 

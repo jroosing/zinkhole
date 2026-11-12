@@ -1,5 +1,5 @@
 # Two zinkhole instances, an origin and a replica that syncs the origin's
-# local records and blocking settings (see docs/adr/0002 and 0003). Used by test.sh;
+# local records and blocking settings (see docs/adr/0001). Used by test.sh;
 # also a starting point for running two instances.
 #
 #   docker compose -f deploy/sync/docker-compose.yml up -d --build

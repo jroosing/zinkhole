@@ -367,7 +367,7 @@ impl<F: Forwarder> Resolver<F> {
     }
 
     /// `answer` for the client, unless a CNAME in it makes `name` an alias of
-    /// a blocked name: then the block response (ADR-0004).
+    /// a blocked name: then the block response (ADR-0001).
     fn alias_checked(
         &self,
         query: &Message,

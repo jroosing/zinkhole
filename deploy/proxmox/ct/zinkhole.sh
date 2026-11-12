@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The scripts (this ct/ script and install/zinkhole-install.sh) come from this
 # repository; the engine that runs them is the Proxmox VE community scripts'
-# own (github.com/community-scripts/core). See docs/adr/0005.
+# own (github.com/community-scripts/core). See docs/adr/0001.
 COMMUNITY_SCRIPTS_URL="${COMMUNITY_SCRIPTS_URL:-https://raw.githubusercontent.com/jroosing/zinkhole/main/deploy/proxmox}"
 export COMMUNITY_SCRIPTS_URL
 _cs_boot="${COMMUNITY_SCRIPTS_CORE_DIR:-$(dirname "${BASH_SOURCE[0]}")/../../core}/core/build.func"

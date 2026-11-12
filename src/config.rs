@@ -22,7 +22,7 @@ pub const DEFAULT_PATH: &str = "/etc/zinkhole/config.toml";
 pub const MAX_FILE_SIZE: u64 = 1024 * 1024;
 /// The port DNS uses when an address gives none.
 pub const DNS_PORT: u16 = 53;
-/// The HTTP port in the docs and the installers (ADR-0006).
+/// The HTTP port in the docs and the installers (ADR-0001).
 pub const HTTP_PORT: u16 = 5380;
 /// At most this many addresses per local record.
 pub const MAX_ADDRESSES: usize = 16;
@@ -651,7 +651,7 @@ pub enum LogFormat {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Http {
-    /// `GET /metrics`, and `GET /sync` on an origin (ADR-0006).
+    /// `GET /metrics`, and `GET /sync` on an origin (ADR-0001).
     pub listen: Vec<HttpAddr>,
 }
 
@@ -674,7 +674,7 @@ impl fmt::Display for Role {
     }
 }
 
-/// Where the Policy settings come from (ADR-0002, ADR-0003).
+/// Where the Policy settings come from (ADR-0001).
 #[derive(Debug, Deserialize)]
 #[serde(tag = "role", rename_all = "lowercase", deny_unknown_fields)]
 pub enum Sync {

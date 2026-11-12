@@ -7,7 +7,7 @@
 # Runs inside the new container, started by ct/zinkhole.sh through the
 # community scripts' engine. Installs the latest zinkhole release (checked
 # against its SHA256SUMS) as a standalone instance, a sync origin or a sync
-# replica (docs/adr/0002, 0003), with metrics on the HTTP port, 5380 (docs/adr/0006),
+# replica, with metrics on the HTTP port, 5380 (docs/adr/0001),
 # which an origin also serves its settings on. The role can be given
 # up front: ZINKHOLE_ROLE, and for a replica ZINKHOLE_ORIGIN and
 # ZINKHOLE_SECRET (an origin's secret is generated with `zinkhole secret`
@@ -181,7 +181,7 @@ TOML
   fi
   # One port for the metrics and an origin's settings, on every address, so
   # a changed (DHCP) address keeps working; only clients in
-  # server.allow_clients are answered (docs/adr/0006).
+  # server.allow_clients are answered (docs/adr/0001).
   printf '\n[http]\nlisten = ["0.0.0.0:%s"]\n' "$HTTP_PORT"
   case "$ROLE" in
   origin) printf '\n[sync]\nrole = "origin"\nsecret = "%s"\n' "$SECRET" ;;

@@ -1,7 +1,7 @@
 #!/bin/sh
 # The zinkhole updater, run inside the container by `update` (which fetches it
 # from a release and checks it against SHA256SUMS first): the community-scripts
-# `update` (ct/zinkhole.sh, docs/adr/0005), with --skip-os, as it upgrades the
+# `update` (ct/zinkhole.sh, docs/adr/0001), with --skip-os, as it upgrades the
 # OS packages itself. In order:
 #
 #   1. upgrade the OS packages (apt or apk), unless --skip-os,

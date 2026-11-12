@@ -68,7 +68,7 @@ bundle() {
 		[ -e "$dist/zinkhole-$arch-linux-musl" ] || die "missing $dist/zinkhole-$arch-linux-musl: run 'binary $arch' first"
 	done
 	# The container's updater travels with the release it belongs to; `update`
-	# fetches it from there (docs/adr/0005). The Proxmox install scripts
+	# fetches it from there (docs/adr/0001). The Proxmox install scripts
 	# themselves are served from the repository, as the community-scripts
 	# engine expects (deploy/proxmox/ct, deploy/proxmox/install).
 	install -m 755 deploy/proxmox/update.sh "$dist/update.sh"

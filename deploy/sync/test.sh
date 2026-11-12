@@ -1,5 +1,5 @@
 #!/bin/sh
-# End-to-end test of sync (docs/adr/0002, 0003) with Docker: an origin and a replica.
+# End-to-end test of sync (docs/adr/0001) with Docker: an origin and a replica.
 #
 #   ./deploy/sync/test.sh
 #

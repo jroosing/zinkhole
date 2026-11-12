@@ -1,4 +1,4 @@
-//! The HTTP port (ADR-0006): `GET /metrics`, and `GET /sync` on an origin.
+//! The HTTP port (ADR-0001): `GET /metrics`, and `GET /sync` on an origin.
 //!
 //! Only clients in `server.allow_clients` are served; others have their
 //! connection closed on arrival, as on the DNS port. A request head must

@@ -311,8 +311,7 @@ restart.
 
 [deploy/sync/](deploy/sync/) has a Docker Compose setup with both roles and
 an end-to-end test (`./deploy/sync/test.sh`). The design is in
-[docs/adr/0002](docs/adr/0002-sync-replicas-from-an-origin.md) and
-[docs/adr/0003](docs/adr/0003-sync-answers-sealed-with-an-aead.md).
+[docs/adr/0001](docs/adr/0001-zinkhole-architecture.md).
 
 ### Metrics
 
@@ -420,7 +419,7 @@ run locally (`publish --dry-run`).
 | `config.rs` | The TOML config: typed, validated |
 | `server.rs` | UDP and TCP listeners: a task per query, TCP limits |
 | `resolver.rs` | The query pipeline above, query counting and log |
-| `policy.rs` | The Policy: local records, rules, forwarded zones and private names, and blocked aliases (ADR-0004) |
+| `policy.rs` | The Policy: local records, rules, forwarded zones and private names, and blocked aliases (ADR-0001) |
 | `local.rs`, `domain_set.rs`, `rules.rs`, `name.rs` | Local records and reverse lookups; domain sets with subdomain matching; the list line parser |
 | `answer.rs` | Building responses: local, blocked, negative, truncated |
 | `cache.rs` | The answer cache (moka), with serve-stale |
@@ -431,9 +430,9 @@ run locally (`publish --dry-run`).
 | `http.rs`, `metrics.rs` | The HTTP port; the Prometheus metrics |
 | `logging.rs`, `tls.rs` | Log output; TLS with the compiled-in roots |
 
-The reasoning behind the larger design decisions is in [docs/adr/](docs/adr/)
-(the foundations in [ADR-0001](docs/adr/0001-rust-on-tokio-and-hickory.md)),
-and [CONTEXT.md](CONTEXT.md) defines the terms used in the code and docs.
+The design as a whole is described in
+[ADR-0001](docs/adr/0001-zinkhole-architecture.md), and
+[CONTEXT.md](CONTEXT.md) defines the terms used in the code and docs.
 
 **Concurrency.** Every query is a tokio task. Local records, blocked and
 private names and cache hits are answered without waiting on anything. At
@@ -473,7 +472,7 @@ right away, even if some failed.
   an `https://` list that redirects to `http://` is refused), with size and
   time limits.
 - Sync: sealed with XChaCha20-Poly1305 under keys derived (HKDF-SHA256) from
-  a 256-bit secret, per request (ADR-0003); the state file is sealed too and
+  a 256-bit secret, per request (ADR-0001); the state file is sealed too and
   readable by its owner only. The secret is never logged.
 - The HTTP port answers only `server.allow_clients`, gives a request head 2
   seconds, serves one request per connection and at most 16 at once. The

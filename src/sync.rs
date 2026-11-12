@@ -1,4 +1,4 @@
-//! Sync (ADR-0002, ADR-0003): replicas pull the Policy settings from an
+//! Sync (ADR-0001): replicas pull the Policy settings from an
 //! origin, over the HTTP port, sealed.
 //!
 //! - A replica sends `GET /sync` with a fresh random nonce, and the `ETag` of
