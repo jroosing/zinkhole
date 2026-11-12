@@ -853,10 +853,10 @@ impl<'de> Deserialize<'de> for Addresses {
 }
 
 /// A name in the config, as its own type: lowercase, without a trailing
-/// dot, and a hostname. `$noun` is what the error calls it; with `wildcard`,
-/// `*.name` stands for every name below `name`.
+/// dot, and valid by `$rule`. `$noun` is what the error calls it; with
+/// `wildcard`, `*.name` stands for every name below `name`.
 macro_rules! config_name {
-    ($(#[$doc:meta])* $type:ident, $noun:literal, wildcard: $wildcard:literal) => {
+    ($(#[$doc:meta])* $type:ident, $noun:literal, wildcard: $wildcard:literal, rule: $rule:path) => {
         $(#[$doc])*
         #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
         #[serde(into = "String")]
@@ -873,7 +873,7 @@ macro_rules! config_name {
             type Err = String;
 
             fn from_str(text: &str) -> Result<Self, Self::Err> {
-                checked_name(text, $noun, $wildcard).map($type)
+                checked_name(text, $noun, $wildcard, $rule).map($type)
             }
         }
 
@@ -892,33 +892,41 @@ macro_rules! config_name {
 }
 
 config_name!(
-    /// A local record's name: lowercase, without a trailing dot, optionally
-    /// `*.name` for every name below `name`.
+    /// A local record's name, a hostname: lowercase, without a trailing
+    /// dot, optionally `*.name` for every name below `name`.
     RecordName,
     "hostname",
-    wildcard: true
+    wildcard: true,
+    rule: name::check_hostname
 );
 
 config_name!(
-    /// A forwarded zone's name, such as `lan` or `1.168.192.in-addr.arpa`.
+    /// A forwarded zone's name, such as `lan`, `1.168.192.in-addr.arpa` or
+    /// `_msdcs.corp.lan`: a zone is any name, not only a hostname.
     ZoneName,
     "zone",
-    wildcard: false
+    wildcard: false,
+    rule: name::check
 );
 
-/// `text` lowercased and without its trailing dot, if it is a hostname (see
-/// [`name::check_hostname`]), after `*.` if a `wildcard` may stand there.
-fn checked_name(text: &str, noun: &str, wildcard: bool) -> Result<String, String> {
+/// `text` lowercased and without its trailing dot, if `rule` finds it
+/// valid, after `*.` if a `wildcard` may stand there.
+fn checked_name(
+    text: &str,
+    noun: &str,
+    wildcard: bool,
+    rule: fn(&str) -> Result<(), String>,
+) -> Result<String, String> {
     let name = name::lowercase(text);
     if name.is_empty() {
         return Err("a name must not be empty".to_owned());
     }
-    let host = if wildcard {
+    let checked = if wildcard {
         name.strip_prefix("*.").unwrap_or(&name)
     } else {
         &name
     };
-    name::check_hostname(host).map_err(|why| format!("'{text}' is not a valid {noun}: {why}"))?;
+    rule(checked).map_err(|why| format!("'{text}' is not a valid {noun}: {why}"))?;
     Ok(name)
 }
 
@@ -1261,6 +1269,26 @@ servers = [
         ));
         let forward = config.local.expect("local").forward;
         assert_eq!(forward.len(), 2);
+        // A zone is any name: underscores, which a hostname may not have.
+        let config = parse(&format!(
+            "{UPSTREAM}[local.forward]\n\"_MSDCS.corp.lan.\" = \"192.168.1.1\"\n"
+        ));
+        let zones: Vec<String> = config
+            .local
+            .expect("local")
+            .forward
+            .keys()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(zones, ["_msdcs.corp.lan"]);
+        expect_error(
+            &format!("{UPSTREAM}[local.forward]\n\"a b.lan\" = \"192.168.1.1\"\n"),
+            "is not a valid zone",
+        );
+        expect_error(
+            &format!("{UPSTREAM}[local.records]\n\"_nas.lan\" = \"192.168.1.10\"\n"),
+            "is not a valid hostname",
+        );
         expect_error(
             &format!("{UPSTREAM}[local.forward]\n\"lan\" = \"[::1]\"\n"),
             "this server itself",
@@ -1295,6 +1323,14 @@ servers = [
         parse(&format!(
             "{UPSTREAM}[blocking]\nblock = [\"*.tracking.example\", \"||ads.example^\"]\n"
         ));
+        // A hosts line blocks only with an address that leads nowhere.
+        parse(&format!(
+            "{UPSTREAM}[blocking]\nblock = [\"0.0.0.0 ads.example\"]\n"
+        ));
+        expect_error(
+            &format!("{UPSTREAM}[blocking]\nblock = [\"93.184.216.34 www.example\"]\n"),
+            "blocking.block[0]",
+        );
     }
 
     #[test]

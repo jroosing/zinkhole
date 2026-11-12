@@ -12,11 +12,11 @@ file (a sync replica keeps one more file: its last synced settings).
 ## Features
 
 - **Blocklists** from URLs or files, in any common format, auto-detected per
-  line: hosts files, plain domains, `*.wildcards`, Adblock (`||domain^`,
-  `@@||domain^` exceptions) and dnsmasq (`address=/domain/`). Allowlists and
-  inline rules. Lists refresh in the background. Answers that alias (CNAME) a
-  blocked domain are blocked too, so trackers cannot hide behind a
-  first-party name.
+  line: hosts files (`0.0.0.0 domain`), plain domains, `*.wildcards`, Adblock
+  (`||domain^`, `@@||domain^` exceptions) and dnsmasq (`address=/domain/`).
+  Allowlists and inline rules. Lists refresh in the background. Answers that
+  alias (CNAME) a blocked domain are blocked too, so trackers cannot hide
+  behind a first-party name.
 - **Local DNS**: `"nas.lan" = "192.168.1.10"`, several IPv4 and IPv6
   addresses per name, `*.apps.lan` wildcards, automatic reverse (PTR)
   lookups. Zones such as `lan` can be forwarded to your router, so its DHCP
@@ -25,7 +25,8 @@ file (a sync replica keeps one more file: its last synced settings).
 - **Privacy**: private names (`.lan`, `.home.arpa`, `.internal`, single-label
   names, reverse lookups of private IPs) never leak upstream; client EDNS
   options (cookies, client subnet) are stripped before forwarding; Firefox's
-  DNS-over-HTTPS canary is answered so it keeps using your resolver.
+  DNS-over-HTTPS canary is answered so it keeps using your resolver (an
+  allow rule for `use-application-dns.net` lets it use its own).
 - **DNS over HTTPS or DNS over QUIC** to upstream servers, so your ISP can
   neither read nor alter your queries. One HTTP/2 or QUIC connection per
   server carries many queries at once. Plain DNS works too, for a local
@@ -88,6 +89,10 @@ failed list or an unhealthy server, 2 wrong usage.
 | `SIGHUP`  | Reload the config file; on a replica, also sync now. Server, upstream, cache, HTTP and sync settings need a restart (a reload names any it sees changed) |
 | `SIGUSR1` | Log the queries per outcome since start and the cache entries |
 | `SIGTERM`, `SIGINT` | Shut down, canceling queries in flight |
+
+Should the list refresh, the sync loop or the HTTP port ever stop on its own,
+zinkhole exits with an error instead of running on without it, so that
+systemd, OpenRC or Docker starts it again.
 
 ## Configuration
 
@@ -200,11 +205,12 @@ IPv6, VLAN, bridge, DNS, root password, SSH, resources, and so on). Then it:
 
 The **role** sets up [two instances](#running-two-instances) for you:
 *standalone* (the default), *origin* (a secret is made with `zinkhole
-secret`, and shown at the end with the command for a replica) or *replica*
-(asks for the origin's URL and secret). Run it on each node. To answer up
-front, set `ZINKHOLE_ROLE`, and for a replica `ZINKHOLE_ORIGIN` and
-`ZINKHOLE_SECRET`; the engine's own settings take its `var_*` variables, and
-`mode=default` skips its menu:
+secret`; the end of the run says where to read it and how to create a
+replica) or *replica* (asks for the origin's URL and secret). Run it on each
+node. To answer up front, set `ZINKHOLE_ROLE`, and for a replica
+`ZINKHOLE_ORIGIN` and `ZINKHOLE_SECRET` (leave the secret out to be asked
+for it, which keeps it out of the shell history); the engine's own settings
+take its `var_*` variables, and `mode=default` skips its menu:
 
 ```sh
 # Unattended: a replica of an origin at 192.168.1.5
@@ -234,7 +240,8 @@ never forward port 53 from the internet to it.
   must accept your config (`zinkhole check`), the old binary is kept as
   `/usr/local/bin/zinkhole.old`, and it is put back if the new one does not
   answer within 15 seconds. With several nodes, **update the replicas before
-  the origin**.
+  the origin**: an origin does not answer replicas older than its way of
+  asking, and may serve settings they do not know.
 - **Trust**: the engine comes from the community scripts' repository and the
   install script from this one's `main` branch, both unpinned, as for every
   community script; zinkhole itself comes from a release and is checked
@@ -302,7 +309,9 @@ interval_secs = 60
 
 Each answer is sealed (XChaCha20-Poly1305) under a one-time key derived from
 the secret and a fresh nonce from the replica, so nobody without the secret
-can read the settings, change them, or replay an old answer. A replica
+can read the settings, change them, or replay an old answer. The origin
+answers only requests that prove the secret, so nobody else counts as a
+replica or learns when the settings change. A replica
 checks the settings as if they were in its own file, keeps the last ones it
 accepted in a sealed file in `/var/lib/zinkhole` (or `sync.state_dir`), and
 starts from them if the origin is down. Reload the origin to publish a

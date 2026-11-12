@@ -13,44 +13,61 @@ pub const MAX_LABEL_LEN: usize = 63;
 #[must_use]
 pub fn normalize(text: &str) -> Option<String> {
     let name = without_dot(text);
-    if name.is_empty() || name.len() > MAX_LEN {
-        return None;
-    }
-    let valid_labels = name.split('.').all(|label| {
-        (1..=MAX_LABEL_LEN).contains(&label.len())
-            && label.bytes().all(|b| is_hostname_byte(b) || b == b'_')
-    });
-    valid_labels.then(|| name.to_ascii_lowercase())
+    check(name).is_ok().then(|| name.to_ascii_lowercase())
 }
 
 /// `text` lowercased and without a trailing dot, not checked: the form
-/// [`check_hostname`] takes.
+/// [`check`] and [`check_hostname`] take.
 #[must_use]
 pub fn lowercase(text: &str) -> String {
     without_dot(text).to_ascii_lowercase()
 }
 
-/// Checks that `name` (lowercase, no trailing dot) is a hostname. Stricter
-/// than [`normalize`], which takes what lists hold: a hostname has no
+/// Checks that `name` (no trailing dot) is a valid name, by the rules of
+/// [`normalize`].
+///
+/// # Errors
+///
+/// What is wrong with the name.
+pub fn check(name: &str) -> Result<(), String> {
+    check_lengths(name)?;
+    let valid = |byte| is_hostname_byte(byte) || byte == b'_';
+    if !name.split('.').all(|label| label.bytes().all(valid)) {
+        return Err("only letters, digits, hyphens, underscores and dots".to_owned());
+    }
+    Ok(())
+}
+
+/// Checks that `name` (no trailing dot) is a hostname. Stricter than
+/// [`check`], which takes what lists and zones hold: a hostname has no
 /// underscores, and no hyphen at either end of a label.
 ///
 /// # Errors
 ///
 /// What is wrong with the name.
 pub fn check_hostname(name: &str) -> Result<(), String> {
-    if name.len() > MAX_LEN {
-        return Err(format!("longer than {MAX_LEN} characters"));
-    }
+    check_lengths(name)?;
     for label in name.split('.') {
-        if !(1..=MAX_LABEL_LEN).contains(&label.len()) {
-            return Err(format!("each label needs 1 to {MAX_LABEL_LEN} characters"));
-        }
         if label.starts_with('-') || label.ends_with('-') {
             return Err("a label may not start or end with a hyphen".to_owned());
         }
         if !label.bytes().all(is_hostname_byte) {
             return Err("only letters, digits, hyphens and dots".to_owned());
         }
+    }
+    Ok(())
+}
+
+/// The lengths every name keeps to: its own, and each label's.
+fn check_lengths(name: &str) -> Result<(), String> {
+    if name.len() > MAX_LEN {
+        return Err(format!("longer than {MAX_LEN} characters"));
+    }
+    if name
+        .split('.')
+        .any(|label| !(1..=MAX_LABEL_LEN).contains(&label.len()))
+    {
+        return Err(format!("each label needs 1 to {MAX_LABEL_LEN} characters"));
     }
     Ok(())
 }
@@ -136,6 +153,22 @@ mod tests {
         assert!(longest.len() > MAX_LEN);
         assert!(check_hostname(&longest).unwrap_err().contains("253"));
         assert_eq!(lowercase("NAS.Lan."), "nas.lan");
+    }
+
+    #[test]
+    fn a_name_may_have_what_a_hostname_may_not() {
+        for name in ["_msdcs.corp.lan", "_dmarc.example.com", "-a.lan", "a-.lan"] {
+            assert_eq!(check(name), Ok(()), "{name}");
+            assert!(check_hostname(name).is_err(), "{name}");
+        }
+        for (bad, why) in [
+            ("a b.lan", "only letters"),
+            ("ex!ample.com", "only letters"),
+            ("a..lan", "each label"),
+            ("", "each label"),
+        ] {
+            assert!(check(bad).unwrap_err().contains(why), "{bad}");
+        }
     }
 
     #[test]

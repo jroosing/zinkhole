@@ -144,13 +144,17 @@ impl Policy {
                 ttl: settings.local_ttl,
             };
         }
-        if name == FIREFOX_DOH_CANARY {
+        // Firefox asks for this name to learn whether it may use its own DNS
+        // over HTTPS, and NXDOMAIN says no. An allow rule for the name says
+        // yes: it is then a name like any other.
+        let lists = self.lists.load();
+        if name == FIREFOX_DOH_CANARY && !is_allowed(&settings, &lists, name) {
             return Decision::Blocked(Blocked {
                 response: BlockResponse::Nxdomain,
                 ttl: settings.blocked.ttl,
             });
         }
-        if is_blocked(&settings, &self.lists.load(), name) {
+        if is_blocked(&settings, &lists, name) {
             return Decision::Blocked(settings.blocked);
         }
         if let Some(server) = settings.forward_server(name) {
@@ -579,6 +583,15 @@ mod tests {
                 response: BlockResponse::Nxdomain,
                 ttl: 300
             })
+        );
+    }
+
+    #[test]
+    fn an_allow_rule_for_the_firefox_canary_wins() {
+        let policy = policy("[blocking]\nallow = [\"use-application-dns.net\"]\n");
+        assert_eq!(
+            policy.decide("use-application-dns.net", RecordType::A),
+            Decision::Upstream
         );
     }
 

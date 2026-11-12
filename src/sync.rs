@@ -1,8 +1,12 @@
 //! Sync (ADR-0001): replicas pull the Policy settings from an
 //! origin, over the HTTP port, sealed.
 //!
-//! - A replica sends `GET /sync` with a fresh random nonce, and the `ETag` of
-//!   the settings it has.
+//! - A replica sends `GET /sync` with a fresh random nonce, the `ETag` of
+//!   the settings it has, and a proof that it has the shared secret: an
+//!   HMAC-SHA256 over the two, under a key derived from the secret.
+//! - The origin answers only a request with that proof (others are 401), so
+//!   only replicas show in its Metrics, and nobody else learns when the
+//!   settings change or how large they are.
 //! - The origin derives a one-time key from the shared secret and that nonce
 //!   (HKDF-SHA256) and seals its answer with XChaCha20-Poly1305: either
 //!   "unchanged" or its settings as TOML. The `ETag` is associated data, so it
@@ -48,6 +52,9 @@ use crate::settings::InForce;
 
 pub const PATH: &str = "/sync";
 const NONCE_HEADER: &str = "x-zinkhole-nonce";
+/// The request's proof of the secret, in hex.
+const PROOF_HEADER: &str = "x-zinkhole-proof";
+const PROOF_LEN: usize = 32;
 const NONCE_LEN: usize = 32;
 const XNONCE_LEN: usize = 24;
 /// Synced settings are config sections: the config's limit applies.
@@ -60,6 +67,7 @@ const WARN_AFTER: u64 = 3;
 const STATE_FILE: &str = "synced-settings";
 
 const INFO_ANSWER: &[u8] = b"zinkhole sync answer v1";
+const INFO_REQUEST: &[u8] = b"zinkhole sync request v1";
 const INFO_ETAG: &[u8] = b"zinkhole sync etag v1";
 const INFO_STATE: &[u8] = b"zinkhole state file v1";
 const AD_ANSWER: &[u8] = b"zinkhole-sync-1\n";
@@ -100,6 +108,34 @@ impl Keys {
 
     fn state(&self) -> [u8; 32] {
         self.derive(&[INFO_STATE])
+    }
+
+    /// The HMAC that proves a request comes from someone with the secret:
+    /// over the request's `nonce` and the `ETag` it says the replica has.
+    /// None only if no HMAC could be set up (any key fits one).
+    fn request_mac(&self, nonce: &[u8; NONCE_LEN], have: Option<&str>) -> Option<Hmac<Sha256>> {
+        let key = self.derive(&[INFO_REQUEST]);
+        let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(&key).ok()?;
+        mac.update(nonce);
+        mac.update(have.unwrap_or_default().as_bytes());
+        Some(mac)
+    }
+
+    /// That proof as a request carries it: in hex.
+    fn proof(&self, nonce: &[u8; NONCE_LEN], have: Option<&str>) -> String {
+        self.request_mac(nonce, have)
+            .map(|mac| hex::encode(&mac.finalize().into_bytes()))
+            .unwrap_or_default()
+    }
+
+    /// True if `proof` (hex) is the proof for a request with `nonce` and
+    /// `have`. Compared in constant time.
+    fn proves(&self, nonce: &[u8; NONCE_LEN], have: Option<&str>, proof: &str) -> bool {
+        let mut bytes = [0u8; PROOF_LEN];
+        hex::decode_into(proof, &mut bytes).is_ok()
+            && self
+                .request_mac(nonce, have)
+                .is_some_and(|mac| mac.verify_slice(&bytes).is_ok())
     }
 
     /// The `ETag` of `text`: a keyed fingerprint, quoted as HTTP has it.
@@ -222,15 +258,22 @@ impl Origin {
     }
 
     /// The sealed answer to a request with `nonce` (hex) from a replica
-    /// that has `if_none_match`.
+    /// that has `if_none_match`, if `proof` shows it has the secret.
     fn answer(
         &self,
         nonce: &str,
         if_none_match: Option<&str>,
+        proof: Option<&str>,
     ) -> Result<(String, Vec<u8>), AnswerError> {
         let mut bytes = [0u8; NONCE_LEN];
         if hex::decode_into(nonce, &mut bytes).is_err() {
             return Err(AnswerError::BadNonce);
+        }
+        // Sealed as it is, an answer still says when the settings change
+        // (its ETag) and how large they are, and whoever gets one counts as
+        // a replica in the Metrics: only for those with the secret.
+        if !proof.is_some_and(|proof| self.keys.proves(&bytes, if_none_match, proof)) {
+            return Err(AnswerError::NoProof);
         }
         let published = self.published.load();
         let mut payload = Vec::with_capacity(1 + published.text.len());
@@ -254,6 +297,8 @@ impl Origin {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AnswerError {
     BadNonce,
+    /// The request does not prove the secret.
+    NoProof,
     /// No random nonce could be made.
     Seal,
 }
@@ -262,6 +307,7 @@ impl IntoResponse for AnswerError {
     fn into_response(self) -> Response {
         match self {
             AnswerError::BadNonce => (StatusCode::BAD_REQUEST, "bad nonce\n").into_response(),
+            AnswerError::NoProof => StatusCode::UNAUTHORIZED.into_response(),
             AnswerError::Seal => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         }
     }
@@ -298,7 +344,8 @@ async fn get_sync(
     let if_none_match = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok());
-    match origin.answer(nonce, if_none_match) {
+    let proof = headers.get(PROOF_HEADER).and_then(|v| v.to_str().ok());
+    match origin.answer(nonce, if_none_match, proof) {
         Ok((etag, sealed)) => {
             origin.metrics.fetched_by(client, SystemTime::now());
             let etag = HeaderValue::from_str(&etag).unwrap_or(HeaderValue::from_static("\"\""));
@@ -329,6 +376,9 @@ pub enum SyncError {
     Http(String),
     #[error("HTTP status {0}")]
     Status(StatusCode),
+    /// The origin wants proof of its secret, and this replica's did not do.
+    #[error("the origin refused the request: it has another secret")]
+    Refused,
     #[error("the answer is larger than {} bytes", MAX_TEXT + OVERHEAD)]
     TooLarge,
     #[error("the answer has no ETag")]
@@ -422,13 +472,16 @@ impl Replica {
         let mut request = self
             .client
             .get(self.url.clone())
-            .header(NONCE_HEADER, hex::encode(&nonce));
+            .header(NONCE_HEADER, hex::encode(&nonce))
+            .header(PROOF_HEADER, self.keys.proof(&nonce, have));
         if let Some(etag) = have {
             request = request.header(header::IF_NONE_MATCH, etag);
         }
         let mut response = request.send().await?;
-        if response.status() != StatusCode::OK {
-            return Err(SyncError::Status(response.status()));
+        match response.status() {
+            StatusCode::OK => {}
+            StatusCode::UNAUTHORIZED => return Err(SyncError::Refused),
+            status => return Err(SyncError::Status(status)),
         }
         let etag = response
             .headers()

@@ -70,8 +70,10 @@ fn an_answer_cannot_be_replayed_to_another_request_or_its_etag_altered() {
     )
     .unwrap();
     let nonce = [7u8; NONCE_LEN];
-    let (etag, sealed) = origin.answer(&hex::encode(&nonce), None).unwrap();
     let keys = Keys::new(&secret(1));
+    let (etag, sealed) = origin
+        .answer(&hex::encode(&nonce), None, Some(&keys.proof(&nonce, None)))
+        .unwrap();
     assert!(open(&keys.answer(&nonce), &answer_ad(&etag), &sealed).is_ok());
     assert_eq!(
         open(&keys.answer(&[8; NONCE_LEN]), &answer_ad(&etag), &sealed),
@@ -81,7 +83,56 @@ fn an_answer_cannot_be_replayed_to_another_request_or_its_etag_altered() {
         open(&keys.answer(&nonce), &answer_ad("\"other\""), &sealed),
         Err(Tampered)
     );
-    assert!(origin.answer("not hex", None).is_err());
+    assert_eq!(
+        origin.answer("not hex", None, None),
+        Err(AnswerError::BadNonce)
+    );
+}
+
+#[test]
+fn the_origin_answers_only_requests_that_prove_the_secret() {
+    let origin = Origin::new(
+        &secret(1),
+        &settings("[blocking]\nblock = [\"ads.example\"]\n"),
+        Arc::default(),
+    )
+    .unwrap();
+    let keys = Keys::new(&secret(1));
+    let nonce = [7u8; NONCE_LEN];
+    let hex_nonce = hex::encode(&nonce);
+    let have = Some("\"an-etag\"");
+    let proof = keys.proof(&nonce, have);
+    assert!(origin.answer(&hex_nonce, have, Some(&proof)).is_ok());
+
+    let refused = [
+        ("no proof", have, None),
+        ("not hex", have, Some("proof".to_owned())),
+        (
+            "of another secret",
+            have,
+            Some(Keys::new(&secret(2)).proof(&nonce, have)),
+        ),
+        (
+            "for another nonce",
+            have,
+            Some(keys.proof(&[8; NONCE_LEN], have)),
+        ),
+        // The proof covers what the replica says it has: neither can be
+        // changed on the way.
+        (
+            "If-None-Match altered",
+            Some("\"another\""),
+            Some(proof.clone()),
+        ),
+        ("If-None-Match removed", None, Some(proof)),
+    ];
+    for (what, if_none_match, proof) in refused {
+        assert_eq!(
+            origin.answer(&hex_nonce, if_none_match, proof.as_deref()),
+            Err(AnswerError::NoProof),
+            "{what}"
+        );
+    }
 }
 
 #[test]
@@ -97,7 +148,13 @@ fn unchanged_counts_only_for_the_settings_a_replica_has() {
     let current = origin.published.load().etag.clone();
     // What the origin answers when `If-None-Match` names its current
     // settings, whoever put that there.
-    let (etag, sealed) = origin.answer(&hex::encode(&nonce), Some(&current)).unwrap();
+    let (etag, sealed) = origin
+        .answer(
+            &hex::encode(&nonce),
+            Some(&current),
+            Some(&keys.proof(&nonce, Some(&current))),
+        )
+        .unwrap();
     assert_eq!(etag, current);
 
     assert_eq!(
@@ -199,14 +256,33 @@ fn snapshot(state: &metrics::State) -> metrics::Snapshot<'_> {
 }
 
 #[tokio::test]
-async fn a_replica_with_another_secret_gets_nothing_it_can_open() {
+async fn a_replica_with_another_secret_is_refused_and_does_not_count_as_one() {
     let running = start_origin(1, "");
     let dir = tempfile::tempdir().unwrap();
     let error = replica(&running.url, 2, dir.path())
         .fetch(None)
         .await
         .unwrap_err();
-    assert!(matches!(error, SyncError::Tampered(_)), "{error}");
+    assert!(matches!(error, SyncError::Refused), "{error}");
+
+    // Nor does a request with a nonce and nothing else.
+    let replica = replica(&running.url, 1, dir.path());
+    let response = replica
+        .client
+        .get(replica.url.clone())
+        .header(NONCE_HEADER, hex::encode(&[7u8; NONCE_LEN]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(response.headers().get(header::ETAG).is_none());
+    assert_eq!(response.bytes().await.unwrap().len(), 0);
+
+    let metrics = metrics::render(&snapshot(&running.metrics));
+    assert!(
+        !metrics.contains("zinkhole_sync_replica_last_fetch_timestamp_seconds{"),
+        "{metrics}"
+    );
 }
 
 #[tokio::test]

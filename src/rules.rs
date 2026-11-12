@@ -93,8 +93,13 @@ pub fn parse_line(raw: &str) -> Parsed {
     let Some(first) = fields.next() else {
         return Parsed::default();
     };
-    if IpAddr::from_str(first).is_ok() {
-        // A hosts file line: "<address> <name> [<name>...]".
+    if let Ok(address) = IpAddr::from_str(first) {
+        // A hosts file line: "<address> <name> [<name>...]". It blocks its
+        // names only if the address leads nowhere: a line that gives names
+        // a real address is no rule, as with dnsmasq.
+        if !leads_nowhere(address) {
+            return Parsed::skip();
+        }
         return fields.fold(Parsed::default(), |mut parsed, host| {
             match hosts_entry(host) {
                 Some(name) => parsed.rules.push(Rule {
@@ -183,8 +188,16 @@ fn parse_dnsmasq(line: &str) -> Parsed {
         })
 }
 
+/// True for what a dnsmasq rule sends blocked names to: nothing, `#`, or an
+/// address that leads nowhere.
 fn is_sinkhole(target: &str) -> bool {
-    ["", "#", "0.0.0.0", "::", "127.0.0.1", "::1"].contains(&target)
+    matches!(target, "" | "#") || IpAddr::from_str(target).is_ok_and(leads_nowhere)
+}
+
+/// True for the addresses blocklists give blocked names: the unspecified
+/// address (`0.0.0.0`, `::`) and loopback (`127.0.0.1`, `::1`).
+fn leads_nowhere(address: IpAddr) -> bool {
+    address.is_unspecified() || address.is_loopback()
 }
 
 /// A name from a hosts file line. Hosts files also map local names
@@ -353,6 +366,21 @@ mod tests {
                     127.0.0.1 localhost\n127.0.0.1 localhost.localdomain\n::1 ip6-localhost\n\
                     0.0.0.0 0.0.0.0\n\n   \n";
         assert_eq!(rules(text), ["ads.example.com", "tracker.example.com"]);
+    }
+
+    #[test]
+    fn a_hosts_line_with_a_real_address_is_no_rule() {
+        for sinkhole in ["0.0.0.0", "::", "127.0.0.1", "::1", "127.0.0.53", "0:0::0"] {
+            let parsed = parse_line(&format!("{sinkhole} ads.example.com"));
+            assert_eq!((parsed.rules.len(), parsed.skipped), (1, 0), "{sinkhole}");
+        }
+        for real in ["93.184.216.34", "192.168.1.10", "2001:db8::1"] {
+            let parsed = parse_line(&format!("{real} nas.example.com www.example.com"));
+            assert_eq!((parsed.rules.len(), parsed.skipped), (0, 1), "{real}");
+        }
+        // As with dnsmasq, in whatever way the address is written.
+        assert_eq!(rules("address=/a.example.com/::0\n"), ["a.example.com"]);
+        assert_eq!(parse_line("address=/a.example.com/192.0.2.1").rules, []);
     }
 
     #[test]

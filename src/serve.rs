@@ -7,7 +7,12 @@
 //!   Server, upstream, cache, HTTP and sync settings apply after a restart,
 //!   and a changed sync role is refused.
 //! - SIGUSR1 logs the queries per Outcome since start and the cache entries.
+//! - The list Refresh, the Sync loop and the HTTP port run beside the DNS
+//!   listeners. Should one of them end on its own, the server stops with an
+//!   error, so that whatever runs zinkhole starts all of it again; only an
+//!   HTTP port that cannot be served at all is done without.
 
+use std::future::pending;
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -16,7 +21,7 @@ use std::time::Duration;
 
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::Notify;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::cache::Cache;
@@ -45,6 +50,9 @@ pub enum ServeError {
     Client(#[from] ClientError),
     #[error(transparent)]
     Io(#[from] io::Error),
+    /// A background task ended while the server ran.
+    #[error("{what} failed ({why}); stopped, to be started again")]
+    Task { what: &'static str, why: String },
 }
 
 /// Runs the server for `config`, read from `path`, until `shutdown`.
@@ -55,7 +63,8 @@ pub enum ServeError {
 /// # Errors
 ///
 /// The signal handlers cannot be set up, a listen address cannot be bound,
-/// a socket not served, or the HTTP client for lists not set up.
+/// a socket not served, the HTTP client for lists not set up, or the list
+/// Refresh, the Sync loop or the HTTP port ended on its own.
 pub async fn run(
     path: PathBuf,
     config: Config,
@@ -63,11 +72,6 @@ pub async fn run(
     controls: Controls,
     shutdown: CancellationToken,
 ) -> Result<(), ServeError> {
-    let Controls {
-        mut hangup,
-        mut user1,
-    } = controls;
-
     let resolver = Arc::new(resolver(&config, Upstream::new(&config.upstream)));
     resolver.log_queries(config.log.queries);
     let loader = Loader::new()?;
@@ -142,26 +146,147 @@ pub async fn run(
     };
     let reloader = Reloader::new(path, config, in_force, role, logging);
 
-    let served = loop {
-        tokio::select! {
-            _ = hangup.recv() => {
-                if let Err(error) = reloader.reload(&resolver) {
-                    tracing::error!("reload failed, keeping the current configuration: {error}");
-                }
-            }
-            _ = user1.recv() => log_summary(&resolver),
-            served = &mut serving => break served,
-        }
+    let mut beside = Beside {
+        refresh: Background::new("the list refresh", Some(refresh)),
+        syncing: Background::new("syncing", syncing),
+        http: Background::new("the HTTP port", http),
     };
+    let (served, failure) = beside
+        .watch(controls, &reloader, &resolver, &mut serving, &shutdown)
+        .await;
     shutdown.cancel();
-    stopped("the list refresh", Some(refresh)).await;
-    stopped("syncing", syncing).await;
-    if let Some(Err(error)) = stopped_with("the HTTP port", http).await {
-        tracing::error!(%error, "the HTTP port failed");
-    }
+    beside.stopped().await;
     served.map_err(io::Error::other)??;
     tracing::info!("stopped");
-    Ok(())
+    failure.map_or(Ok(()), Err)
+}
+
+/// What runs beside the DNS listeners.
+#[derive(Debug)]
+struct Beside {
+    refresh: Background<()>,
+    syncing: Background<()>,
+    http: Background<io::Result<()>>,
+}
+
+impl Beside {
+    /// Reloads and logs the summary when asked, until the DNS listeners
+    /// (`serving`) end. Returns how they ended, and why the server stops if
+    /// that is because one of these tasks ended on its own.
+    async fn watch(
+        &mut self,
+        controls: Controls,
+        reloader: &Reloader,
+        resolver: &Resolver<Upstream>,
+        serving: &mut JoinHandle<io::Result<()>>,
+        shutdown: &CancellationToken,
+    ) -> (Result<io::Result<()>, JoinError>, Option<ServeError>) {
+        let Controls {
+            mut hangup,
+            mut user1,
+        } = controls;
+        let Beside {
+            refresh,
+            syncing,
+            http,
+        } = self;
+        let mut failure = None;
+        let served = loop {
+            tokio::select! {
+                _ = hangup.recv() => {
+                    if let Err(error) = reloader.reload(resolver) {
+                        tracing::error!("reload failed, keeping the current configuration: {error}");
+                    }
+                }
+                _ = user1.recv() => log_summary(resolver),
+                served = &mut *serving => break served,
+                ended = refresh.ended() => failure = failure.or(refresh.failed(ended, shutdown)),
+                ended = syncing.ended() => failure = failure.or(syncing.failed(ended, shutdown)),
+                ended = http.ended() => match ended {
+                    // Its listeners could not be served: DNS without the
+                    // HTTP port is worth more than no DNS.
+                    Ok(Err(error)) => {
+                        tracing::error!(%error, "the HTTP port failed; answering DNS without it");
+                    }
+                    Ok(Ok(())) => failure = failure.or(http.failed(Ok(()), shutdown)),
+                    Err(error) => failure = failure.or(http.failed(Err(error), shutdown)),
+                },
+            }
+        };
+        (served, failure)
+    }
+
+    /// Waits for the tasks, which were told to stop.
+    async fn stopped(self) {
+        self.refresh.stopped().await;
+        self.syncing.stopped().await;
+        if let Some(Err(error)) = self.http.stopped().await {
+            tracing::error!(%error, "the HTTP port failed");
+        }
+    }
+}
+
+/// A task that runs beside the DNS listeners for as long as they do: the
+/// list Refresh, the Sync loop or the HTTP port.
+#[derive(Debug)]
+struct Background<T> {
+    what: &'static str,
+    /// None without one (no HTTP port, not a replica), and once it ended.
+    task: Option<JoinHandle<T>>,
+}
+
+impl<T> Background<T> {
+    fn new(what: &'static str, task: Option<JoinHandle<T>>) -> Background<T> {
+        Background { what, task }
+    }
+
+    /// How the task ended, once it does; never, without a task.
+    async fn ended(&mut self) -> Result<T, JoinError> {
+        let Some(task) = self.task.as_mut() else {
+            return pending().await;
+        };
+        let ended = task.await;
+        self.task = None;
+        ended
+    }
+
+    /// What follows from the task having ended.
+    ///
+    /// - Told to stop (`shutdown`): nothing, but a panic is logged.
+    /// - On its own: its work would be missing from now on (no lists
+    ///   refreshed, no syncing) with nothing to show for it. The server is
+    ///   told to stop, and the error returned is why.
+    fn failed(
+        &self,
+        ended: Result<(), JoinError>,
+        shutdown: &CancellationToken,
+    ) -> Option<ServeError> {
+        let what = self.what;
+        if shutdown.is_cancelled() {
+            if let Err(error) = ended {
+                tracing::error!(%error, "{what} failed");
+            }
+            return None;
+        }
+        let why = ended
+            .err()
+            .map_or_else(|| "it ended".to_owned(), |error| error.to_string());
+        tracing::error!("{what} failed ({why}): stopping, to be started again with all of it");
+        shutdown.cancel();
+        Some(ServeError::Task { what, why })
+    }
+
+    /// Waits for the task, which was told to stop; what it returned, unless
+    /// it panicked, which is logged.
+    async fn stopped(mut self) -> Option<T> {
+        match self.task.take()?.await {
+            Ok(returned) => Some(returned),
+            Err(error) => {
+                tracing::error!(%error, "{} failed", self.what);
+                None
+            }
+        }
+    }
 }
 
 /// `GET /metrics`, and `GET /sync` on an origin.
@@ -182,22 +307,6 @@ fn http_router(
         tracing::info!("serving the Policy settings to replicas on http://{address}/sync");
     }
     router.merge(Arc::clone(origin).router())
-}
-
-/// Waits for a background task that was told to stop; logs if it panicked.
-async fn stopped<T>(what: &str, task: Option<JoinHandle<T>>) {
-    let _ = stopped_with(what, task).await;
-}
-
-/// The same, returning what the task returned unless it panicked.
-async fn stopped_with<T>(what: &str, task: Option<JoinHandle<T>>) -> Option<T> {
-    match task?.await {
-        Ok(returned) => Some(returned),
-        Err(error) => {
-            tracing::error!(%error, "{what} failed");
-            None
-        }
-    }
 }
 
 /// The HTTP port's listeners, if there is one.

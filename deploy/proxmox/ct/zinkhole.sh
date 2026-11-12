@@ -127,10 +127,10 @@ echo -e "${INFO}${YW}Metrics:${CL}"
 echo -e "${TAB}${GATEWAY}${BGN}http://${IP}:${HTTP_PORT}/metrics${CL}"
 echo -e "${INFO}${YW}Config: /etc/zinkhole/config.toml (pct enter ${CTID}); update with: pct exec ${CTID} -- update${CL}"
 if pct exec "$CTID" -- grep -Eq '^role[[:space:]]*=[[:space:]]*"origin"' /etc/zinkhole/config.toml 2>/dev/null; then
-  # shellcheck disable=SC2016 # awk's $2, not the shell's
-  secret=$(pct exec "$CTID" -- awk -F'"' '/^secret[[:space:]]*=/ {print $2}' /etc/zinkhole/config.toml)
-  echo -e "${INFO}${YW}This is the sync origin. Its secret (also in the config):${CL}"
-  echo -e "${TAB}${BGN}${secret}${CL}"
-  echo -e "${INFO}${YW}Create a replica on another node with:${CL}"
-  echo -e "${TAB}${BGN}ZINKHOLE_ROLE=replica ZINKHOLE_ORIGIN=http://${IP}:${HTTP_PORT} ZINKHOLE_SECRET=<the secret> bash -c \"\$(curl -fsSL ${COMMUNITY_SCRIPTS_URL}/ct/zinkhole.sh)\"${CL}"
+  # The secret itself is not shown: it would stay in the terminal's
+  # scrollback, and on a command line in the shell history.
+  echo -e "${INFO}${YW}This is the sync origin. Its secret is in the config; read it with:${CL}"
+  echo -e "${TAB}${BGN}pct exec ${CTID} -- grep '^secret' /etc/zinkhole/config.toml${CL}"
+  echo -e "${INFO}${YW}Create a replica on another node with (it asks for the secret):${CL}"
+  echo -e "${TAB}${BGN}ZINKHOLE_ROLE=replica ZINKHOLE_ORIGIN=http://${IP}:${HTTP_PORT} bash -c \"\$(curl -fsSL ${COMMUNITY_SCRIPTS_URL}/ct/zinkhole.sh)\"${CL}"
 fi

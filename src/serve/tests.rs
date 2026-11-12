@@ -206,3 +206,58 @@ fn the_summary_names_every_outcome_with_its_count() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_background_task_that_ends_on_its_own_stops_the_server() {
+    let shutdown = CancellationToken::new();
+    let mut refresh = Background::new(
+        "the list refresh",
+        Some(tokio::spawn(async { panic!("a bug in the refresh") })),
+    );
+    let ended = refresh.ended().await;
+    assert!(ended.as_ref().is_err_and(JoinError::is_panic));
+    let failure = refresh.failed(ended, &shutdown);
+    assert!(
+        matches!(
+            &failure,
+            Some(ServeError::Task { what: "the list refresh", why }) if why.contains("panicked")
+        ),
+        "{failure:?}"
+    );
+    assert!(shutdown.is_cancelled(), "the server is told to stop");
+    // It ended once: there is nothing more to wait for.
+    let again = tokio::time::timeout(Duration::from_millis(20), refresh.ended()).await;
+    assert!(again.is_err());
+    assert!(refresh.stopped().await.is_none());
+
+    // Returning is as wrong as panicking, while the server runs.
+    let shutdown = CancellationToken::new();
+    let mut syncing = Background::new("syncing", Some(tokio::spawn(async {})));
+    let ended = syncing.ended().await;
+    assert!(matches!(
+        syncing.failed(ended, &shutdown),
+        Some(ServeError::Task {
+            what: "syncing",
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn a_background_task_that_was_told_to_stop_is_no_failure() {
+    let shutdown = CancellationToken::new();
+    let told = shutdown.clone();
+    let mut syncing = Background::new(
+        "syncing",
+        Some(tokio::spawn(async move { told.cancelled().await })),
+    );
+    shutdown.cancel();
+    let ended = syncing.ended().await;
+    assert!(syncing.failed(ended, &shutdown).is_none());
+
+    // Without a task (no HTTP port, say) nothing ever ends.
+    let mut none: Background<()> = Background::new("the HTTP port", None);
+    let ended = tokio::time::timeout(Duration::from_millis(20), none.ended()).await;
+    assert!(ended.is_err());
+    assert!(none.stopped().await.is_none());
+}
