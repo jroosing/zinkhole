@@ -448,6 +448,10 @@ private names and cache hits are answered without waiting on anything. At
 most `upstream.max_in_flight` upstream exchanges run at once; a cache miss
 beyond that is answered SERVFAIL at once, so in an upstream outage local
 names and cached answers keep answering instantly and memory cannot grow.
+Queries for a name already being asked upstream wait for that answer
+rather than asking again, and a name that got no answer is not asked again
+for 5 seconds, so a busy network does not get zinkhole rate-limited by its
+upstream servers.
 The Policy and lists are immutable once built: a reload or a list refresh
 builds new ones on the side and swaps them in atomically, and each query
 works on one snapshot.

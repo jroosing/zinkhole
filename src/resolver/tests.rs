@@ -429,6 +429,103 @@ async fn with_every_slot_busy_a_miss_fails_at_once_and_local_answers_stay_instan
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queries_for_a_question_already_asked_upstream_wait_for_its_answer() {
+    // max_in_flight = 2, and twenty queries: none fails for want of a slot.
+    let r = Arc::new(resolver("", Behaviour::Slow(Duration::from_millis(200))));
+    let asking: Vec<_> = (0..20)
+        .map(|_| {
+            let r = Arc::clone(&r);
+            tokio::spawn(async move { ask(&r, "example.com.", RecordType::A).await })
+        })
+        .collect();
+    for task in asking {
+        let (response, outcome) = task.await.unwrap();
+        assert_eq!(outcome, Outcome::Forwarded);
+        assert_eq!(first_a(&response), Some(Ipv4Addr::new(1, 2, 3, 4)));
+    }
+    assert_eq!(r.forwarder().calls(), 1, "asked upstream once");
+
+    // Another question is another lookup, and so is the same one once the
+    // answer is in: then it comes from the cache.
+    assert_eq!(
+        ask(&r, "example.com.", RecordType::AAAA).await.1,
+        Outcome::Forwarded
+    );
+    assert_eq!(
+        ask(&r, "example.com.", RecordType::A).await.1,
+        Outcome::Cached
+    );
+    assert_eq!(r.forwarder().calls(), 2);
+}
+
+#[tokio::test]
+async fn a_question_no_server_answered_is_not_asked_again_at_once() {
+    for (behaviour, outcome) in [
+        (Behaviour::Fail, Outcome::Failed),
+        (Behaviour::ServFail, Outcome::Failed),
+        (Behaviour::Bogus, Outcome::Bogus),
+    ] {
+        let r = resolver("", behaviour);
+        for _ in 0..3 {
+            let (response, got) = ask(&r, "example.com.", RecordType::A).await;
+            assert_eq!(
+                (response.metadata.response_code, got),
+                (ResponseCode::ServFail, outcome),
+                "{behaviour:?}"
+            );
+        }
+        assert_eq!(r.forwarder().calls(), 1, "{behaviour:?}: asked once");
+        // Other questions are asked as usual.
+        r.forwarder().set(Behaviour::Answer);
+        assert_eq!(
+            ask(&r, "other.example.", RecordType::A).await.1,
+            Outcome::Forwarded
+        );
+    }
+
+    // A failed question with an expired answer still gets that.
+    let r = resolver("", Behaviour::Fail);
+    ask(&r, "example.com.", RecordType::A).await;
+    store_expired(&r, "example.com.", Ipv4Addr::new(5, 6, 7, 8));
+    let (stale, outcome) = ask(&r, "example.com.", RecordType::A).await;
+    assert_eq!(
+        (outcome, first_a(&stale)),
+        (Outcome::Cached, Some(Ipv4Addr::new(5, 6, 7, 8)))
+    );
+    assert_eq!(r.forwarder().calls(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queries_waiting_on_a_lookup_that_is_canceled_fail_at_once_and_the_next_one_asks() {
+    let r = Arc::new(resolver("", Behaviour::Slow(Duration::from_secs(30))));
+    let first = {
+        let r = Arc::clone(&r);
+        tokio::spawn(async move { ask(&r, "example.com.", RecordType::A).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let waiting = {
+        let r = Arc::clone(&r);
+        tokio::spawn(async move { ask(&r, "example.com.", RecordType::A).await.1 })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    first.abort();
+    let outcome = tokio::time::timeout(Duration::from_secs(2), waiting)
+        .await
+        .expect("not left waiting")
+        .unwrap();
+    assert_eq!(outcome, Outcome::Failed);
+
+    // Nothing is left behind: the slot is free, and the question is asked
+    // anew (a canceled lookup is no failure to remember).
+    r.forwarder().set(Behaviour::Answer);
+    assert_eq!(
+        ask(&r, "example.com.", RecordType::A).await.1,
+        Outcome::Forwarded
+    );
+    assert_eq!(r.forwarder().calls(), 2);
+}
+
 #[tokio::test]
 async fn disallowed_clients_are_dropped_over_udp_and_refused_over_tcp() {
     let r = resolver(

@@ -11,19 +11,25 @@
 //!                                       stale cached one if none answers
 //! ```
 //!
+//! Upstream servers are spared what a busy network would send them: queries
+//! for a question already being asked upstream wait for that answer instead
+//! of asking again, and a question no server answered (or whose answer was
+//! bogus) is not asked again for [`FAILURE_TTL`].
+//!
 //! Steps 2–5 are the Policy's decision; this module turns it into a response.
 //! Upstream servers sit behind [`Forwarder`].
 
+use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{DNSClass, Name, RData, RecordType};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, watch};
 
 use crate::answer;
 use crate::cache::{Cache, Key};
@@ -116,6 +122,21 @@ pub trait Forwarder: Send + Sync {
     ) -> impl Future<Output = Result<Message, ForwardError>> + Send;
 }
 
+/// How long a question that no upstream server answered, or whose answer was
+/// bogus, is answered without asking again: a stale answer or SERVFAIL. A
+/// failing name then costs the upstream servers one query per question this
+/// often, not one per client query.
+pub const FAILURE_TTL: Duration = Duration::from_secs(5);
+/// The most failed questions remembered at once.
+const MAX_FAILURES: u64 = 10_000;
+
+/// What an upstream lookup came to, for every query that waited on it.
+type Fetched = Result<Message, ForwardError>;
+
+/// The upstream lookups under way, by question: queries for one of these
+/// wait for its answer.
+type Pending = Mutex<HashMap<Key, watch::Receiver<Option<Fetched>>>>;
+
 /// The response to send, if any, and how the query was answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reply {
@@ -132,6 +153,10 @@ pub struct Resolver<F> {
     allow_clients: Vec<Network>,
     /// Upstream exchanges at once; a miss that finds none free is SERVFAIL.
     in_flight: Semaphore,
+    /// The upstream lookups under way.
+    pending: Pending,
+    /// Questions whose last lookup failed, for [`FAILURE_TTL`].
+    failures: moka::sync::Cache<Key, ForwardError>,
     queries: Queries,
     /// One log line per query (`log.queries`).
     log_queries: AtomicBool,
@@ -152,6 +177,11 @@ impl<F: Forwarder> Resolver<F> {
             forwarder,
             allow_clients,
             in_flight: Semaphore::new(max_in_flight),
+            pending: Mutex::new(HashMap::new()),
+            failures: moka::sync::Cache::builder()
+                .max_capacity(MAX_FAILURES)
+                .time_to_live(FAILURE_TTL)
+                .build(),
             queries: Queries::default(),
             log_queries: AtomicBool::new(false),
         }
@@ -333,25 +363,47 @@ impl<F: Forwarder> Resolver<F> {
         if let Some(cached) = self.cache.lookup(&key, Instant::now()) {
             return self.alias_checked(query, name, cached, Outcome::Cached);
         }
-        // A full pool fails at once (ADR-0001): local and cached answers never
-        // wait behind upstream ones, and an outage cannot grow memory. A pool
-        // full of exchanges that time out is an outage: a stale answer helps.
-        let Ok(_permit) = self.in_flight.try_acquire() else {
-            return self.stale_or_failed(query, name, &key);
+        // Boxed: what asking upstream needs to keep across its awaits would
+        // otherwise make every query's task larger, cache hits included.
+        Box::pin(self.ask_upstream(query, name, target, key)).await
+    }
+
+    /// A miss: the answer of `target`, shared with the other queries for
+    /// `key` meanwhile, else a stale answer or a failure.
+    async fn ask_upstream(
+        &self,
+        query: &Message,
+        name: &str,
+        target: Target,
+        key: Key,
+    ) -> (Message, Outcome) {
+        // Failed a moment ago: asking again so soon would most likely fail
+        // too, and adds to the load that made it fail.
+        let fetched = match self.failures.get(&key) {
+            Some(failure) => Err(failure),
+            None => match self.lookup(&key) {
+                // Asked already: its answer is this query's too.
+                Lookup::Join(mut answer) => match answer.wait_for(Option::is_some).await {
+                    Ok(fetched) => fetched.clone().unwrap_or(Err(ForwardError::NoAnswer)),
+                    // The lookup was abandoned (the server is stopping).
+                    Err(_) => Err(ForwardError::NoAnswer),
+                },
+                Lookup::Lead(lead) => {
+                    let fetched = self.fetch(query, target, &key).await;
+                    lead.done(&fetched);
+                    fetched
+                }
+                // A full pool fails at once (ADR-0001): local and cached
+                // answers never wait behind upstream ones, and an outage
+                // cannot grow memory. A pool full of exchanges that time
+                // out is an outage: a stale answer helps.
+                Lookup::Busy => return self.stale_or_failed(query, name, &key),
+            },
         };
-        match self.forwarder.forward(upstream_query(query), target).await {
-            // The upstream server could not get an answer either (its
-            // authoritative servers are down, say): as good as none, so a
-            // stale answer helps (RFC 8767), and it counts as failed.
-            Ok(fresh) if fresh.metadata.response_code == ResponseCode::ServFail => {
-                self.stale_or_failed(query, name, &key)
-            }
-            Ok(fresh) => {
-                // Cached as it came: the aliases are checked again on every
-                // hit, so a Reload that changes the rules applies at once.
-                self.cache.store(key, &fresh, Instant::now());
-                self.alias_checked(query, name, fresh, Outcome::Forwarded)
-            }
+        match fetched {
+            // Cached as it came: the aliases are checked again on every
+            // hit, so a Reload that changes the rules applies at once.
+            Ok(fresh) => self.alias_checked(query, name, fresh, Outcome::Forwarded),
             Err(ForwardError::NoAnswer) => self.stale_or_failed(query, name, &key),
             // Forged or broken: never cached, and no stale answer stands in
             // for it either (the name may be under attack right now).
@@ -360,6 +412,44 @@ impl<F: Forwarder> Resolver<F> {
                 Outcome::Bogus,
             ),
         }
+    }
+
+    /// Who asks upstream for `key`: this query, or the one already asking.
+    fn lookup(&self, key: &Key) -> Lookup<'_> {
+        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(answer) = pending.get(key) {
+            return Lookup::Join(answer.clone());
+        }
+        let Ok(permit) = self.in_flight.try_acquire() else {
+            return Lookup::Busy;
+        };
+        let (answer, waiting) = watch::channel(None);
+        pending.insert(key.clone(), waiting);
+        Lookup::Lead(Lead {
+            pending: &self.pending,
+            key: key.clone(),
+            answer,
+            _permit: permit,
+        })
+    }
+
+    /// Asks `target`, and keeps what it answers: an answer in the cache, a
+    /// failure for [`FAILURE_TTL`].
+    async fn fetch(&self, query: &Message, target: Target, key: &Key) -> Fetched {
+        let fetched = match self.forwarder.forward(upstream_query(query), target).await {
+            // The upstream server could not get an answer either (its
+            // authoritative servers are down, say): as good as none, so a
+            // stale answer helps (RFC 8767), and it counts as failed.
+            Ok(fresh) if fresh.metadata.response_code == ResponseCode::ServFail => {
+                Err(ForwardError::NoAnswer)
+            }
+            fetched => fetched,
+        };
+        match &fetched {
+            Ok(fresh) => self.cache.store(key.clone(), fresh, Instant::now()),
+            Err(failure) => self.failures.insert(key.clone(), *failure),
+        }
+        fetched
     }
 
     /// No upstream answer: one that expired less than `serve_stale_hours` ago
@@ -401,6 +491,44 @@ impl<F: Forwarder> Resolver<F> {
 
 /// The query was not a query: send nothing.
 struct Dropped;
+
+/// Who asks upstream for a question.
+enum Lookup<'a> {
+    /// Another query is asking: wait for its answer.
+    Join(watch::Receiver<Option<Fetched>>),
+    /// This query asks, and tells the others.
+    Lead(Lead<'a>),
+    /// Nobody is asking, and every upstream slot is taken.
+    Busy,
+}
+
+/// The query that asks upstream for a question, on behalf of every query
+/// for it meanwhile. Holds an upstream slot. When dropped, the question is
+/// no longer under way: queries after that ask anew, and those still
+/// waiting without an answer (the asking query was canceled) are told it
+/// failed.
+struct Lead<'a> {
+    pending: &'a Pending,
+    key: Key,
+    answer: watch::Sender<Option<Fetched>>,
+    _permit: tokio::sync::SemaphorePermit<'a>,
+}
+
+impl Lead<'_> {
+    /// Tells the waiting queries what the lookup came to.
+    fn done(self, fetched: &Fetched) {
+        self.answer.send_replace(Some(fetched.clone()));
+    }
+}
+
+impl Drop for Lead<'_> {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.key);
+    }
+}
 
 /// `name` as the Policy compares names: lowercase, without the trailing dot.
 /// None if a label holds a `.`, which has no unambiguous text form.

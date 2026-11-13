@@ -490,7 +490,7 @@ pub struct Cache {
 impl Default for Cache {
     fn default() -> Self {
         Cache {
-            size_mb: 16,
+            size_mb: 32,
             min_ttl: 0,
             max_ttl: 86_400,
             serve_stale_hours: 24,
@@ -1110,7 +1110,7 @@ mod tests {
         );
         assert_eq!(config.upstream.timeout_ms, 2000);
         assert_eq!(config.upstream.max_in_flight, 64);
-        assert_eq!(config.cache.size_mb, 16);
+        assert_eq!(config.cache.size_mb, 32);
         assert_eq!(config.policy_settings(), PolicySettings::default());
         assert!(config.http.is_none() && config.sync.is_none());
     }

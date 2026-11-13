@@ -47,7 +47,7 @@ dnssec = "upstream"
 
 [cache]
 # Memory for cached upstream answers, in MiB (0 to 1024; 0 disables).
-size_mb = 16
+size_mb = 32
 # Clamp the TTLs of cached answers (seconds, up to 604800).
 min_ttl = 0
 max_ttl = 86400
